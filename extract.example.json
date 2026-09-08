@@ -1,0 +1,26 @@
+{
+  "job_id": "orders_incremental",
+  "table": "orders",
+  "columns": ["order_id", "user_id", "status", "amount", "created_at", "updated_at"],
+  "source": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password_env": "ORDERS_PG_PASSWORD",
+    "database": "app",
+    "pool_max": 8,
+    "statement_timeout_ms": 300000,
+    "application_name": "rust-extract-layer"
+  },
+  "incremental": {
+    "column": "updated_at",
+    "safety_lag_secs": 300,
+    "max_window_secs": 21600
+  },
+  "sink": {
+    "path": "./warehouse/raw/orders"
+  },
+  "checkpoint": {
+    "dir": "./.checkpoints"
+  }
+}

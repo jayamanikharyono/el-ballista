@@ -1,0 +1,21 @@
+[package]
+name = "rust-ballista-extraction-layer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = "58.4"
+ballista = "54.1.0"
+bigdecimal = "0.4.10"
+chrono = { version = "0.4.45", features = ["serde"] }
+datafusion = "54.1.0"
+log = "0.4.34"
+parquet = "58.4"
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "bigdecimal", "json", "uuid"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+async-trait = "0.1.92"
+futures = "0.3.34"
+serde_json = "1.0.151"
+uuid = { version = "1.26.0", features = ["v4", "serde"] }

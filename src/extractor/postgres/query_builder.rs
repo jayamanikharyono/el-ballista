@@ -57,7 +57,7 @@ impl PostgresQueryBuilder {
         query.push_bind(hi);
     }
 
-    fn push_columns(
+    pub(crate) fn push_columns(
         query: &mut QueryBuilder<Postgres>,
         table: &TableMetadata,
     ) {
@@ -82,7 +82,7 @@ impl PostgresQueryBuilder {
         }
     }
 
-    fn push_identifier(
+    pub(crate) fn push_identifier(
         query: &mut QueryBuilder<Postgres>,
         identifier: &str,
     ) {

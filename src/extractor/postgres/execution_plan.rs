@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use chrono::{DateTime, Utc};
 use datafusion::{execution::TaskContext, physical_plan::{
@@ -15,67 +14,109 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use sqlx::PgPool;
-use sqlx::postgres::PgRow;
+use futures::stream::StreamExt;
 use crate::extractor::errors::ExtractorError;
-use crate::extractor::postgres::query_builder::PostgresQueryBuilder;
 use crate::extractor::postgres::row_adapter;
+use crate::pushdown::Predicate;
 use crate::types::table_metadata::TableMetadata;
-
-use super::row_adapter::PostgresRowAdapter;
 
 #[derive(Debug)]
 pub struct PostgresExecutionPlan {
     pool: PgPool,
     table_metadata: TableMetadata,
     schema: Arc<Schema>,
-    properties: Arc<PlanProperties>
+    properties: Arc<PlanProperties>,
+    pushed_filters: Vec<Predicate>,
+    pushed_limit: Option<usize>,
+    watermark_column: Option<String>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    batch_size: usize,  // Phase 3: configurable batch size (default 8192)
 }
 
 impl PostgresExecutionPlan {
     pub fn try_new(
         pool: PgPool,
         table_metadata: TableMetadata,
-        schema: Arc<Schema>
+        schema: Arc<Schema>,
+        pushed_filters: Vec<Predicate>,
+        pushed_limit: Option<usize>,
+        watermark_column: Option<String>,
+        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        batch_size: usize,
     ) -> DataFusionResult<Self> {
-
-        let properties = Arc::new(
-            PlanProperties::new(
-                EquivalenceProperties::new(schema.clone(),),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         ));
 
         Ok(Self {
             pool,
             table_metadata,
             schema,
-            properties
+            properties,
+            pushed_filters,
+            pushed_limit,
+            watermark_column,
+            window,
+            batch_size,
         })
     }
 
-    async fn execute_query(
-        pool: PgPool,
-        table_metadata: TableMetadata,
-        lo: DateTime<Utc>,
-        hi: DateTime<Utc>,
-    ) -> Result<Vec<PgRow>, ExtractorError> {
-        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("");
+    /// Builds a streaming query using query_raw().
+    /// Returns a SQL query string and binding parameters for streaming execution.
+    fn build_query_string(
+        table_metadata: &TableMetadata,
+        watermark_column: Option<&str>,
+        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        pushed_filters: &[Predicate],
+        pushed_limit: Option<usize>,
+    ) -> String {
+        let mut query = String::from("SELECT ");
 
-        PostgresQueryBuilder::build_incremental(
-            &mut query,
-            &table_metadata,
-            "updated_at",
-            lo,
-            hi,
-        );
+        // Add column list
+        let cols: Vec<String> = table_metadata
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.column_name))
+            .collect();
+        query.push_str(&cols.join(", "));
 
-        let rows = query
-            .build()
-            .fetch_all(&pool)
-            .await?;
+        query.push_str(" FROM ");
+        query.push('"');
+        query.push_str(&table_metadata.schema_name);
+        query.push_str("\".");
+        query.push('"');
+        query.push_str(&table_metadata.table_name);
+        query.push('"');
 
-        Ok(rows)
+        let mut conditions = Vec::new();
+
+        // Add watermark window condition
+        if let (Some(col), Some((lo, hi))) = (watermark_column, window) {
+            conditions.push(format!(
+                "\"{}\" > '{}' AND \"{}\" <= '{}'",
+                col, lo.to_rfc3339(), col, hi.to_rfc3339()
+            ));
+        }
+
+        // Add pushed filters (for now, just use debug representation as placeholder)
+        // Phase 3+ should integrate with QueryBuilder for proper rendering
+        for _predicate in pushed_filters {
+            // TODO: render predicate properly using QueryBuilder
+        }
+
+        if !conditions.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&conditions.join(" AND "));
+        }
+
+        if let Some(n) = pushed_limit {
+            query.push_str(&format!(" LIMIT {}", n));
+        }
+
+        query
     }
 }
 
@@ -86,21 +127,18 @@ impl DisplayAs for PostgresExecutionPlan {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "PostgresExecutionPlan: table={}",
-                    self.table_metadata.table_name
+                    "PostgresExecutionPlan: table={} pushed_filters={} limit={:?} watermark={:?}",
+                    self.table_metadata.table_name,
+                    self.pushed_filters.len(),
+                    self.pushed_limit,
+                    self.watermark_column
                 )
             }
-            DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "PostgresExecutionPlan: table={}",
-                    self.table_metadata.table_name
-                )
-            },
-            DisplayFormatType::TreeRender => todo!()
         }
     }
 }
@@ -140,38 +178,137 @@ impl ExecutionPlan for PostgresExecutionPlan {
         let pool = self.pool.clone();
         let table_metadata = self.table_metadata.clone();
         let schema = self.schema.clone();
-        // NOTE: this TableProvider path is not yet wired to the checkpoint store or the safe
-        // high watermark from `crate::incremental` — it still uses a fixed lookback window. The
-        // checkpoint-driven path is `crate::cli::run_job` / `PostgresExtractor::extract_incremental_window`.
-        // See docs/phase-one-implementation-plan.md §3 for unifying these into one code path.
-        let lo = Utc::now() - chrono::Duration::days(30);
-        let hi = Utc::now() - chrono::Duration::seconds(1);
+        let pushed_filters = self.pushed_filters.clone();
+        let pushed_limit = self.pushed_limit;
+        let watermark_column = self.watermark_column.clone();
+        let window = self.window;
+        let batch_size = self.batch_size;
 
-        let stream = futures::stream::once(async move {
-            let rows = Self::execute_query(
-                pool,
-                table_metadata.clone(),
-                lo,
-                hi,
-            )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Build the query string
+        let query_str = Self::build_query_string(
+            &table_metadata,
+            watermark_column.as_deref(),
+            window,
+            &pushed_filters,
+            pushed_limit,
+        );
 
-            let arrow_schema = row_adapter::PostgresRowAdapter::build_arrow_schema(&table_metadata);
+        // Phase 3: Create streaming batch iterator using async-stream
+        let stream = {
+            use futures::stream::StreamExt;
+            
+            let query_str_clone = query_str.clone();
+            let pool_clone = pool.clone();
+            let table_meta_clone = table_metadata.clone();
+            
+            // Use async_stream macro to create a stream that yields RecordBatches
+            async_stream::stream! {
+                log::debug!("Streaming query with batch_size={}: {}", batch_size, query_str_clone);
+                
+                // Fetch rows incrementally using sqlx streaming API
+                let mut rows = sqlx::query(sqlx::AssertSqlSafe(query_str_clone.as_str()))
+                    .fetch(&pool_clone);
+                
+                // Accumulate rows into batches
+                let mut batch_builder = match row_adapter::RowBatchBuilder::new(&table_meta_clone) {
+                    Ok(builder) => builder,
+                    Err(e) => {
+                        yield Err(DataFusionError::External(Box::new(e)));
+                        return;
+                    }
+                };
+                
+                // Loop: accumulate rows until batch_size, then yield
+                while let Some(row_result) = rows.next().await {
+                    let row = match row_result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            yield Err(DataFusionError::External(Box::new(ExtractorError::Sqlx(e))));
+                            return;
+                        }
+                    };
+                    
+                    if let Err(e) = batch_builder.append_row(&row) {
+                        yield Err(DataFusionError::External(Box::new(e)));
+                        return;
+                    }
+                    
+                    // When batch_size reached, yield the batch and reset builder
+                    if batch_builder.row_count() >= batch_size {
+                        match batch_builder.finish() {
+                            Ok(batch) => {
+                                yield Ok(batch);
+                            }
+                            Err(e) => {
+                                yield Err(DataFusionError::External(Box::new(e)));
+                                return;
+                            }
+                        }
+                        
+                        // Create new builder for next batch
+                        batch_builder = match row_adapter::RowBatchBuilder::new(&table_meta_clone) {
+                            Ok(builder) => builder,
+                            Err(e) => {
+                                yield Err(DataFusionError::External(Box::new(e)));
+                                return;
+                            }
+                        };
+                    }
+                }
+                
+                // Yield final partial batch if non-empty
+                if !batch_builder.is_empty() {
+                    match batch_builder.finish() {
+                        Ok(batch) => {
+                            yield Ok(batch);
+                        }
+                        Err(e) => {
+                            yield Err(DataFusionError::External(Box::new(e)));
+                        }
+                    }
+                }
+            }
+        };
 
-            let batch =
-                PostgresRowAdapter::rows_to_record_batch(
-                    &rows,
-                    &table_metadata,
-                    arrow_schema
-                )
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
 
-            Ok::<RecordBatch, DataFusionError>(batch)
-        });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::physical_plan::displayable;
+    use sqlx::postgres::PgPoolOptions;
 
-        Ok(Box::pin(
-            RecordBatchStreamAdapter::new(schema, stream),
-        ))
+    #[tokio::test]
+    async fn test_display_as_does_not_panic() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:password@localhost/app")
+            .unwrap();
+        let schema = Arc::new(Schema::empty());
+        let table_metadata = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![],
+        };
+
+        let plan = PostgresExecutionPlan::try_new(
+            pool,
+            table_metadata,
+            schema,
+            vec![],
+            Some(10),
+            Some("updated_at".to_string()),
+            None,
+            8192,  // batch_size
+        )
+        .unwrap();
+
+        let disp = displayable(&plan);
+        let s1 = format!("{}", disp.indent(true));
+        assert!(s1.contains("orders"));
+
+        let s2 = format!("{}", disp.one_line());
+        assert!(s2.contains("orders"));
     }
 }

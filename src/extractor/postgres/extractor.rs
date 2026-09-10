@@ -113,7 +113,7 @@ impl PostgresExtractor {
 
         // 3. Build Arrow schema.
         let arrow_schema =
-            PostgresRowAdapter::build_arrow_schema(&table_metadata);
+            PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
 
         // 4. Build SELECT column list.
         let mut query_builder = QueryBuilder::<Postgres>::new("");

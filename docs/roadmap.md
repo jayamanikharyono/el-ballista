@@ -8,36 +8,38 @@ evenings.
 
 ---
 
-## Phase 1 — Single-node PostgreSQL extractor
+## Phase 1 — Single-node PostgreSQL Extraction
 
 ```
-Postgres ──► Rust ──► Arrow ──► Parquet ──► GCS
+Postgres ──► Rust ──► Arrow ──► DataFusion/Ballista
 ```
 
-The whole vertical slice, narrow. One connector, one sink, no DataFrame API — a job spec goes in,
-Parquet comes out, a checkpoint advances.
+The whole vertical slice, narrow. One connector, no sink implementation — a job spec goes in,
+Arrow RecordBatches come out, a checkpoint advances. Sink functionality is handled by DataFusion
+or Ballista (ParquetWriter, CSVWriter, etc.) or by the orchestrator.
 
 - PostgreSQL connector: schema resolution, binary `COPY` and portal-based scans, type mapping,
   streaming decode into Arrow builders
 - Incremental extraction in `timestamp` mode with the exact
   [safe high watermark](connectors/postgres.md#52-the-safe-high-watermark)
-- Checkpoint store (Postgres backend) with leases and run history
+- Checkpoint store (local filesystem, atomic rename semantics) with leases and run history
 - Projection and filter pushdown with `Exact`/`Inexact` fidelity rules — cost model not yet, policy
   is `always` for safe predicates
-- Parquet sink to local filesystem and GCS, deterministic window paths, `_SUCCESS` markers
+- Arrow output (RecordBatch streams) to be consumed by DataFusion, Ballista, or orchestrator
 - `rel run`, `rel plan`, `rel checkpoint` CLI commands
-- Metrics and structured tracing
+- Structured logging
 
 **Exit criteria.** A real table extracts incrementally on a schedule for two weeks without
 intervention. The differential correctness suite from
 [pushdown §6](pushdown.md#6-verification-strategy) passes against the hostile-value fixture. A
-killed process mid-run resumes without duplicating or losing a row. Throughput is measured and
-recorded — against the PySpark job it replaces, on the same table and hardware, so the comparison
-is a number rather than an adjective.
+killed process mid-run resumes without duplicating or losing a row. Arrow output is verified
+correct via DataFusion's query engine. Throughput is measured and recorded — against the
+PySpark job it replaces, on the same table and hardware, so the comparison is a number rather
+than an adjective.
 
 ---
 
-## Phase 2 — DataFrame API and the cost model
+## Phase 2 — DataFrame API and Cost-Based Pushdown
 
 The engine gets a usable front end, and pushdown becomes a decision rather than a reflex.
 
@@ -48,7 +50,8 @@ let df = ctx.source("orders_pg", "public.orders")
     .select(vec![col("order_id"), col("amount")])
     .with_column("amount_usd", col("amount") * lit(rate));
 
-df.write_parquet("gs://warehouse/raw/orders/", opts).await?;
+// Output is Arrow RecordBatches, ready for DataFusion operations
+let batches = df.collect().await?;
 ```
 
 - DataFrame builder over DataFusion's `LogicalPlan`, plus SQL entry via `ctx.sql()`
@@ -57,41 +60,52 @@ df.write_parquet("gs://warehouse/raw/orders/", opts).await?;
 - `rel plan --explain` printing per-operator push/keep decisions and their reasoning
 - Parallel scan: `keyset` and `ctid` strategies under exported snapshots
 - Backfill orchestration with chunking and a separate checkpoint namespace
+- Arrow RecordBatch output for consumption by DataFusion writers or orchestrator
 
 **Exit criteria.** For at least one real table, `cost_based` demonstrably chooses differently from
 `always` and produces a measurably better outcome — this is the phase where the project's central
-claim either holds up or does not. Plan snapshot tests cover the decision surface.
+claim either holds up or does not. Plan snapshot tests cover the decision surface. Output is
+verifiable as correct Arrow data via DataFusion's query engine.
 
 ---
 
-## Phase 3 — MySQL and multi-source
+## Phase 3 — True Streaming Execution
 
 ```
-Postgres ──┐
-MySQL   ───┼──► Arrow / DataFusion ──► GCS / BigQuery
-GCS     ───┘
+PostgreSQL
+    ↓
+streaming portal (fetch, not fetch_all)
+    ↓
+RecordBatch stream (bounded memory, multiple batches)
+    ↓
+SendableRecordBatchStream
+    ↓
+DataFusion
 ```
 
-The second connector is what proves the SPI is an abstraction rather than a Postgres wrapper, and
-MySQL is the right second connector precisely because it is *worse* at everything Postgres does
-well — no bulk export, no exportable snapshot, opt-in histograms, unrepresentable values. If the
-SPI survives MySQL, it will survive anything.
+Replace `fetch_all()` with true incremental batching. Current Phase 2 implementation materializes
+the entire query result before yielding any batches. This phase makes `execute()` produce multiple
+`RecordBatch` objects as data arrives from PostgreSQL, with bounded memory that scales to `O(batch_size)`
+rather than `O(total_rows)`.
 
-- MySQL connector per [its detailed plan](connectors/mysql.md), including the collation fidelity
-  rules, zero-date handling, and replica lag bounding
-- Cross-source joins: a Postgres fact table joined against a GCS Parquet dimension, executed in
-  Arrow because no single source can do it
-- BigQuery sink: load-job orchestration and the `MERGE` upsert pattern
-- Object store source (Parquet/CSV on GCS) as a read side, which mostly falls out of DataFusion
+- Replace `sqlx::query(...).fetch_all()` with `sqlx::query(...).fetch()` (streaming rows)
+- Implement batch accumulation loop: collect rows into Arrow builders until `batch_size` reached
+- Yield `RecordBatch` incrementally as stream items
+- Memory bounded to `O(batch_size + driver buffering)`, not `O(total_rows)`
+- Preserve existing query building, type mappings, error handling
+- Support all existing pushed predicates: watermark, filters, projection, limit
+- Configurable `batch_size` (default 8192 rows)
+- Test with multiple batches, empty results, partial final batches
 
-**Exit criteria.** A join across Postgres and MySQL produces correct results with each side's
-predicates pushed independently. The MySQL differential correctness suite passes, including the
-`_ci` collation cases. The SPI required no breaking change to accommodate MySQL — or if it did, the
-change is documented as a lesson.
+**Exit criteria.** `fetch_all()` is removed from the normal scan path. Multiple `RecordBatch`
+objects are produced for results exceeding `batch_size`. Memory no longer scales with total row
+count. First-batch latency is significantly earlier than full-result materialization. All existing
+Phase 2 features (pushdown, type mappings, schema handling) remain intact. Tests verify batching
+correctness and memory efficiency.
 
 ---
 
-## Phase 4 — Distributed execution
+## Phase 4 — Distributed Execution
 
 Only when single-node throughput is genuinely the bottleneck, which for the target workloads it may
 never be.
@@ -106,7 +120,7 @@ never be.
        │              │              │
        └──────────────┼──────────────┘
                       ▼
-                     GCS
+                   Parquet
 ```
 
 Ballista adds a scheduler and workers over DataFusion, using Arrow IPC for shuffle. It tracks
@@ -126,15 +140,58 @@ worse rather than better.
 
 ---
 
-## Deferred, tracked, not scheduled
+## Phase 5 — MySQL Connector
 
-| Item | Why it is deferred |
+```
+Postgres ──┐
+MySQL   ───┼──► Arrow / DataFusion
+```
+
+The second connector proves the SPI is a real abstraction rather than a Postgres wrapper. MySQL
+is the right second connector because it is *worse* at everything Postgres does well — no bulk
+export, no exportable snapshot, opt-in histograms, unrepresentable values. If the SPI survives
+MySQL, it will survive anything.
+
+- MySQL connector per [its detailed plan](connectors/mysql.md), including:
+  - Collation fidelity rules (binary vs. `utf8_unicode_ci` vs. `utf8mb4_general_ci`)
+  - Zero-date handling (`0000-00-00` → NULL / error / custom mapping)
+  - Replica lag bounding (GTIDs, `Seconds_Behind_Master` monitoring)
+  - Safe high watermark from `SHOW PROCESSLIST` instead of `pg_stat_activity`
+  - Streaming LIMIT-OFFSET pagination instead of exported snapshots
+  - Type mapping for MySQL-specific types (ENUM, SET, JSON, GEOMETRY)
+
+**Exit criteria.** The MySQL differential correctness suite passes, including collation fidelity
+(`_ci`, `_cs`, `_bin`). Zero-date handling is correctly configurable. Replica lag is bounded and
+monitored. The SPI required no breaking change to accommodate MySQL — or if it did, the change is
+documented as a lesson.
+
+---
+
+## Out of Scope
+
+This project is an extraction layer: source database → Arrow. Sink functionality is explicitly
+out of scope and delegated to DataFusion, Ballista, or the orchestrator. The following items are
+not part of this project's scope:
+
+### Sink Operations (Out of Scope)
+| Item | Delegated to |
 | --- | --- |
-| [Python wrapper](python-bindings.md) | Explicitly out of scope. Placeholder design exists so the Rust API stays bindable |
-| Log-based CDC ([Postgres](connectors/postgres.md#8-future-logical-replication-cdc), [MySQL](connectors/mysql.md#9-future-binlog-cdc)) | The correct fix for deletes and commit skew, but replication slots and binlog retention are footguns that need real operational maturity first |
-| Aggregate and join pushdown | Highest translation risk, lowest value for extraction workloads |
-| Additional connectors (ScyllaDB, MongoDB, SQL Server) | Not until the SPI has been proven by two dissimilar implementations |
-| Web UI | An orchestrator already has one. Metrics and CLI output are the interface |
+| Parquet writing | DataFusion ParquetWriter or Ballista sink |
+| CSV/JSON writing | DataFusion writers |
+| GCS/S3 upload | Ballista or orchestrator |
+| BigQuery load | BigQuery Rust client or orchestrator |
+| Checkpoint finalization | Orchestrator or external checkpoint service |
+
+### Other Out of Scope Items
+| Item | Why it is out of scope |
+| --- | --- |
+| [Python wrapper](python-bindings.md) | Not part of core extraction engine. Placeholder design exists so the Rust API stays bindable |
+| Cross-source joins | Better handled by orchestrator or DataFusion, not part of extraction scope |
+| Log-based CDC ([Postgres](connectors/postgres.md#8-future-logical-replication-cdc), [MySQL](connectors/mysql.md#9-future-binlog-cdc)) | Replication slots and binlog retention are operational footguns |
+| Aggregate and join pushdown | High translation risk, low value for extraction workloads |
+| Additional connectors (ScyllaDB, MongoDB, SQL Server) | Wait for second connector proof of concept (MySQL) first |
+| Web UI | Orchestrators provide their own. CLI and metrics are the interface |
+| Object store source (Parquet/CSV) | DataFusion handles this natively |
 
 ---
 
@@ -148,9 +205,6 @@ Worth writing down, since these are the ways a hobby project like this quietly d
 - **Pushdown that is fast and wrong.** A silent correctness bug destroys trust permanently, and
   it is trivially easy to introduce here. This is why fidelity rules and the differential test
   suite are Phase 1 work rather than a later hardening pass.
-- **Chasing a benchmark number.** "Faster than PySpark" is a side effect. Source-aware optimization
-  and incremental extraction are the actual product, and a Rust DataFrame library that is 3× faster
-  at reading a table is not interesting to anyone.
-- **Taking down a production database.** One incident caused by an extraction job forcing a
-  sequential scan on a primary during business hours ends adoption. The cost model, statement
-  timeouts, small connection pools, and conservative defaults all exist for this reason.
+- **Becoming a sink framework.** The moment work starts on Parquet writers, BigQuery integration, or
+  S3 upload, this project loses focus. Sinks are DataFusion's job, Ballista's job, or the
+  orchestrator's job — not ours. We extract to Arrow and stop.

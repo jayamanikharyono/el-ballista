@@ -110,3 +110,42 @@ pub fn max_timestamp_column(batch: &RecordBatch, column_name: &str) -> Option<Da
         .max()
         .and_then(DateTime::<Utc>::from_timestamp_micros)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_window_first_run() {
+        let hi_candidate = DateTime::<Utc>::from_timestamp(1000, 0).unwrap();
+        let max_window = Duration::seconds(500);
+
+        let window = build_window(None, hi_candidate, max_window);
+        assert_eq!(window.lo, DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        // Clamped by max_window from 0
+        assert_eq!(window.hi, DateTime::<Utc>::from_timestamp(500, 0).unwrap());
+    }
+
+    #[test]
+    fn test_build_window_within_max() {
+        let lo = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let hi_candidate = DateTime::<Utc>::from_timestamp(300, 0).unwrap();
+        let max_window = Duration::seconds(500);
+
+        let window = build_window(Some(lo), hi_candidate, max_window);
+        assert_eq!(window.lo, lo);
+        assert_eq!(window.hi, hi_candidate);
+    }
+
+    #[test]
+    fn test_clamp_to_observed() {
+        let hi = DateTime::<Utc>::from_timestamp(1000, 0).unwrap();
+        let observed = DateTime::<Utc>::from_timestamp(800, 0).unwrap();
+
+        assert_eq!(clamp_to_observed(hi, Some(observed)), observed);
+        assert_eq!(clamp_to_observed(hi, None), hi);
+
+        let later_observed = DateTime::<Utc>::from_timestamp(1200, 0).unwrap();
+        assert_eq!(clamp_to_observed(hi, Some(later_observed)), hi);
+    }
+}

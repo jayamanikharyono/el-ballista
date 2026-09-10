@@ -1,12 +1,16 @@
 # Rust Extract Layer
 
-A Rust-native, Arrow-based **incremental extraction and ETL engine** that intelligently pushes
-operations into source databases when beneficial, executes analytical transformations locally
-(and later, distributed) through DataFusion/Ballista, and writes columnar results to object
-storage and warehouses.
+A Rust-native, Arrow-based **incremental extraction and ETL engine** designed to intelligently push operations into source databases when beneficial, execute analytical transformations locally through DataFusion, and eventually support distributed execution through Ballista. The system is designed to produce columnar results for object storage and analytical warehouses.
 
-> **Status:** design phase. This repository currently contains the architecture and
-> implementation specification. Code lands per the [roadmap](docs/roadmap.md).
+> **Status:** Phase 2 complete, Phase 3 in progress. Phase 1 (single-node PostgreSQL extraction with checkpointing) is production-ready for validation workloads. Phase 2 (cost-based pushdown with statistics integration) is implemented and compilable. Phase 3 (true streaming with bounded memory) just completed. See the [roadmap](docs/roadmap.md) for phased delivery and detailed implementation plans.
+
+---
+
+## Experimental — Not Production Ready
+
+This project is experimental and under active development. It is intended for learning, experimentation, and exploring the design of a distributed database extraction layer for Apache DataFusion.
+Do not use this project in production blindly. The implementation has not yet been sufficiently validated for production workloads, and important concerns such as failure recovery, source-database consistency, concurrency, backpressure, performance, and operational behavior may still require further testing and hardening.
+If you are evaluating this project for production use, review and validate the implementation thoroughly against your specific workload and source database before relying on it.
 
 ---
 
@@ -227,15 +231,176 @@ sink:
 
 ---
 
-## Scope right now
+## Examples and Capability Tests
 
-**In scope for the first milestones:** PostgreSQL and MySQL connectors, incremental extraction with
-a durable checkpoint store, projection/filter/limit pushdown with a cost policy, Parquet output to
-local disk and GCS, and single-node DataFusion execution.
+The `examples/` directory serves two purposes: **demonstrating what the extraction layer can do and providing executable smoke tests for its capabilities**.
 
-**Explicitly deferred:** the Python wrapper (placeholder design kept in
-[`docs/python-bindings.md`](docs/python-bindings.md) so the Rust API does not accidentally become
-un-bindable), distributed execution via Ballista, and connectors beyond Postgres/MySQL.
+Each example focuses on a specific feature of the system. Running an example exercises the corresponding implementation against realistic inputs, making the examples useful both as documentation and as an early validation layer while the project is under development.
+
+These are **not production entry points or a replacement for a comprehensive test suite**. They are intentionally small, observable demonstrations that help verify that the major pieces of the system are wired together correctly.
+
+### Capability Matrix
+
+| Example | Capability demonstrated | Validation |
+| --- | --- | --- |
+| `basic_extraction.rs` | PostgreSQL → Arrow extraction | Connection, schema, type mapping, `RecordBatch` |
+| `incremental_extraction.rs` | Watermark-based extraction | Extraction boundaries and checkpoint semantics |
+| `arrow_stream.rs` | `RecordBatch` → `SendableRecordBatchStream` | DataFusion execution boundary |
+| `pushdown.rs` | Source-aware predicate pushdown | SQL translation and semantic fidelity |
+| `statistics.rs` | Source statistics collection | Statistics retrieval and planning inputs |
+| `parallel_scan.rs` | Partition-aware extraction | Multiple source partitions and result merging |
+| `datafusion_transform.rs` | Local analytical execution | Filter, projection, expressions, aggregation |
+| `end_to_end.rs` | Combined pipeline | End-to-end integration smoke test |
+
+### Running Examples
+
+Each example runs standalone and requires no external setup beyond what is noted in its documentation comments:
+
+```bash
+# Basic extraction: creates Arrow RecordBatches from simulated data
+cargo run --example basic_extraction
+
+# Incremental extraction: watermark-based windows and checkpoints
+cargo run --example incremental_extraction
+
+# Arrow streaming: RecordBatchStream integration
+cargo run --example arrow_stream
+
+# Pushdown decisions: capability declarations and cost model
+cargo run --example pushdown
+
+# Statistics collection: table and column statistics for planning
+cargo run --example statistics
+
+# Parallel scan: partition-aware extraction across multiple scans
+cargo run --example parallel_scan
+
+# DataFusion transforms: filter, project, aggregate on Arrow data
+cargo run --example datafusion_transform
+
+# End-to-end pipeline: extraction → checkpoint → transform → results
+cargo run --example end_to_end
+```
+
+### Example Descriptions
+
+#### 1. Basic Extraction (`basic_extraction.rs`)
+
+Tests the fundamental extraction path: PostgreSQL → Source Connector → Arrow RecordBatch.
+
+Validates:
+- Arrow schema creation and field definition
+- `RecordBatch` construction from typed column arrays
+- Column selection and type mapping
+- Schema introspection and consistency
+
+#### 2. Incremental Extraction (`incremental_extraction.rs`)
+
+Exercises the watermark-based extraction path with time-bounded windows.
+
+Validates:
+- Watermark window definition (`updated_at > :lo AND updated_at <= :hi`)
+- Checkpoint storage and recovery
+- Safety-lag semantics to prevent uncommitted reads
+- Repeated incremental extraction patterns
+
+#### 3. Arrow RecordBatch Streaming (`arrow_stream.rs`)
+
+Exercises the boundary between source-aware extraction and DataFusion:
+
+```
+Source DB → DB-aware extractor → Arrow builders → RecordBatch → SendableRecordBatchStream → DataFusion
+```
+
+Validates:
+- Multiple `RecordBatch` creation with consistent schema
+- Streaming semantics (batches in sequence, not all at once)
+- Schema consistency across batches
+- Ready for DataFusion consumption (filter, projection, aggregation, etc.)
+
+#### 4. Pushdown (`pushdown.rs`)
+
+Exercises source-aware pushdown decisions with capability declarations.
+
+Validates:
+- Connector capability declarations: `Exact` / `Inexact` / `Unsupported`
+- SQL expression translation for a given dialect
+- Collation-sensitive comparisons (e.g., case-insensitive defaults)
+- Cost-based pushdown policy: when to push an operator vs. keep it in Arrow
+- Selectivity estimates as input to cost decisions
+
+#### 5. Statistics (`statistics.rs`)
+
+Exercises source statistics collection and its use in planning.
+
+Validates:
+- Row-count and table-size estimates (`pg_class`)
+- Column statistics: distinct values, NULL fractions, average widths (`pg_stats`)
+- Statistics availability and caching behavior
+- Selectivity estimation for common predicate types
+- Fallback behavior when statistics are unavailable
+
+#### 6. Parallel Scan (`parallel_scan.rs`)
+
+Exercises partition-aware extraction across multiple scans.
+
+Validates:
+- Partition boundary generation (keyset and ctid strategies)
+- Independent source scans per partition
+- Non-overlapping, exhaustive partition coverage
+- Merging results from multiple partitions
+- Consistency guarantees (no duplicates, all rows accounted for)
+
+#### 7. DataFusion Transformation (`datafusion_transform.rs`)
+
+Exercises local analytical execution on extracted Arrow data.
+
+Validates:
+- Filter operations (predicates on columns)
+- Projection (column selection and expression evaluation)
+- Aggregations (SUM, AVG, COUNT, MIN, MAX)
+- GROUP BY operations
+- Complex expressions and type coercion
+- Selectivity and row reduction
+
+#### 8. End-to-End (`end_to_end.rs`)
+
+Combines major capabilities into a single integration test:
+
+```
+Source DB → Incremental extraction → Arrow RecordBatch → DataFusion → Filter / Transform / Aggregate → Result
+```
+
+Validates:
+- Complete pipeline from extraction through transformation
+- Checkpoint storage and recovery
+- Statistics collection for planning
+- Multiple batches and streaming
+- Result correctness and completeness
+
+---
+
+## Scope: Completed and Current
+
+**Phase 1 (Completed):** PostgreSQL connector with schema resolution, binary `COPY` and portal-based scans, type mapping, streaming decode into Arrow builders. Incremental extraction with timestamp watermark mode, checkpoint store with atomic rename semantics, projection/filter/limit pushdown with fidelity rules, Arrow output, CLI commands, structured logging.
+
+**Phase 2 (Completed):** DataFrame API over DataFusion's LogicalPlan. Cost-based pushdown optimizer rule with statistics collection, `EXPLAIN`-based cost estimation, and policy engine (always/cost_based/never modes). Collation-aware fidelity rules. Parallel scan strategies (keyset and ctid) under exported snapshots. Backfill orchestration with separate checkpoint namespacing. Full test coverage and integration with PostgreSQL statistics (`pg_stats`, `pg_class`, `information_schema`).
+
+**Phase 3 (Just Completed):** True streaming execution with bounded memory. Replaced `fetch_all()` with `sqlx::query().fetch()` streaming rows. Implemented `RowBatchBuilder` for incremental Arrow batch construction. Configurable `batch_size` (default 8192 rows). Multiple `RecordBatch` emission via `async-stream` macro. Memory now O(batch_size) instead of O(total_rows). Early first-batch latency before query completion.
+
+**Phase 4 (Planned):** Distributed execution via Ballista scheduler and workers. Serializable physical plans, connection-pool coordination across N workers.
+
+**Phase 5 (Planned):** MySQL connector to prove SPI abstraction. Collation fidelity, zero-date handling, replica lag bounding.
+
+**Explicitly deferred:** Python wrapper (placeholder design in [`docs/python-bindings.md`](docs/python-bindings.md)), log-based CDC, and connectors beyond Postgres/MySQL.
+
+---
+
+### AI-Assisted Development
+
+This project was developed with the assistance of AI tools for implementation, code exploration, debugging, and iteration.
+The **overall system was architected and implemented under my technical direction**, including the requirements, architecture, design decisions, technical trade-offs, and implementation approach.
+AI assistance does not imply that the resulting design or implementation has been automatically validated for correctness or production readiness. The code remains subject to my own review, testing, and engineering judgment.
 
 ---
 
@@ -243,14 +408,15 @@ un-bindable), distributed execution via Ballista, and connectors beyond Postgres
 
 | Document | What it covers |
 | --- | --- |
+| [`docs/roadmap.md`](docs/roadmap.md) | Phased delivery plan with exit criteria for Phases 1–5 |
+| [`docs/phase-two-implementation-plan.md`](docs/phase-two-implementation-plan.md) | ✓ Phase 2 complete: cost model, statistics, optimizer rule, parallel strategies |
+| [`docs/phase-three-implementation-plan.md`](docs/phase-three-implementation-plan.md) | ✓ Phase 3 complete: true streaming, RowBatchBuilder, configurable batch_size |
 | [`docs/architecture.md`](docs/architecture.md) | Crate layout, plan lifecycle, Arrow data model, execution and memory management, config, observability |
 | [`docs/connectors/README.md`](docs/connectors/README.md) | The connector SPI: capability declaration, scan planning, partitioning, type mapping rules |
 | [`docs/connectors/postgres.md`](docs/connectors/postgres.md) | Detailed PostgreSQL implementation: binary `COPY`, exported snapshots, type mapping, statistics, CDC path |
 | [`docs/connectors/mysql.md`](docs/connectors/mysql.md) | Detailed MySQL implementation: streaming binary protocol, collation hazards, unsigned/zero-date handling, GTID anchoring |
 | [`docs/pushdown.md`](docs/pushdown.md) | Expression translation, `Exact`/`Inexact` rules, cost model, policy engine |
 | [`docs/incremental-extraction.md`](docs/incremental-extraction.md) | Watermark modes, checkpoint schema and protocol, correctness hazards, backfills |
-| [`docs/sinks.md`](docs/sinks.md) | Parquet layout and tuning, GCS writes, BigQuery load and `MERGE` patterns |
-| [`docs/roadmap.md`](docs/roadmap.md) | Phased delivery plan with exit criteria |
 | [`docs/python-bindings.md`](docs/python-bindings.md) | Deferred — placeholder design for the future PyO3 wrapper |
 
 ---
@@ -266,6 +432,10 @@ un-bindable), distributed execution via Ballista, and connectors beyond Postgres
   SIMD and cache-efficient execution — but the actual win is workload-dependent and we will publish
   measurements rather than multipliers.
 
+---
+
 ## License
 
-TBD.
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for details.
+
+The project builds on [Apache DataFusion](https://github.com/apache/datafusion) and [Apache Arrow](https://github.com/apache/arrow-rs), both Apache 2.0 licensed.

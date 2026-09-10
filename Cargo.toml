@@ -19,3 +19,36 @@ async-trait = "0.1.92"
 futures = "0.3.34"
 serde_json = "1.0.151"
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
+async-stream = "0.3"
+
+[[example]]
+name = "basic_extraction"
+path = "examples/basic_extraction.rs"
+
+[[example]]
+name = "incremental_extraction"
+path = "examples/incremental_extraction.rs"
+
+[[example]]
+name = "arrow_stream"
+path = "examples/arrow_stream.rs"
+
+[[example]]
+name = "pushdown"
+path = "examples/pushdown.rs"
+
+[[example]]
+name = "statistics"
+path = "examples/statistics.rs"
+
+[[example]]
+name = "parallel_scan"
+path = "examples/parallel_scan.rs"
+
+[[example]]
+name = "datafusion_transform"
+path = "examples/datafusion_transform.rs"
+
+[[example]]
+name = "end_to_end"
+path = "examples/end_to_end.rs"

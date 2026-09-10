@@ -11,9 +11,9 @@ pub enum ExtractorError {
     #[error("Unsupported PostgreSQL type: {0}")]
     UnsupportedType(String),
 
-    // #[error("Invalid column: {0}")]
-    // InvalidColumn(String),
-    //
-    // #[error("Invalid table: {0}")]
-    // InvalidTable(String)
+    #[error("Statistics collection error: {0}")]
+    Statistics(String),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }

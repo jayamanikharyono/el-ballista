@@ -53,4 +53,20 @@ impl TableMetadata {
             None => self.clone(),
         }
     }
+
+    /// Select columns by catalog index — what DataFusion's projection pushdown hands a
+    /// `TableProvider` (`Option<&Vec<usize>>` into the table's full column list), as opposed to
+    /// `select_columns`'s by-name lookup used by the checkpoint-driven CLI path.
+    pub fn select_indices(&self, indices: &[usize]) -> TableMetadata {
+        let columns = indices
+            .iter()
+            .filter_map(|&i| self.columns.get(i).cloned())
+            .collect();
+
+        TableMetadata {
+            schema_name: self.schema_name.clone(),
+            table_name: self.table_name.clone(),
+            columns,
+        }
+    }
 }

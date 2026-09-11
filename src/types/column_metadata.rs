@@ -9,6 +9,8 @@ pub struct ColumnMetadata {
     pub numeric_precision: Option<i32>,
     pub numeric_scale: Option<i32>,
     pub udt_name: Option<String>,
+    #[sqlx(default)]
+    pub collation_name: Option<String>,
 }
 
 impl fmt::Display for ColumnMetadata {

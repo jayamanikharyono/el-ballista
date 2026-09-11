@@ -3,6 +3,14 @@ name = "rust-ballista-extraction-layer"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rust_ballista_extraction_layer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-ballista-extraction-layer"
+path = "src/main.rs"
+
 [dependencies]
 arrow = "58.4"
 ballista = "54.1.0"
@@ -10,6 +18,7 @@ bigdecimal = "0.4.10"
 chrono = { version = "0.4.45", features = ["serde"] }
 datafusion = "54.1.0"
 log = "0.4.34"
+once_cell = "1.20"
 parquet = "58.4"
 serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "bigdecimal", "json", "uuid"] }
@@ -19,3 +28,28 @@ async-trait = "0.1.92"
 futures = "0.3.34"
 serde_json = "1.0.151"
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
+async-stream = "0.3"
+
+[[example]]
+name = "incremental_extraction"
+path = "examples/incremental_extraction.rs"
+
+[[example]]
+name = "end_to_end"
+path = "examples/end_to_end.rs"
+
+[[example]]
+name = "full_extraction"
+path = "examples/full_extraction.rs"
+
+[[example]]
+name = "daily_incremental"
+path = "examples/daily_incremental.rs"
+
+[[example]]
+name = "hourly_incremental"
+path = "examples/hourly_incremental.rs"
+
+[[example]]
+name = "parallel_extraction"
+path = "examples/parallel_extraction.rs"

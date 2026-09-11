@@ -7,14 +7,14 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use arrow::record_batch::RecordBatch;
-use crate::extractor::postgres::{
+use crate::connector::postgres::{
     query_builder::PostgresQueryBuilder,
     row_adapter::PostgresRowAdapter,
     schema_reader::PostgresSchemaReader,
 };
 
 use crate::{
-    extractor::errors::ExtractorError,
+    connector::errors::ExtractorError,
     types::table_metadata::TableMetadata
 };
 
@@ -58,7 +58,7 @@ impl PostgresExtractor {
                         .await?;
                     // `statement_timeout_setting` is a formatted integer (milliseconds) we
                     // built ourselves, never user input — safe to assert despite being a
-                    // dynamic string. sqlx 0.9 requires this audit annotation for any SQL
+                    // dynamic string. SQLX 0.9 requires this audit annotation for any SQL
                     // string that isn't a `&'static str` literal.
                     sqlx::query(sqlx::AssertSqlSafe(format!(
                         "SET statement_timeout = '{statement_timeout_setting}'"
@@ -113,7 +113,7 @@ impl PostgresExtractor {
 
         // 3. Build Arrow schema.
         let arrow_schema =
-            PostgresRowAdapter::build_arrow_schema(&table_metadata);
+            PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
 
         // 4. Build SELECT column list.
         let mut query_builder = QueryBuilder::<Postgres>::new("");
@@ -134,6 +134,114 @@ impl PostgresExtractor {
         // streaming batches of `batch_size` rows as docs/connectors/README.md §2 specifies.
         // Streaming decode and the binary `COPY` bulk path (docs/connectors/postgres.md §2) are
         // deferred — see docs/phase-one-implementation-plan.md §6.
+        let rows = query_builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?;
+
+        // 6. Convert PostgreSQL rows into Arrow RecordBatch.
+        let record_batch =
+            PostgresRowAdapter::rows_to_record_batch(
+                &rows,
+                &table_metadata,
+                arrow_schema,
+            )?;
+
+        Ok(record_batch)
+    }
+
+    /// Extract all rows from a table without date filtering.
+    /// This is used for full table loads where no incremental window is needed.
+    pub async fn extract_full_table(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+    ) -> Result<RecordBatch, ExtractorError> {
+        // 1. Read PostgreSQL schema.
+        let schema_reader = PostgresSchemaReader::new(&self.pool);
+
+        let table_metadata : TableMetadata = schema_reader
+            .get_table_metadata(table_name)
+            .await?;
+
+        // 2. Select requested columns.
+        let table_metadata  =
+            table_metadata.select_columns(columns.as_deref());
+
+        log::debug!("{}", table_metadata);
+
+        // 3. Build Arrow schema.
+        let arrow_schema =
+            PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
+
+        // 4. Build SELECT query (no WHERE clause).
+        let mut query_builder = QueryBuilder::<Postgres>::new("");
+
+        PostgresQueryBuilder::build_full_table(
+            &mut query_builder,
+            &table_metadata,
+        );
+
+        log::info!("Executing query: {:#?}", query_builder.sql());
+
+        // 5. Execute query.
+        let rows = query_builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?;
+
+        // 6. Convert PostgreSQL rows into Arrow RecordBatch.
+        let record_batch =
+            PostgresRowAdapter::rows_to_record_batch(
+                &rows,
+                &table_metadata,
+                arrow_schema,
+            )?;
+
+        Ok(record_batch)
+    }
+
+    /// Extract a keyset partition: rows where `partition_column` is in range [lo, hi).
+    /// Used for parallel extraction by primary key or indexed column ranges.
+    pub async fn extract_keyset_partition(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        partition_column: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<RecordBatch, ExtractorError> {
+        // 1. Read PostgreSQL schema.
+        let schema_reader = PostgresSchemaReader::new(&self.pool);
+
+        let table_metadata : TableMetadata = schema_reader
+            .get_table_metadata(table_name)
+            .await?;
+
+        // 2. Select requested columns.
+        let table_metadata  =
+            table_metadata.select_columns(columns.as_deref());
+
+        log::debug!("{}", table_metadata);
+
+        // 3. Build Arrow schema.
+        let arrow_schema =
+            PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
+
+        // 4. Build SELECT query with keyset predicate.
+        let mut query_builder = QueryBuilder::<Postgres>::new("");
+
+        PostgresQueryBuilder::build_keyset_partition(
+            &mut query_builder,
+            &table_metadata,
+            partition_column,
+            lo,
+            hi,
+        );
+
+        log::info!("Executing query: {:#?}", query_builder.sql());
+
+        // 5. Execute query.
         let rows = query_builder
             .build()
             .fetch_all(&self.pool)

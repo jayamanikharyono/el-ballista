@@ -1,4 +1,4 @@
-use crate::extractor::errors::ExtractorError;
+use crate::connector::errors::ExtractorError;
 use datafusion::error::DataFusionError;
 use sqlx::Error as SqlxError;
 
@@ -21,7 +21,4 @@ pub enum AppError {
 
     #[error("incremental extraction error: {0}")]
     Incremental(String),
-
-    #[error("sink error: {0}")]
-    Sink(String),
 }

@@ -257,26 +257,20 @@ These are **not production entry points or a replacement for a comprehensive tes
 Each example runs standalone and requires no external setup beyond what is noted in its documentation comments:
 
 ```bash
-# Basic extraction: creates Arrow RecordBatches from simulated data
-cargo run --example basic_extraction
+# Full Extraction
+cargo run --example full_extraction
 
 # Incremental extraction: watermark-based windows and checkpoints
 cargo run --example incremental_extraction
 
-# Arrow streaming: RecordBatchStream integration
-cargo run --example arrow_stream
+# Hourly Incremental Extraction
+cargo run --example hourly_incremental
 
-# Pushdown decisions: capability declarations and cost model
-cargo run --example pushdown
-
-# Statistics collection: table and column statistics for planning
-cargo run --example statistics
+# Daily Incremental Extraction
+cargo run --example daily_incremental
 
 # Parallel scan: partition-aware extraction across multiple scans
-cargo run --example parallel_scan
-
-# DataFusion transforms: filter, project, aggregate on Arrow data
-cargo run --example datafusion_transform
+cargo run --example parallel_extraction
 
 # End-to-end pipeline: extraction → checkpoint → transform → results
 cargo run --example end_to_end

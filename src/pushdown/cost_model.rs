@@ -3,7 +3,7 @@
 //! Implements the decision tree from docs/pushdown.md §4.2:
 //! 1. Index available → push (near-free, huge win)
 //! 2. No index but selectivity < keep_threshold and cost < budget → push
-//! 3. Otherwise keep (execute in Arrow)
+//! 3. Otherwise, keep (execute in Arrow)
 
 use super::{Fidelity, Predicate};
 use crate::pushdown::stats::{SourceStatistics, ColumnStats};
@@ -182,7 +182,7 @@ pub fn estimate_selectivity_from_stats(
             estimate_comparison_selectivity(left, right, op, stats)
         }
         Predicate::And(l, r) => {
-            // AND: multiply selectivities (assumes independence).
+            // AND: multiply selectivity (assumes independence).
             let l_sel = estimate_selectivity_from_stats(l, stats);
             let r_sel = estimate_selectivity_from_stats(r, stats);
             l_sel * r_sel
@@ -278,7 +278,7 @@ fn estimate_comparison_selectivity(
 pub fn estimate_source_cost(predicate: &Predicate, stats: &SourceStatistics) -> u64 {
     // Cost heuristic: proportional to table size and selectivity.
     let selectivity = estimate_selectivity_from_stats(predicate, stats);
-    let base_cost = (stats.table_size_bytes / 1024) as u64; // Convert to KB
+    let base_cost = stats.table_size_bytes / 1024; // Convert to KB
     let cost = (base_cost as f64 * selectivity) as u64;
     cost.max(1) // Minimum cost of 1
 }

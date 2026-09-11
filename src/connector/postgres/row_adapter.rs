@@ -2,7 +2,13 @@
 //! extractor/postgres/row_adapter.rs
 //! This module is used to convert the PostgreSQL rows to the Arrow record batch.
 //! Phase 3: Includes RowBatchBuilder for incremental row-by-row appending with streaming batches.
-
+#[allow(unused_variables)]
+use std::sync::Arc;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use sqlx::{
+    postgres::PgRow,
+    Row,
+};
 use arrow::array::{
     ArrayBuilder, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, ListBuilder, StringArray, StringBuilder,
@@ -11,17 +17,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{Schema, Field, DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use std::sync::Arc;
-use sqlx::{
-    postgres::PgRow,
-    Row,
-};
 use bigdecimal::{BigDecimal,ToPrimitive};
 
-use crate::extractor::errors::ExtractorError;
+use crate::connector::errors::ExtractorError;
 use crate::types::{ColumnMetadata, TableMetadata};
-use crate::extractor::postgres::arrow_type_mapper::ArrowTypeMapper;
+use crate::connector::postgres::arrow_type_mapper::ArrowTypeMapper;
 
 pub struct PostgresRowAdapter;
 
@@ -53,7 +53,7 @@ impl RowBatchBuilder {
                 DataType::Binary => Box::new(BinaryBuilder::new()),
                 DataType::Date32 => Box::new(Date32Builder::new()),
                 DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-                    let mut builder = TimestampMicrosecondBuilder::new();
+                    let builder = TimestampMicrosecondBuilder::new();
                     if tz.is_some() {
                         // Timezone is preserved in schema, not in builder
                     }
@@ -641,7 +641,7 @@ impl PostgresRowAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, TimeUnit};
+    use arrow::datatypes::{DataType};
     use crate::types::ColumnMetadata;
 
     /// Helper to create a simple test table metadata

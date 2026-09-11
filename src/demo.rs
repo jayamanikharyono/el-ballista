@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::config::{JobConfig, SourceConfig, IncrementalConfig, SinkConfig, CheckpointConfig, PushdownConfig, ParallelScanConfig, ExecutionConfig};
 use crate::errors::AppError;
-use crate::extractor::postgres::PostgresExtractor;
+use crate::connector::postgres::PostgresExtractor;
 use crate::pushdown::dialect::{SqlDialect, PostgresDialect};
 use crate::pushdown::stats::StatisticsCollector;
 use crate::types::ColumnMetadata;
@@ -71,7 +71,7 @@ pub async fn run() -> Result<(), AppError> {
         numeric_precision: None,
         numeric_scale: None,
         udt_name: None,
-        collation: Some("C".to_string()),
+        collation_name: Some("C".to_string()),
     };
     
     let text_col_citext = ColumnMetadata {
@@ -81,7 +81,7 @@ pub async fn run() -> Result<(), AppError> {
         numeric_precision: None,
         numeric_scale: None,
         udt_name: None,
-        collation: Some("en_US".to_string()),
+        collation_name: Some("en_US".to_string()),
     };
 
     let fidelity_c = dialect.column_literal_fidelity(&text_col_c, true, false);

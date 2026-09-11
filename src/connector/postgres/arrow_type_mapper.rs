@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::extractor::errors::ExtractorError;
+use crate::connector::errors::ExtractorError;
 use crate::types::ColumnMetadata;
 
 pub struct ArrowTypeMapper;
@@ -93,6 +93,7 @@ mod tests {
             numeric_precision: Some(20),
             numeric_scale: Some(4),
             udt_name: udt_name.map(String::from),
+            collation_name: None,
         }
     }
 

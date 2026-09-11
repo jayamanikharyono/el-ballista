@@ -1,4 +1,4 @@
-mod extractor;
+mod connector;
 mod types;
 mod errors;
 mod config;

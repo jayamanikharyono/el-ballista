@@ -9,28 +9,44 @@
 //! - Checkpoint boundary calculations
 //! - Repeated incremental extraction patterns
 //!
+//! Uses the extraction layer to demonstrate incremental data extraction.
+//!
 //! Usage:
 //! ```bash
 //! cargo run --example incremental_extraction
 //! ```
 
+use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
 use chrono::{Duration, Utc};
 use std::fs;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  Incremental Extraction Example");
-    println!("  Watermark-Based Extraction with Checkpointing");
-    println!("═══════════════════════════════════════════════════════════\n");
-    
     // 1. Setup
-    println!("► Step 1: Setup checkpoint store");
-    fs::create_dir_all(".checkpoints")?;
-    println!("  ✓ Checkpoint directory: .checkpoints/");
+    println!("► Step 1: Initialize");
     
-    // 2. Define extraction window
-    println!("\n► Step 2: Define extraction window");
+    fs::create_dir_all(".checkpoints")?;
+    println!("  ✓ Checkpoint store: .checkpoints/");
+    
+    // 2. Connect to PostgreSQL using extraction layer
+    println!("\n► Step 2: Connect via extraction layer");
+    
+    let extractor = PostgresExtractor::connect(
+        "localhost",
+        5432,
+        "postgres",
+        "postgres",
+        "app",
+        5,
+        30000,
+        "incremental_extraction_example",
+    ).await?;
+    
+    println!("  ✓ Connected to database");
+    println!("  ✓ Extraction layer initialized");
+    
+    // 3. Define extraction window
+    println!("\n► Step 3: Define extraction window");
     let now = Utc::now();
     let safety_lag = Duration::minutes(5);
     let window_size = Duration::hours(1);
@@ -44,16 +60,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Safety lag: {} minutes", safety_lag.num_minutes());
     println!("  Window size: {} hours", window_size.num_hours());
     
-    // 3. Watermark query simulation
-    println!("\n► Step 3: Watermark query (simulated)");
-    println!("  Query:");
-    println!("    SELECT * FROM public.orders");
-    println!("    WHERE updated_at > '{}' ", window_lo.to_rfc3339());
-    println!("      AND updated_at <= '{}'", window_hi.to_rfc3339());
-    println!("  (Simulated result: 150 rows)");
+    // 4. Execute incremental extraction using extraction layer
+    println!("\n► Step 4: Execute incremental extraction via extraction layer");
     
-    // 4. Checkpoint
-    println!("\n► Step 4: Store checkpoint");
+    let table_name = "public.orders";
+    let columns = Some(vec!["order_id", "customer_name", "amount", "updated_at"]);
+    let timestamp_column = "updated_at";
+    
+    println!("  Using extraction layer method:");
+    println!("    extractor.extract_incremental_window(");
+    println!("      \"{}\",", table_name);
+    println!("      {:?},", columns);
+    println!("      \"{}\",", timestamp_column);
+    println!("      {},", window_lo.to_rfc3339());
+    println!("      {},", window_hi.to_rfc3339());
+    println!("    )");
+    
+    let batch = extractor.extract_incremental_window(
+        table_name,
+        columns,
+        timestamp_column,
+        window_lo,
+        window_hi,
+    ).await?;
+    
+    let row_count = batch.num_rows();
+    println!("  ✓ Incremental extraction complete");
+    println!("  ✓ Extracted {} rows via extraction layer", row_count);
+    
+    // 5. Store checkpoint
+    println!("\n► Step 5: Store checkpoint");
     let checkpoint = serde_json::json!({
         "job_id": "orders_incremental",
         "table": "public.orders",
@@ -61,36 +97,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "last_checkpoint": window_lo.to_rfc3339(),
         "current_checkpoint": window_hi.to_rfc3339(),
         "extraction_time": now.to_rfc3339(),
-        "row_count": 150,
+        "row_count": row_count,
     });
     
     let checkpoint_path = ".checkpoints/orders_incremental__default.json";
     fs::write(checkpoint_path, checkpoint.to_string())?;
     println!("  ✓ Checkpoint saved: {}", checkpoint_path);
-    println!("  ✓ Rows extracted: 150");
+    println!("  ✓ Rows extracted: {}", row_count);
     
-    // 5. Repeated extraction
-    println!("\n► Step 5: Simulate next extraction window");
+    // 6. Simulate next extraction window
+    println!("\n► Step 6: Next extraction window (not executed)");
     let next_window_lo = window_hi;
     let next_window_hi = window_hi + window_size;
     
     println!("  Next window: {} to {}", 
         next_window_lo.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         next_window_hi.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    println!("  (Simulated result: 180 rows)");
+    println!("  (Would extract from next checkpoint boundaries)");
     
-    // 6. Correctness properties
-    println!("\n► Step 6: Correctness properties validated");
+    // 7. Correctness properties
+    println!("\n► Step 7: Correctness properties validated");
     println!("  ✓ Windows are non-overlapping (no duplicates)");
     println!("  ✓ Windows are exhaustive (no gaps)");
     println!("  ✓ Boundaries use transactional consistency");
     println!("  ✓ Safety lag prevents uncommitted reads");
     
-    // 7. Status
+    // 8. Status
     println!("\n► Result");
     println!("  ✓ Incremental extraction successful");
-    println!("  ✓ First window: 150 rows");
-    println!("  ✓ Next window: 180 rows (simulated)");
+    println!("  ✓ Current window: {} rows", row_count);
     println!("  ✓ Checkpoint stored");
     println!("  ✓ Watermark semantics validated");
     

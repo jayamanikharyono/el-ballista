@@ -61,7 +61,7 @@ impl SqlDialect for PostgresDialect {
 
         if literal_is_text {
             // Text comparisons depend on collation. Check if column has a known-safe collation.
-            if let Some(collation) = &column.collation {
+            if let Some(collation) = &column.collation_name {
                 // "C" and "POSIX" collations are deterministic and Unicode-safe.
                 // Binary-safe equality is OK, but ordering might diverge on non-ASCII.
                 // Conservative: only equality on deterministic ASCII-safe collations is Exact.
@@ -95,8 +95,8 @@ impl SqlDialect for PostgresDialect {
 
         // String types: check collation consistency.
         if is_text_type(&left_column.data_type) {
-            let left_collation = left_column.collation.as_deref();
-            let right_collation = right_column.collation.as_deref();
+            let left_collation = left_column.collation_name.as_deref();
+            let right_collation = right_column.collation_name.as_deref();
 
             match (left_collation, right_collation) {
                 (Some(l), Some(r)) if l == r && (l == "C" || l == "POSIX") => Fidelity::Exact,
@@ -145,7 +145,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             udt_name: None,
-            collation: collation.map(String::from),
+            collation_name: collation.map(String::from),
         }
     }
 

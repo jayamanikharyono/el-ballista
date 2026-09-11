@@ -5,7 +5,7 @@
 
 use sqlx::PgPool;
 
-use crate::extractor::errors::ExtractorError;
+use crate::connector::errors::ExtractorError;
 
 /// Parallel scan strategy: how to partition the table across connections.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub enum ParallelStrategy {
     None,
     /// Partition by primary key ranges using keyset predicates.
     Keyset { partition_column: String },
-    /// Partition by physical tuple ID ranges (requires exported snapshot).
+    /// Partition by physical tuple ID ranges (requires to be exported snapshot).
     Ctid,
 }
 

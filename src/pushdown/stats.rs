@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::extractor::errors::ExtractorError;
+use crate::connector::errors::ExtractorError;
 
 /// Per-column statistics from pg_stats.
 #[derive(Debug, Clone)]

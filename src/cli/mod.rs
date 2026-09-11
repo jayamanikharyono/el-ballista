@@ -3,7 +3,7 @@
 //! Hand-rolled arg parsing rather than pulling in `clap` — this pass added several new
 //! dependencies already (`serde`, `parquet`) and there was no way to compile-check any of it in
 //! the environment this was written in, so new dependencies were kept to ones already resolved
-//! in Cargo.lock transitively. `clap` was not one of them.
+//! in Cargo.Lock transitively. `clap` was not one of them.
 //!
 //! Subcommands: `rel run` / `rel checkpoint` (Phase 1), `rel demo`, and the Phase 2 additions
 //! `rel plan` (per-filter push/keep decisions, docs/pushdown.md) and `rel backfill` (a bounded
@@ -21,7 +21,7 @@ use crate::checkpoint::json_store::JsonCheckpointStore;
 use crate::checkpoint::{CheckpointStore, JobKey, RunStats};
 use crate::config::JobConfig;
 use crate::errors::AppError;
-use crate::extractor::postgres::{PostgresExtractor, PostgresTableProvider};
+use crate::connector::postgres::{PostgresExtractor, PostgresTableProvider};
 use crate::incremental::{build_window, clamp_to_observed, max_timestamp_column, safe_high_watermark};
 use crate::pushdown::PushdownPolicy;
 
@@ -345,7 +345,7 @@ fn parse_filter_value(raw: &str) -> Expr {
 }
 
 /// `rel backfill` — docs/incremental-extraction.md §7: the same extract-then-sink machinery as
-/// `rel run`, but with an explicit `(from, to]` window instead of one resolved from the safe
+/// `rel run`, but with an explicit `[from, to]` window instead of one resolved from the safe
 /// high watermark, committed under its own checkpoint namespace so it can't clobber the live
 /// incremental job's watermark. What's deferred from the doc: chunking a large range into
 /// bounded pieces with parallelism (`--chunk`/`--parallel`) — this runs the whole range as one

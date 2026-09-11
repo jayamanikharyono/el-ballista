@@ -9,8 +9,8 @@ use datafusion::{
 };
 use datafusion::catalog::Session;
 use sqlx::PgPool;
-use crate::extractor::errors::ExtractorError;
-use crate::extractor::postgres::execution_plan::PostgresExecutionPlan;
+use crate::connector::errors::ExtractorError;
+use crate::connector::postgres::execution_plan::PostgresExecutionPlan;
 use crate::pushdown::{self, PushdownPolicy};
 use crate::types::TableMetadata;
 use super::{

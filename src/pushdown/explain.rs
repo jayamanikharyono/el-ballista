@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::extractor::errors::ExtractorError;
+use crate::connector::errors::ExtractorError;
 
 /// The plan node type that Postgres used to execute the query.
 #[derive(Debug, Clone, PartialEq, Eq)]

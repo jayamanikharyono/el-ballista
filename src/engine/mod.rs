@@ -7,11 +7,10 @@
 use std::sync::Arc;
 use datafusion::prelude::SessionContext;
 use sqlx::PgPool;
-
 use crate::config::JobConfig;
 use crate::checkpoint::CheckpointStore;
 use crate::errors::AppError;
-use crate::extractor::postgres::PostgresExtractor;
+use crate::connector::postgres::PostgresExtractor;
 
 /// The primary entry point for extraction pipelines. Wraps DataFusion's SessionContext,
 /// manages source connectors and checkpoints, and provides a fluent builder API.
@@ -94,7 +93,7 @@ pub struct SourceDataFrame {
 
 impl SourceDataFrame {
     /// Configure incremental extraction with a watermark column.
-    /// Resolves the `(lo, hi]` window from the checkpoint store and injects it into
+    /// Resolves the `[lo, hi]` window from the checkpoint store and injects it into
     /// the query plan.
     pub fn incremental(self, _watermark: Watermark) -> Self {
         // TODO: Resolve checkpoint and inject watermark predicate

@@ -3126,6 +3126,7 @@ dependencies = [
  "datafusion",
  "futures",
  "log",
+ "once_cell",
  "parquet",
  "serde",
  "serde_json",

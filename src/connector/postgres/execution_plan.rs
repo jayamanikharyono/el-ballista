@@ -1,6 +1,8 @@
 use std::sync::Arc;
+//use futures::stream::StreamExt;
 use arrow::datatypes::Schema;
 use chrono::{DateTime, Utc};
+use sqlx::PgPool;
 use datafusion::{execution::TaskContext, physical_plan::{
     DisplayAs,
     DisplayFormatType,
@@ -13,10 +15,9 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use sqlx::PgPool;
-use futures::stream::StreamExt;
-use crate::extractor::errors::ExtractorError;
-use crate::extractor::postgres::row_adapter;
+
+use crate::connector::errors::ExtractorError;
+use crate::connector::postgres::row_adapter;
 use crate::pushdown::Predicate;
 use crate::types::table_metadata::TableMetadata;
 
@@ -304,11 +305,11 @@ mod tests {
         )
         .unwrap();
 
-        let disp = displayable(&plan);
-        let s1 = format!("{}", disp.indent(true));
+        let display_execution_plan = displayable(&plan);
+        let s1 = format!("{}", display_execution_plan.indent(true));
         assert!(s1.contains("orders"));
 
-        let s2 = format!("{}", disp.one_line());
+        let s2 = format!("{}", display_execution_plan.one_line());
         assert!(s2.contains("orders"));
     }
 }

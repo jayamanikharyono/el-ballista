@@ -403,8 +403,8 @@ AI assistance does not imply that the resulting design or implementation has bee
 | Document | What it covers |
 | --- | --- |
 | [`docs/roadmap.md`](docs/roadmap.md) | Phased delivery plan with exit criteria for Phases 1–5 |
-| [`docs/phase-two-implementation-plan.md`](docs/phase-two-implementation-plan.md) | ✓ Phase 2 complete: cost model, statistics, optimizer rule, parallel strategies |
-| [`docs/phase-three-implementation-plan.md`](docs/phase-three-implementation-plan.md) | ✓ Phase 3 complete: true streaming, RowBatchBuilder, configurable batch_size |
+| [`docs/roadmap/phase-two-implementation-plan.md`](docs/roadmap/phase-two-implementation-plan.md) | ✓ Phase 2 complete: cost model, statistics, optimizer rule, parallel strategies |
+| [`docs/roadmap/phase-three-implementation-plan.md`](docs/roadmap/phase-three-implementation-plan.md) | ✓ Phase 3 complete: true streaming, RowBatchBuilder, configurable batch_size |
 | [`docs/architecture.md`](docs/architecture.md) | Crate layout, plan lifecycle, Arrow data model, execution and memory management, config, observability |
 | [`docs/connectors/README.md`](docs/connectors/README.md) | The connector SPI: capability declaration, scan planning, partitioning, type mapping rules |
 | [`docs/connectors/postgres.md`](docs/connectors/postgres.md) | Detailed PostgreSQL implementation: binary `COPY`, exported snapshots, type mapping, statistics, CDC path |

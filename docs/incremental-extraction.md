@@ -9,29 +9,31 @@ store, the commit protocol, and — at length — the failure modes that a naive
 
 ## 1. Watermark modes
 
-| Mode | Predicate | Detects updates | Detects deletes | Requires |
-| --- | --- | --- | --- | --- |
-| `append_id` | `id > :lo AND id <= :hi` | no | no | Monotonic, gapless-enough surrogate key |
-| `timestamp` | `updated_at > :lo AND updated_at <= :hi` | yes | no | An `updated_at` maintained on every write |
-| `snapshot` | none — full table read | yes | yes | Tolerance for reading the whole table |
-| `log` (future) | LSN / GTID range | yes | **yes** | Logical replication or binlog access |
+| Mode | Predicate | Detects updates | Detects deletes | Requires | Status |
+| --- | --- | --- | --- | --- | --- |
+| `append_id` | `id > :lo AND id <= :hi` | no | no | Monotonic, gapless-enough surrogate key | Not implemented |
+| `timestamp` | `updated_at > :lo AND updated_at <= :hi` | yes | no | An `updated_at` maintained on every write | **Implemented** |
+| `snapshot` | none — full table read | yes | yes | Tolerance for reading the whole table | Not implemented as a mode (full loads go through `extract_full_table` / the end-to-end example, without checkpointing) |
+| `log` (future) | LSN / GTID range | yes | **yes** | Logical replication or binlog access | Roadmap |
 
 `timestamp` is the default and the mode most of this document is about. `append_id` is strictly
 safer where it applies (immutable event tables) because integer sequences do not have the
 commit-ordering problem described in §3.1 — though they do have their own gap problem, covered in
-§3.6.
+§3.6 (design only, like the rest of that section).
 
-The declaration in a job spec:
+The declaration in a job spec (JSON — there is no YAML/TOML spec format):
 
-```yaml
-incremental:
-  mode: timestamp
-  column: updated_at
-  primary_key: [order_id]     # required: tiebreaker and dedup key
-  safety_lag: 5m              # see §3.1
-  max_window: 6h              # cap on a single run's window, see §4
-  overlap: 0s                 # optional deliberate re-read, see §3.2
+```json
+"incremental": {
+  "column": "updated_at",
+  "safety_lag_secs": 300,
+  "max_window_secs": 21600
+}
 ```
+
+There is no `mode`, `primary_key`, or `overlap` field: only `timestamp` mode exists, there is no
+composite keyset tiebreaker, and no deliberate re-read. §3.2 below is the design for those, not
+the implementation.
 
 ---
 
@@ -56,7 +58,9 @@ WHERE  updated_at >  :lo
 ```
 
 The low bound is strict and the high bound is inclusive, consistently, so consecutive windows
-neither overlap nor gap. Choosing `hi` correctly is the entire problem.
+neither overlap nor gap. On a job's first run there is no checkpoint, so `lo` is the epoch
+(`1970-01-01T00:00:00Z`) and the run walks forward in `max_window` chunks from there (see §4).
+Choosing `hi` correctly is the entire problem.
 
 ---
 
@@ -112,8 +116,10 @@ WHERE backend_type = 'client backend'
 
 This is exact rather than heuristic and adapts automatically to load. It requires the connecting
 role to see other sessions' `xact_start` (superuser, or membership in `pg_read_all_stats`). When
-the role lacks that privilege we fall back to Mitigation 1 and log a warning at startup, because
-silently downgrading a correctness mechanism is not acceptable.
+the role lacks that privilege we fall back to Mitigation 1 and log a loud warning every time the
+fallback triggers — because silently downgrading a correctness mechanism is not acceptable.
+(A `check_pg_read_all_stats_privilege` helper exists for a once-per-startup check, but no caller
+wires it up yet, so today the warning fires per fallback, not once at startup.)
 
 MySQL's closest equivalent is `information_schema.INNODB_TRX.trx_started`, which covers InnoDB
 transactions that have acquired a transaction ID. It is a weaker guarantee than the Postgres query
@@ -128,6 +134,12 @@ construction, which eliminates the hazard entirely rather than bounding it. This
 and it is why `log` mode is on the roadmap.
 
 ### 3.2 Boundary ties at coarse timestamp precision
+
+> **Design only — none of this section is implemented.** Windows are always plain
+> `(lo, hi]` on the timestamp column: no precision truncation, no composite keyset, no
+> `overlap` re-read, no `ORDER BY` tiebreaker. On Postgres `timestamptz` (microseconds)
+> ties are rare enough that this has not bitten yet; on a coarse-grained source it would.
+> What follows is the spec for when it does.
 
 MySQL `DATETIME` and `TIMESTAMP` default to **zero fractional-second precision**. A busy table can
 write thousands of rows within a single second. If `hi` lands mid-second, then `updated_at <= hi`
@@ -159,9 +171,9 @@ If `updated_at` is set by application servers rather than the database, their cl
 `now()` on the extraction host is a third clock.
 
 **Rule:** the high watermark is *always* computed from a `SELECT` against the source database, never
-from the extractor's local clock. Application-set timestamps are flagged at job registration
-(detectable by the absence of a column default or `ON UPDATE` clause) with a recommendation to
-increase `safety_lag`, since the extractor cannot bound another host's clock drift.
+from the extractor's local clock. (The second half of the original rule — flagging
+application-set timestamps at registration via missing column defaults — is not implemented;
+when in doubt, raise `safety_lag_secs` yourself.)
 
 ### 3.4 Hard deletes are invisible
 
@@ -171,13 +183,19 @@ No timestamp-based scheme can observe a row that no longer exists. Options, in o
 2. **Log-based capture.** Delete events appear in the WAL/binlog. The real answer, deferred.
 3. **Periodic key reconciliation.** On a slow cadence (nightly), read only the primary key column
    for the whole table — cheap, since it is usually an index-only scan — and diff against the keys
-   in the warehouse. Emit tombstones for the difference. This is a documented job type
-   (`rel reconcile`) rather than something that happens automatically.
+   in the warehouse. Emit tombstones for the difference. Designed as a `rel reconcile` job type;
+   **not implemented** — there is no reconcile command today.
 
-Any table configured with `mode: timestamp` and no `deleted_at` column is reported by
-`rel doctor` as "deletes not captured", so this is a known gap rather than a surprise.
+There is no `rel doctor` command, so nothing currently reports "deletes not captured" for a
+`timestamp` table without `deleted_at`. That gap is real and undiscovered-by-tooling: know it
+before you rely on it.
 
 ### 3.5 Schema drift
+
+> **Design only — no schema comparison happens today.** The connector resolves the schema at
+> plan time and proceeds; nothing records a fingerprint, nothing fails a run, and there is no
+> `rel migrate`. The policy below is what *should* happen, kept as the spec for when drift
+> detection is built.
 
 A column added to the source mid-stream changes the Arrow schema between runs, which downstream
 Parquet readers and BigQuery may or may not tolerate.
@@ -195,6 +213,10 @@ the checkpoint store.
 
 ### 3.6 Sequence gaps in `append_id` mode
 
+> **Design only — `append_id` mode does not exist.** There is no `id_safety_gap` setting and
+> no sequence-gap handling anywhere in the code. What follows is the hazard analysis for when
+> the mode is built.
+
 Postgres sequences and MySQL `AUTO_INCREMENT` allocate values outside transaction scope. A
 transaction can obtain id 105 and commit *after* one that obtained 106. A run that sets
 `hi = 106` then skips 105 forever — the same hazard as §3.1 with the same shape.
@@ -202,7 +224,6 @@ transaction can obtain id 105 and commit *after* one that obtained 106. A run th
 **Mitigation:** the same lag idea, expressed in rows rather than time — hold back the high
 watermark by `id_safety_gap` (default 0, meaning the mode is only safe out of the box for tables
 with short, serialized write transactions), or bound it by the oldest in-flight transaction.
-`rel doctor` warns when `append_id` is used on a table whose writes are not known to be short.
 
 ---
 
@@ -212,8 +233,9 @@ An extraction that has been down for two days must not attempt a single window c
 that is a full-table scan with extra steps, and it will time out.
 
 `max_window` caps a single run. When `now() - lo > max_window`, the run processes
-`(lo, lo + max_window]` and exits successfully, leaving the watermark behind. The orchestrator's
-next trigger picks up the next chunk, and the job walks forward until it catches up.
+`(lo, lo + max_window]` and commits that watermark, leaving the rest behind. The orchestrator's
+next trigger picks up the next chunk, and the job walks forward until it catches up. (Backfills
+additionally loop over chunks inside one invocation — see §7.)
 
 ```
 lo ────┬──────┬──────┬──────┬──────► now
@@ -222,65 +244,81 @@ lo ────┬──────┬──────┬──────�
         6h     6h     6h     6h
 ```
 
-`rel_watermark_lag_seconds` decreasing across runs shows catch-up is progressing; flat or rising
-lag means the window is too small for the change rate, which is an alert-worthy condition.
+Shrinking time-to-catch-up across runs shows progress; a window that never advances means the
+window is too small for the change rate. (The original text referenced a
+`rel_watermark_lag_seconds` metric here — it doesn't exist yet; see `architecture.md` §7.)
 
 ---
 
 ## 5. The commit protocol
 
 Data lands in the sink, *then* the checkpoint advances. There is no distributed transaction between
-GCS and the checkpoint store, so we design for at-least-once with idempotent writes rather than
-pretending otherwise.
+the sink and the checkpoint store, so we design for at-least-once with idempotent writes rather than
+pretending otherwise. (In practice today the "sink" is a local Parquet file or just collected
+batches — there are no deterministic window object paths, no `_SUCCESS` markers, and no BigQuery
+loader. The protocol below describes the ordering guarantee, which holds regardless.)
 
 ```
   1. Resolve lo from checkpoint store              (state: RUNNING, run_id recorded)
   2. Compute hi from the source clock, clamped
-  3. Extract (lo, hi] → Arrow → Parquet objects at a DETERMINISTIC path
-  4. Flush and finalize all objects
-  5. Advance checkpoint to hi                      (state: COMMITTED)
+  3. Extract (lo, hi] → Arrow → sink
+  4. Flush and finalize output
+  5. Advance checkpoint to hi (never past what was observed — see Mitigation 3)
+                                                   (state: COMMITTED)
 ```
 
-The deterministic path is what makes retries safe:
+A crash between steps 4 and 5 leaves the checkpoint at `lo`. The next run re-resolves its window
+from that `lo` — note `hi` is *not* reproduced exactly (it is re-read from the source clock, so a
+retry normally covers `lo..new-hi`, a superset, not the identical window). At-least-once holds
+either way: rows are never skipped, and a rerun may re-extract already-written rows, which is why
+sinks must tolerate overwrites once real sink paths exist.
 
-```
-gs://warehouse/raw/orders/_extracted_date=2026-09-04/
-    w=1757030400-1757034000/part-00000.parquet
-                └── lo and hi epoch seconds: identical inputs → identical object names
-```
-
-A crash between steps 4 and 5 leaves the checkpoint at `lo`. The next run recomputes the *same*
-window — because `lo` is unchanged and `hi` is clamped and reproducible for that `lo` — and
-overwrites the same objects. No duplicates reach the warehouse.
-
-A crash *during* step 3 leaves partial objects. Object stores make single-object writes atomic, so
-partial objects are whole-but-fewer, and the retry overwrites them. The window directory is only
-declared complete when a `_SUCCESS` marker naming the expected object count is written; readers and
-the BigQuery loader ignore incomplete window directories.
-
-Concurrency is prevented by a lease: a run must acquire the checkpoint row's lease (a
-compare-and-swap on `run_id` plus an expiry) before proceeding. A run that loses its lease — because
-it stalled long enough for the lease to expire and another run to start — aborts before writing.
+Concurrency is prevented by a lease: a run must acquire the checkpoint (RUNNING + fresh `run_id`
++ expiry) before proceeding, and `commit`/`abandon` verify the caller still holds the recorded
+`run_id`. A run that loses its lease aborts before writing. Our store is file-backed (one JSON
+file per job+namespace, atomic rename), not a CAS row — same protocol, weaker concurrency
+guarantee, sufficient for one scheduler triggering one job at a time.
 
 ---
 
 ## 6. Checkpoint store
 
-Pluggable behind a trait, with a Postgres implementation as the default (it needs
-read-modify-write with isolation, which object storage does not give you) and a local-file
-implementation for development.
+One implementation exists: `JsonCheckpointStore`, one JSON file per `(job_id, namespace)` under
+a local directory, written atomically (temp file + rename). The `CheckpointStore` trait behind
+it (`acquire` / `commit` / `abandon` / `read`) is the seam a Postgres-backed store would plug
+into — but that store does not exist yet, and neither does run history. The real shapes:
 
 ```rust
-#[async_trait]
-pub trait CheckpointStore: Send + Sync {
-    async fn acquire(&self, key: &JobKey, run_id: Uuid, lease: Duration)
-        -> Result<Checkpoint>;
-    async fn commit(&self, key: &JobKey, run_id: Uuid, next: WatermarkValue, stats: RunStats)
-        -> Result<()>;
-    async fn abandon(&self, key: &JobKey, run_id: Uuid, err: &Error) -> Result<()>;
-    async fn history(&self, key: &JobKey, limit: usize) -> Result<Vec<RunRecord>>;
+pub struct Checkpoint {
+    pub job_id: String,
+    pub namespace: String,              // isolates backfills (see §7)
+    pub watermark_column: String,
+    pub watermark_value: Option<DateTime<Utc>>,  // None = no successful run yet
+    pub state: RunState,                // Running | Committed | Failed
+    pub run_id: Option<Uuid>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub struct RunStats {
+    pub rows_extracted: u64,
+    pub window_lo: Option<DateTime<Utc>>,
+    pub window_hi: Option<DateTime<Utc>>,
 }
 ```
+
+Notes against the original Postgres-first design this replaces:
+
+- The watermark is a plain `Option<DateTime<Utc>>`, not typed JSON — timestamp mode is the
+  only mode, so there is nothing else to discriminate. A second mode will need the tagged
+  representation (or a second column).
+- There is no schema fingerprint, no drift detection, and no `history()` method — §3.5's
+  table is spec, not implementation.
+- The `namespace` field *does* exist and works: a backfill runs under its own namespace with
+  its own watermark, without clobbering the live incremental job.
+
+The SQL below is kept as the design for the Postgres-backed store, when the local file stops
+being sufficient (multiple schedulers, or history queries worth indexing):
 
 ```sql
 CREATE TABLE rel_checkpoint (
@@ -316,30 +354,31 @@ CREATE TABLE rel_run_history (
 );
 ```
 
-`watermark_value` is stored as typed JSON rather than a string so that a timestamp watermark cannot
-be silently compared as text — an ordering bug that produces a plausible-looking but wrong window.
+`watermark_value` in the SQL design is typed JSON rather than a string so that a timestamp
+watermark cannot be silently compared as text — an ordering bug that produces a
+plausible-looking but wrong window. (The JSON store doesn't need this yet: with one mode,
+`Option<DateTime<Utc>>` cannot be miscompared.)
 
 The `namespace` column lets a backfill run alongside the live incremental job with its own
-watermark, without either clobbering the other.
+watermark, without either clobbering the other — and unlike the rest of this SQL, the
+namespace field genuinely exists in the JSON store today.
 
 ---
 
 ## 7. Backfills
 
-A backfill is the same machinery with a bounded window and a separate namespace:
+A backfill is the same machinery with an explicit `[from, to]` window instead of one resolved
+from the watermark, committed under its own checkpoint namespace:
 
 ```bash
-rel backfill --job orders_incremental \
-             --from 2024-01-01 --to 2026-09-01 \
-             --chunk 7d --parallel 4 \
-             --namespace backfill_2026q3
+cargo run -- backfill --config <path> --namespace <name> \
+    --from <rfc3339> --to <rfc3339>
 ```
 
-Chunks are planned up front, dispatched with bounded parallelism, and each commits its own
-checkpoint, so an interrupted backfill resumes at chunk granularity. Because object paths are
-derived from the window bounds, backfill output and incremental output coexist in the same
-partition layout, and a chunk that overlaps live data simply overwrites identical content.
-
-For very large historical loads, `--strategy keyset` switches from time chunks to primary-key range
-chunks, which is faster when there is no index on the watermark column covering old data — a common
-situation, since `updated_at` indexes are often added long after a table is created.
+A large range is walked in `max_window_secs`-bounded chunks with one acquire/extract/commit
+cycle per chunk, so a crash resumes from the last committed chunk rather than restarting the
+whole range. Chunking is strictly sequential — there is no `--chunk`/`--parallel` fan-out and
+no `--strategy keyset` primary-key chunking; for very large historical loads, full-table
+extraction (see `examples/end_to_end.rs`) is currently the faster path. Sink output, such as
+it is, goes wherever the run writes it — there are no window-derived object paths and no
+partition layout shared with incremental output yet.

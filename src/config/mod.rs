@@ -9,11 +9,11 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::AppError;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
     pub host: String,
     pub port: u16,
@@ -100,6 +100,10 @@ pub struct PushdownConfig {
     pub policy: String,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// `hinted` policy: predicates touching these columns are forced to the source
+    /// (whenever they translate — hints never override correctness). Deny wins over push.
+    #[serde(default)]
+    pub push: Vec<String>,
     #[serde(default = "default_max_source_cost")]
     pub max_source_cost: u64,
     #[serde(default = "default_keep_threshold")]
@@ -129,6 +133,7 @@ impl Default for PushdownConfig {
         Self {
             policy: default_pushdown_policy(),
             deny: Vec::new(),
+            push: Vec::new(),
             max_source_cost: default_max_source_cost(),
             keep_threshold: default_keep_threshold(),
             statistics_ttl_secs: default_statistics_ttl_secs(),
@@ -151,6 +156,36 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             batch_size: default_batch_size(),
+        }
+    }
+}
+
+/// Phase 4 (docs/roadmap.md): distributed execution over Ballista.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DistributedConfig {
+    /// Remote scheduler endpoint (`http://host:port`), or empty for a standalone deployment
+    /// where the scheduler and `parallel_workers` executors run in this process.
+    #[serde(default = "default_scheduler_url")]
+    pub scheduler_url: String,
+    /// Number of executor processes (standalone mode) or expected workers (remote mode — used
+    /// only to budget the per-process source connection pools; see docs/roadmap.md Phase 4).
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+}
+
+fn default_scheduler_url() -> String {
+    String::new()
+}
+
+fn default_workers() -> usize {
+    1
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            scheduler_url: default_scheduler_url(),
+            workers: default_workers(),
         }
     }
 }
@@ -205,6 +240,8 @@ pub struct JobConfig {
     pub parallel_scan: ParallelScanConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    #[serde(default)]
+    pub distributed: DistributedConfig,
 }
 
 impl JobConfig {
@@ -271,6 +308,7 @@ mod tests {
             pushdown: PushdownConfig::default(),
             parallel_scan: ParallelScanConfig::default(),
             execution: ExecutionConfig::default(),
+            distributed: DistributedConfig::default(),
         };
 
         assert_eq!(config.resolved_table(), "public.orders");
@@ -308,6 +346,7 @@ mod tests {
             pushdown: PushdownConfig::default(),
             parallel_scan: ParallelScanConfig::default(),
             execution: ExecutionConfig::default(),
+            distributed: DistributedConfig::default(),
         };
 
         unsafe {

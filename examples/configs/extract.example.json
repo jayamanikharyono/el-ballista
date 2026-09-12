@@ -1,7 +1,7 @@
 {
   "job_id": "orders_incremental",
   "table": "orders",
-  "columns": ["order_id", "user_id", "status", "amount", "created_at", "updated_at"],
+  "columns": ["order_id", "user_id", "status", "amount", "currency", "item_count", "tags", "metadata", "shipped_on", "ext_ref", "created_at", "updated_at"],
   "source": {
     "host": "localhost",
     "port": 5432,
@@ -10,7 +10,8 @@
     "database": "app",
     "pool_max": 8,
     "statement_timeout_ms": 300000,
-    "application_name": "rust-extract-layer"
+    "application_name": "rust-extract-layer",
+    "schema": "public"
   },
   "incremental": {
     "column": "updated_at",
@@ -25,6 +26,19 @@
   },
   "pushdown": {
     "policy": "cost_based",
-    "deny": []
+    "deny": [],
+    "push": []
+  },
+  "parallel_scan": {
+    "strategy": "none",
+    "partitions": 1,
+    "partition_column": "order_id"
+  },
+  "execution": {
+    "batch_size": 8192
+  },
+  "distributed": {
+    "scheduler_url": "",
+    "workers": 2
   }
 }

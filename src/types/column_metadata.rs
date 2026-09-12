@@ -1,7 +1,8 @@
 use std::fmt;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ColumnMetadata {
     pub column_name: String,
     pub data_type: String,

@@ -13,7 +13,7 @@ use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::prelude::*;
 use std::sync::Arc;
 
-use crate::config::{JobConfig, SourceConfig, IncrementalConfig, SinkConfig, CheckpointConfig, PushdownConfig, ParallelScanConfig, ExecutionConfig};
+use crate::config::{CheckpointConfig, ExecutionConfig, IncrementalConfig, JobConfig, ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig, DistributedConfig};
 use crate::errors::AppError;
 use crate::connector::postgres::PostgresExtractor;
 use crate::pushdown::dialect::{SqlDialect, PostgresDialect};
@@ -186,6 +186,7 @@ pub async fn run() -> Result<(), AppError> {
         pushdown: PushdownConfig {
             policy: "cost_based".to_string(),
             deny: vec![],
+            push: vec![],
             max_source_cost: 50_000,
             keep_threshold: 0.30,
             statistics_ttl_secs: 900,
@@ -198,6 +199,7 @@ pub async fn run() -> Result<(), AppError> {
         execution: ExecutionConfig {
             batch_size: 8192,
         },
+        distributed: DistributedConfig::default(),
     };
 
     println!("  ✓ Pushdown policy: cost_based");

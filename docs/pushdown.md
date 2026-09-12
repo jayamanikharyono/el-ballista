@@ -132,6 +132,15 @@ own filter — you have just silently loosened the query and included rows the u
 reducing the rows, DataFusion just re-checks the survivors, which is a vectorized pass over a small
 batch.
 
+**Enum columns.** Postgres has no `enum = text` operator, so a text literal against a true enum
+column (detected via `pg_enum`, cached per provider) is rewritten to a label comparison
+(`"status"::text = 'PAID'`) and forced `Inexact` — label equality *is* enum equality, so the
+cast only narrows. A non-text literal against an enum has no pushable form and stays in Arrow
+(an integer literal alone would look `Exact` and then fail at execution with `42883`).
+`citext` is deliberately excluded from this rewrite: its native case-insensitive operator is
+correct as pushed, and recasting to text would narrow case-sensitively, dropping rows Arrow
+would keep.
+
 ### 3.2 NULL semantics
 
 SQL `WHERE` returns only rows where the predicate is `TRUE`; `NULL` and `FALSE` are both dropped.
@@ -248,6 +257,7 @@ Two guardrails override the arithmetic:
 | `always` | Push everything expressible and safe | Dedicated replica, no production impact |
 | `never` | Only the watermark predicate is pushed | Emergency: source is under pressure |
 | `cost_based` | The model above (default) | Normal operation |
+| `strict` | Push a filter only if every referenced column is indexed, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp); never push `LIMIT`; `push` hints ignored, `deny` still applies | Source under pressure but the watermark must flow |
 | `hinted` | Per-column and per-predicate overrides in the job spec | When you know something the stats do not |
 
 Configured per source, overridable per job:

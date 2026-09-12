@@ -1,18 +1,36 @@
-//! Custom DataFusion optimizer rule for source-aware pushdown.
+//! Source-aware pushdown as a DataFusion optimizer rule.
 //! pushdown/optimizer_rule.rs
-//! Implements plan-level filter optimization that considers multiple filters simultaneously
-//! and makes combined cost-based decisions on which filters to push to the source.
+//! Splits conjunctive filters sitting above one of our table scans into the pushable part
+//! (absorbed into the `TableScan`'s own filter list, honoring the provider's policy, denylist,
+//! hints, statistics, and EXPLAIN cache) and the keep part (left in a `Filter` for Arrow).
+//!
+//! This is the plan-level twin of the provider path: [`PostgresTableProvider`] answers the
+//! same question through `supports_filters_pushdown` during physical planning, and both funnel
+//! through [`PostgresTableProvider::decide_cost`], so the rule can never push something the
+//! provider would refuse. DataFusion's built-in filter pushdown would eventually do the same
+//! split; this rule does it earlier, with source cost awareness, and its decisions are what
+//! `rel plan --explain` reports.
+//!
+//! [`PostgresTableProvider`]: crate::connector::postgres::PostgresTableProvider
 
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use crate::pushdown::stats::SourceStatistics;
-use crate::pushdown::cost_model::{CostParams, IndexInfo};
+use std::any::Any;
+use std::sync::Arc;
 
-/// Utility for making cost-based filter decisions at the plan level.
-/// This is a helper for Phase 2.5+ full optimizer rule implementation.
+use datafusion::common::tree_node::Transformed;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, TableSource};
+use datafusion::optimizer::OptimizerConfig;
+use datafusion::optimizer::OptimizerRule;
+
+use crate::connector::postgres::PostgresTableProvider;
+use crate::pushdown::{self, Decision, Fidelity};
+
+/// Optimizer rule that pushes source-pushable filter conjuncts into Postgres scans.
 #[derive(Debug)]
-pub struct SourceAwarePushdown;
+pub struct SourceAwarePushdownRule;
 
-impl SourceAwarePushdown {
+impl SourceAwarePushdownRule {
     /// Collect all filter predicates from a conjunction tree (AND-based filters).
     /// Returns a vector of (expr, fidelity, predicate) tuples.
     pub fn collect_filters(expr: &Expr) -> Vec<Expr> {
@@ -35,17 +53,21 @@ impl SourceAwarePushdown {
         }
     }
 
-    /// Make cost-based decisions for a set of filters given statistics.
+    /// Make cost-based decisions for a set of filters against one provider.
     /// Returns (push_filters, keep_filters) where each is a Vec of expressions.
     pub fn decide_filters(
+        provider: &PostgresTableProvider,
         filters: &[Expr],
-        _stats: &SourceStatistics,
-        _params: &CostParams,
-        _indexes: &[IndexInfo],
     ) -> (Vec<Expr>, Vec<Expr>) {
-        // Placeholder for phase 2.5+
-        // For now, keep all filters
-        (Vec::new(), filters.to_vec())
+        let mut push = Vec::new();
+        let mut keep = Vec::new();
+        for filter in filters {
+            match provider.decide_cost(filter) {
+                Decision::Push { .. } => push.push(filter.clone()),
+                Decision::Keep => keep.push(filter.clone()),
+            }
+        }
+        (push, keep)
     }
 
     /// Reconstruct a filter expression from a list of conjunctions.
@@ -70,58 +92,152 @@ impl SourceAwarePushdown {
 
         Some(result)
     }
+
+    /// The [`PostgresTableProvider`] behind a scan's table source, if it is one of ours.
+    /// Registered providers are wrapped in a [`DefaultTableSource`], hence the two-step
+    /// downcast.
+    fn postgres_provider(source: &Arc<dyn TableSource>) -> Option<&PostgresTableProvider> {
+        let as_any = source.as_ref() as &dyn Any;
+        let default = as_any.downcast_ref::<DefaultTableSource>()?;
+        default.table_provider.downcast_ref::<PostgresTableProvider>()
+    }
 }
 
-/// Reference implementation for phase 2.5+ full DataFusion OptimizerRule.
-/// This is pseudocode showing how to integrate with DataFusion's optimizer.
-///
-/// ```ignore
-/// use datafusion::optimizer::OptimizerRule;
-/// use datafusion::error::Result as DataFusionResult;
-/// use datafusion::logical_expr::LogicalPlan;
-/// use datafusion::optimizer::optimizer::OptimizerConfig;
-///
-/// #[derive(Debug)]
-/// pub struct SourceAwarePushdownRule;
-///
-/// impl OptimizerRule for SourceAwarePushdownRule {
-///     fn name(&self) -> &str {
-///         "source_aware_pushdown"
-///     }
-///
-///     fn try_optimize(
-///         &self,
-///         plan: &LogicalPlan,
-///         _config: &dyn OptimizerConfig,
-///     ) -> DataFusionResult<Option<LogicalPlan>> {
-///         // 1. Walk the plan looking for Filter → TableScan pairs
-///         // 2. If TableScan is a PostgresTableProvider:
-///         //    a. Extract all filters from the Filter node
-///         //    b. Fetch table statistics
-///         //    c. Call SourceAwarePushdown::decide_filters()
-///         //    d. Rewrite TableScan with pushed filters
-///         //    e. Keep remaining filters above the scan
-///         // 3. Return modified plan
-///         Ok(None)
-///     }
-/// }
-/// ```
+impl OptimizerRule for SourceAwarePushdownRule {
+    fn name(&self) -> &str {
+        "source_aware_pushdown"
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> DataFusionResult<Transformed<LogicalPlan>> {
+        let LogicalPlan::Filter(filter) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+        let LogicalPlan::TableScan(mut scan) = (*filter.input).clone() else {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+        };
+        let Some(provider) = Self::postgres_provider(&scan.source) else {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+        };
+
+        let conjuncts = Self::collect_filters(&filter.predicate);
+        let (push, mut keep) = Self::decide_filters(provider, &conjuncts);
+
+        // `Inexact` predicates are pushed for narrowing but must ALSO stay above the scan:
+        // only Arrow re-checking makes their semantics exact. `Exact` predicates are fully
+        // absorbed. This mirrors what DataFusion's own planner does with the
+        // `Exact`/`Inexact` answers from `supports_filters_pushdown`.
+        for expr in &push {
+            if matches!(
+                pushdown::translate(expr).map(|(fidelity, _)| fidelity),
+                Some(Fidelity::Inexact)
+            ) && !keep.contains(expr)
+            {
+                keep.push(expr.clone());
+            }
+        }
+
+        // Only absorb conjuncts the scan doesn't already carry: the built-in pushdown rule
+        // may have run first, and pushing twice would duplicate the predicate.
+        let fresh_push: Vec<Expr> = push
+            .into_iter()
+            .filter(|expr| !scan.filters.contains(expr))
+            .collect();
+        if fresh_push.is_empty() {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+        }
+        scan.filters.extend(fresh_push);
+
+        match Self::reconstruct_filter(&keep) {
+            Some(predicate) => {
+                let input = Arc::new(LogicalPlan::TableScan(scan));
+                Ok(Transformed::yes(LogicalPlan::Filter(
+                    datafusion::logical_expr::Filter::try_new(predicate, input)?,
+                )))
+            }
+            None => Ok(Transformed::yes(LogicalPlan::TableScan(scan))),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::datasource::provider_as_source;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::optimizer::OptimizerContext;
     use datafusion::prelude::*;
+
+    use crate::distributed::connection::PostgresConnectionDescriptor;
+    use crate::pushdown::PushdownPolicy;
+    use crate::types::table_metadata::TableMetadata;
+
+    fn test_provider(policy: PushdownPolicy) -> PostgresTableProvider {
+        use crate::connector::postgres::table_provider::PostgresTableProviderModel;
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
+            arrow::datatypes::Field::new("status", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        // Decoded-model providers carry no statistics, so `cost_based` degrades to the
+        // optimistic legacy behavior here; the rule test pins the *splitting* mechanics,
+        // while the stats-driven snapshots live in `pushdown::tests`.
+        let model = PostgresTableProviderModel {
+            descriptor: PostgresConnectionDescriptor {
+                host: "localhost".to_string(),
+                port: 5432,
+                user: "postgres".to_string(),
+                password_env: "UNUSED_TEST_ENV".to_string(),
+                database: "db".to_string(),
+                pool_max: 8,
+                expected_workers: 1,
+                statement_timeout_ms: 1000,
+                application_name: "test".to_string(),
+                schema: "public".to_string(),
+            },
+            table_metadata: TableMetadata {
+                schema_name: "public".to_string(),
+                table_name: "orders".to_string(),
+                columns: vec![],
+            },
+            policy,
+            deny: vec![],
+            push: vec![],
+            watermark_column: None,
+            window: None,
+            batch_size: 8192,
+            parallel_workers: 1,
+            partition_column: None,
+            strategy: crate::connector::postgres::parallel::ParallelStrategy::None,
+            enum_columns: vec!["status".to_string()],
+        };
+        PostgresTableProvider::from_model(schema, model)
+    }
+
+    fn scan_plan(provider: PostgresTableProvider, predicate: Expr) -> LogicalPlan {
+        use datafusion::logical_expr::Filter;
+
+        // Built by hand, not via the builder: `LogicalPlanBuilder::filter` already applies
+        // pushdown itself, which would leave no Filter node for the rule to rewrite.
+        let source = provider_as_source(Arc::new(provider));
+        let scan = LogicalPlanBuilder::scan("orders", source, None).expect("scan");
+        let input = Arc::new(scan.build().expect("plan"));
+        LogicalPlan::Filter(Filter::try_new(predicate, input).expect("filter"))
+    }
 
     #[test]
     fn test_optimizer_creation() {
-        let _rule = SourceAwarePushdown;
-        assert!(true);
+        let rule = SourceAwarePushdownRule;
+        assert_eq!(rule.name(), "source_aware_pushdown");
     }
 
     #[test]
     fn test_collect_filters_single() {
         let expr = col("id").eq(lit(42i64));
-        let filters = SourceAwarePushdown::collect_filters(&expr);
+        let filters = SourceAwarePushdownRule::collect_filters(&expr);
         assert_eq!(filters.len(), 1);
     }
 
@@ -130,7 +246,7 @@ mod tests {
         let expr = col("id")
             .eq(lit(42i64))
             .and(col("status").eq(lit("PAID")));
-        let filters = SourceAwarePushdown::collect_filters(&expr);
+        let filters = SourceAwarePushdownRule::collect_filters(&expr);
         assert_eq!(filters.len(), 2);
     }
 
@@ -138,7 +254,84 @@ mod tests {
     fn test_reconstruct_filter_single() {
         let expr = col("id").eq(lit(42i64));
         let filters = vec![expr];
-        let reconstructed = SourceAwarePushdown::reconstruct_filter(&filters);
+        let reconstructed = SourceAwarePushdownRule::reconstruct_filter(&filters);
         assert!(reconstructed.is_some());
+    }
+
+    #[test]
+    fn test_rewrite_pushes_translatable_conjunct() {
+        let rule = SourceAwarePushdownRule;
+        let config = OptimizerContext::new();
+
+        // `id = 42` translates (Exact); `1 = 1`-style tautologies and anything outside the
+        // allowlist stays above the scan.
+        let predicate = col("id")
+            .eq(lit(42i64))
+            .and(col("status").eq(lit("PAID")));
+        let plan = scan_plan(test_provider(PushdownPolicy::Always), predicate);
+
+        let rewritten = rule.rewrite(plan, &config).expect("rewrite").data;
+        match rewritten {
+            LogicalPlan::Filter(filter) => {
+                // status is Inexact: pushed into the scan AND kept above it for re-checking.
+                assert_eq!(
+                    filter.predicate,
+                    col("status").eq(lit("PAID")),
+                    "only the kept conjunct stays in Filter"
+                );
+                match filter.input.as_ref() {
+                    LogicalPlan::TableScan(scan) => {
+                        assert_eq!(scan.filters.len(), 2, "both conjuncts absorbed");
+                    }
+                    other => panic!("expected TableScan under Filter, got {other:?}"),
+                }
+            }
+            other => panic!("expected Filter above scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rewrite_never_pushes_nothing() {
+        let rule = SourceAwarePushdownRule;
+        let config = OptimizerContext::new();
+
+        let plan = scan_plan(
+            test_provider(PushdownPolicy::Never),
+            col("id").eq(lit(42i64)),
+        );
+
+        let transformed = rule.rewrite(plan, &config).expect("rewrite");
+        assert!(
+            !transformed.transformed,
+            "policy=never must leave the plan untouched"
+        );
+    }
+
+    #[test]
+    fn test_enum_decisions_through_provider() {
+        // The fixture declares `status` an enum column: text comparisons push as label
+        // comparisons (Inexact, re-checked above the scan), integer comparisons keep.
+        let provider = test_provider(PushdownPolicy::Always);
+
+        match provider.decide_cost(&col("status").eq(lit("PAID"))) {
+            crate::pushdown::Decision::Push { fidelity, predicate } => {
+                assert_eq!(fidelity, crate::pushdown::Fidelity::Inexact);
+                assert_eq!(predicate.render_inline(), "(\"status\"::text = 'PAID')");
+            }
+            crate::pushdown::Decision::Keep => {
+                panic!("enum-vs-text should push as a label comparison")
+            }
+        }
+
+        assert!(matches!(
+            provider.decide_cost(&col("status").eq(lit(42i64))),
+            crate::pushdown::Decision::Keep
+        ));
+
+        let reason = provider.explain_decision(&col("status").eq(lit(42i64)));
+        assert!(
+            reason.contains("no pushable form"),
+            "keep reason should name the enum hazard, got: {reason}"
+        );
     }
 }

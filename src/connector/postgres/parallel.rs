@@ -1,29 +1,36 @@
 //! Parallel scan strategies.
 //! extractor/postgres/parallel.rs
-//! Splits a table scan across multiple connections using keyset or ctid partitioning,
-//! with optional exported snapshot for consistency.
+//! Splits a table scan across multiple connections using keyset or ctid partitioning.
+//! `export_snapshot`/`use_snapshot` exist for future cross-connection consistency work but are
+//! NOT wired into any scan path: pooled connections cannot hold `SET TRANSACTION SNAPSHOT`
+//! across checkouts, so snapshot-consistent parallel reads stay deferred. Keyset bounds come
+//! from a single MIN/MAX read; ctid ranges from relpages.
 
 use sqlx::PgPool;
+
+use serde::{Deserialize, Serialize};
 
 use crate::connector::errors::ExtractorError;
 
 /// Parallel scan strategy: how to partition the table across connections.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized into distributed plans; `None` preserves single-scan behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ParallelStrategy {
     /// No parallelism; scan with a single connection.
+    #[default]
     None,
     /// Partition by primary key ranges using keyset predicates.
-    Keyset { partition_column: String },
-    /// Partition by physical tuple ID ranges (requires to be exported snapshot).
+    Keyset,
+    /// Partition by physical tuple ID ranges. No partition column needed; concurrent
+    /// VACUUM can move tuples between pages, so prefer keyset for hot tables. Exported
+    /// snapshots for cross-connection consistency remain deferred (see module docs).
     Ctid,
 }
 
 impl ParallelStrategy {
     pub fn parse(s: &str) -> Self {
         match s {
-            "keyset" => ParallelStrategy::Keyset {
-                partition_column: "id".to_string(),
-            },
+            "keyset" => ParallelStrategy::Keyset,
             "ctid" => ParallelStrategy::Ctid,
             _ => ParallelStrategy::None,
         }
@@ -47,7 +54,7 @@ impl Default for ParallelScanConfig {
 }
 
 /// Represents a single partition of a parallel scan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanPartition {
     pub partition_id: usize,
     pub lo: Option<i64>,
@@ -264,9 +271,7 @@ mod tests {
 
     #[test]
     fn test_parallel_strategy_parse() {
-        assert_eq!(ParallelStrategy::parse("keyset"), ParallelStrategy::Keyset {
-            partition_column: "id".to_string()
-        });
+        assert_eq!(ParallelStrategy::parse("keyset"), ParallelStrategy::Keyset);
         assert_eq!(ParallelStrategy::parse("ctid"), ParallelStrategy::Ctid);
         assert_eq!(ParallelStrategy::parse("none"), ParallelStrategy::None);
         assert_eq!(ParallelStrategy::parse("unknown"), ParallelStrategy::None);

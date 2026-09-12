@@ -25,6 +25,33 @@ use crate::connector::postgres::arrow_type_mapper::ArrowTypeMapper;
 
 pub struct PostgresRowAdapter;
 
+impl PostgresRowAdapter {
+    /// Create an empty Arrow builder matching a mapped data type. Timestamp builders carry
+    /// the schema's timezone: `RecordBatch::try_new` rejects arrays whose type disagrees
+    /// with the schema, so a `timestamptz` column (schema `Timestamp(µs, "UTC")`) must not
+    /// be built by a naive `TimestampMicrosecondBuilder`.
+    pub fn new_builder(data_type: &DataType) -> Box<dyn ArrayBuilder> {
+        match data_type {
+            DataType::Int16 => Box::new(Int16Builder::new()),
+            DataType::Int32 => Box::new(Int32Builder::new()),
+            DataType::Int64 => Box::new(Int64Builder::new()),
+            DataType::Float32 => Box::new(Float32Builder::new()),
+            DataType::Float64 => Box::new(Float64Builder::new()),
+            DataType::Boolean => Box::new(BooleanBuilder::new()),
+            DataType::Utf8 => Box::new(StringBuilder::new()),
+            DataType::Binary => Box::new(BinaryBuilder::new()),
+            DataType::Date32 => Box::new(Date32Builder::new()),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => Box::new(
+                TimestampMicrosecondBuilder::new().with_timezone_opt(tz.clone()),
+            ),
+            // Precision/scale are applied at finish time; only text[] arrays are supported.
+            DataType::Decimal128(_, _) => Box::new(Decimal128Builder::new()),
+            DataType::List(_) => Box::new(ListBuilder::new(StringBuilder::new())),
+            _ => Box::new(StringBuilder::new()),
+        }
+    }
+}
+
 /// RowBatchBuilder: Accumulates rows into Arrow builders for incremental batching.
 /// Phase 3: Enables true streaming with bounded memory O(batch_size) instead of O(total_rows).
 pub struct RowBatchBuilder {
@@ -42,33 +69,7 @@ impl RowBatchBuilder {
         let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
         for column in &table_metadata.columns {
             let data_type = ArrowTypeMapper::map(column)?;
-            let builder: Box<dyn ArrayBuilder> = match data_type {
-                DataType::Int16 => Box::new(Int16Builder::new()),
-                DataType::Int32 => Box::new(Int32Builder::new()),
-                DataType::Int64 => Box::new(Int64Builder::new()),
-                DataType::Float32 => Box::new(Float32Builder::new()),
-                DataType::Float64 => Box::new(Float64Builder::new()),
-                DataType::Boolean => Box::new(BooleanBuilder::new()),
-                DataType::Utf8 => Box::new(StringBuilder::new()),
-                DataType::Binary => Box::new(BinaryBuilder::new()),
-                DataType::Date32 => Box::new(Date32Builder::new()),
-                DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-                    let builder = TimestampMicrosecondBuilder::new();
-                    if tz.is_some() {
-                        // Timezone is preserved in schema, not in builder
-                    }
-                    Box::new(builder)
-                }
-                DataType::Decimal128(precision, scale) => {
-                    // Create empty Decimal128Builder, precision/scale set on finish
-                    Box::new(Decimal128Builder::new())
-                }
-                _ => {
-                    // For complex types like lists, we'll fall back to batch appending
-                    Box::new(StringBuilder::new())
-                }
-            };
-            builders.push(builder);
+            builders.push(PostgresRowAdapter::new_builder(&data_type));
         }
         
         Ok(Self {
@@ -211,12 +212,20 @@ impl RowBatchBuilder {
                     .ok_or_else(|| ExtractorError::Internal("downcast to StringBuilder failed".into()))?;
                 b.append_option(s);
             }
-            "ARRAY" => {
-                // For arrays, we need special handling; for now append as string representation
-                let value: Option<String> = row.try_get(column.column_name.as_str())?;
-                let b = builder.as_any_mut().downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast to StringBuilder failed".into()))?;
-                b.append_option(value);
+            "ARRAY" => match column.udt_name.as_deref() {
+                Some("_text") => {
+                    let value: Option<Vec<Option<String>>> =
+                        row.try_get(column.column_name.as_str())?;
+                    let b = builder.as_any_mut().downcast_mut::<ListBuilder<StringBuilder>>()
+                        .ok_or_else(|| ExtractorError::Internal("downcast to ListBuilder failed".into()))?;
+                    PostgresRowAdapter::append_text_array_option(b, value);
+                }
+                other => {
+                    return Err(ExtractorError::UnsupportedType(format!(
+                        "array element type {:?} for column '{}' (only text[] arrays are supported)",
+                        other, column.column_name
+                    )));
+                }
             }
             _ => {
                 return Err(ExtractorError::UnsupportedType(column.data_type.clone()));
@@ -275,25 +284,7 @@ impl RowBatchBuilder {
         // Reinitialize empty builders
         for column in &self.table_metadata.columns {
             let data_type = ArrowTypeMapper::map(column)?;
-            let builder: Box<dyn ArrayBuilder> = match data_type {
-                DataType::Int16 => Box::new(Int16Builder::new()),
-                DataType::Int32 => Box::new(Int32Builder::new()),
-                DataType::Int64 => Box::new(Int64Builder::new()),
-                DataType::Float32 => Box::new(Float32Builder::new()),
-                DataType::Float64 => Box::new(Float64Builder::new()),
-                DataType::Boolean => Box::new(BooleanBuilder::new()),
-                DataType::Utf8 => Box::new(StringBuilder::new()),
-                DataType::Binary => Box::new(BinaryBuilder::new()),
-                DataType::Date32 => Box::new(Date32Builder::new()),
-                DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    Box::new(TimestampMicrosecondBuilder::new())
-                }
-                DataType::Decimal128(_precision, _scale) => {
-                    Box::new(Decimal128Builder::new())
-                }
-                _ => Box::new(StringBuilder::new()),
-            };
-            self.builders.push(builder);
+            self.builders.push(PostgresRowAdapter::new_builder(&data_type));
         }
         
         Ok(batch)
@@ -582,18 +573,27 @@ impl PostgresRowAdapter {
             let value: Option<Vec<Option<String>>> =
                 row.try_get(column.column_name.as_str())?;
 
-            match value {
-                Some(items) => {
-                    for item in items {
-                        builder.values().append_option(item);
-                    }
-                    builder.append(true);
-                }
-                None => builder.append(false),
-            }
+            Self::append_text_array_option(&mut builder, value);
         }
 
         Ok(Arc::new(builder.finish()))
+    }
+
+    /// Append one `text[]` value (or SQL NULL) to a list builder. Shared by the batch path
+    /// (`build_text_array`) and the streaming builders; array elements may themselves be NULL.
+    pub fn append_text_array_option(
+        builder: &mut ListBuilder<StringBuilder>,
+        value: Option<Vec<Option<String>>>,
+    ) {
+        match value {
+            Some(items) => {
+                for item in items {
+                    builder.values().append_option(item);
+                }
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
     }
 
     pub fn rows_to_record_batch(
@@ -641,6 +641,7 @@ impl PostgresRowAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Array;
     use arrow::datatypes::{DataType};
     use crate::types::ColumnMetadata;
 
@@ -812,5 +813,72 @@ mod tests {
         
         assert_eq!(builder.row_count(), 0);
         assert!(builder.is_empty());
+    }
+
+    #[test]
+    fn test_append_text_array_option() {        use arrow::array::ListArray;
+
+        let mut builder = ListBuilder::new(StringBuilder::new());
+
+        // Row with values including a NULL element.
+        PostgresRowAdapter::append_text_array_option(
+            &mut builder,
+            Some(vec![Some("a".to_string()), None, Some("c".to_string())]),
+        );
+        // SQL NULL array.
+        PostgresRowAdapter::append_text_array_option(&mut builder, None);
+        // Empty (non-null) array.
+        PostgresRowAdapter::append_text_array_option(&mut builder, Some(vec![]));
+
+        let list = builder.finish();
+        assert_eq!(list.len(), 3);
+        assert!(list.is_valid(0));
+        assert!(!list.is_valid(1));
+        assert!(list.is_valid(2));
+
+        let values = list.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), "a");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "c");
+    }
+
+    #[test]
+    fn test_streaming_builders_match_schema_types() {
+        use crate::types::TableMetadata;
+
+        // Regression test: a timestamptz column must be built by a timezone-aware builder,
+        // or RecordBatch::try_new rejects the batch ("expected Timestamp(µs, UTC) but
+        // found Timestamp(µs)"). Same for text[] list columns.
+        let metadata = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![
+                ColumnMetadata {
+                    column_name: "created_at".to_string(),
+                    data_type: "timestamp with time zone".to_string(),
+                    is_nullable: false,
+                    numeric_precision: None,
+                    numeric_scale: None,
+                    udt_name: None,
+                    collation_name: None,
+                },
+                ColumnMetadata {
+                    column_name: "tags".to_string(),
+                    data_type: "ARRAY".to_string(),
+                    is_nullable: false,
+                    numeric_precision: None,
+                    numeric_scale: None,
+                    udt_name: Some("_text".to_string()),
+                    collation_name: None,
+                },
+            ],
+        };
+
+        let mut builder = RowBatchBuilder::new(&metadata).unwrap();
+        // Empty batch still validates every column type against the schema.
+        let batch = builder.finish().unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
     }
 }

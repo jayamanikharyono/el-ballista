@@ -15,6 +15,8 @@ use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use async_trait::async_trait;
+
 use crate::errors::AppError;
 
 /// Cache for privilege check result to avoid repeated queries
@@ -88,6 +90,20 @@ pub async fn check_pg_read_all_stats_privilege(pool: &PgPool) -> Result<bool, Ap
     }
 }
 
+/// A source that can anchor an incremental window: the oldest timestamp no still-open
+/// transaction can invalidate. Each backend implements this its own way (Postgres reads
+/// `pg_stat_activity`; MySQL will read `SHOW PROCESSLIST` per docs/connectors/mysql.md
+/// §5.2) — the window math above never sees the difference.
+#[async_trait]
+pub trait WatermarkSource {
+    /// Never advance past the oldest in-flight transaction, so a row written by a
+    /// still-open transaction isn't skipped once it commits.
+    async fn safe_high_watermark(
+        &self,
+        safety_lag: Duration,
+    ) -> Result<DateTime<Utc>, AppError>;
+}
+
 /// docs/connectors/postgres.md §5.2 — the exact (not heuristic) safe high watermark: never
 /// advance past the oldest in-flight transaction, so a row written by a still-open transaction
 /// isn't skipped once it commits (docs/incremental-extraction.md §3.1).
@@ -121,53 +137,63 @@ pub async fn check_pg_read_all_stats_privilege(pool: &PgPool) -> Result<bool, Ap
 /// **Important:** Check privilege status at startup using `check_pg_read_all_stats_privilege()`
 /// to log the warning once, rather than on every watermark query.
 pub async fn safe_high_watermark(pool: &PgPool, safety_lag: Duration) -> Result<DateTime<Utc>, AppError> {
-    let result = sqlx::query(
-        r#"
-        SELECT LEAST(
-                 now() - INTERVAL '1 second',
-                 COALESCE(MIN(xact_start), now())
-               ) AS safe_hi
-        FROM pg_stat_activity
-        WHERE backend_type = 'client backend'
-          AND state <> 'idle'
-          AND datname = current_database()
-        "#,
-    )
-    .fetch_one(pool)
-    .await;
+    pool.safe_high_watermark(safety_lag).await
+}
 
-    match result {
-        Ok(row) => {
-            let safe_hi: DateTime<Utc> = row.try_get("safe_hi").map_err(|e| {
-                AppError::Incremental(format!(
-                    "safe watermark query returned an unexpected shape: {e}"
-                ))
-            })?;
+#[async_trait]
+impl WatermarkSource for PgPool {
+        async fn safe_high_watermark(
+            &self,
+            safety_lag: Duration,
+        ) -> Result<DateTime<Utc>, AppError> {
+        let result = sqlx::query(
+            r#"
+            SELECT LEAST(
+                     now() - INTERVAL '1 second',
+                     COALESCE(MIN(xact_start), now())
+                   ) AS safe_hi
+            FROM pg_stat_activity
+            WHERE backend_type = 'client backend'
+              AND state <> 'idle'
+              AND datname = current_database()
+            "#,
+        )
+        .fetch_one(self)
+        .await;
+
+        match result {
+            Ok(row) => {
+                let safe_hi: DateTime<Utc> = row.try_get("safe_hi").map_err(|e| {
+                    AppError::Incremental(format!(
+                        "safe watermark query returned an unexpected shape: {e}"
+                    ))
+                })?;
             
-            log::debug!(
-                "Safe high watermark from pg_stat_activity: {} (protects against commit skew)",
-                safe_hi.to_rfc3339()
-            );
+                log::debug!(
+                    "Safe high watermark from pg_stat_activity: {} (protects against commit skew)",
+                    safe_hi.to_rfc3339()
+                );
             
-            Ok(safe_hi)
-        }
-        Err(e) => {
-            log::warn!(
-                "Safe high watermark query failed ({e}); this role likely lacks \
-                 pg_read_all_stats privilege. Falling back to now() - safety_lag ({} seconds), \
-                 which provides WEAKER protection against commit-skew data loss. \
-                 See docs/incremental-extraction.md §3.1 Mitigation 1 vs 2.",
-                safety_lag.num_seconds()
-            );
+                Ok(safe_hi)
+            }
+            Err(e) => {
+                log::warn!(
+                    "Safe high watermark query failed ({e}); this role likely lacks \
+                     pg_read_all_stats privilege. Falling back to now() - safety_lag ({} seconds), \
+                     which provides WEAKER protection against commit-skew data loss. \
+                     See docs/incremental-extraction.md §3.1 Mitigation 1 vs 2.",
+                    safety_lag.num_seconds()
+                );
             
-            let fallback_hi = Utc::now() - safety_lag;
-            log::debug!(
-                "Fallback safe high watermark: {} (now - {} seconds)",
-                fallback_hi.to_rfc3339(),
-                safety_lag.num_seconds()
-            );
+                let fallback_hi = Utc::now() - safety_lag;
+                log::debug!(
+                    "Fallback safe high watermark: {} (now - {} seconds)",
+                    fallback_hi.to_rfc3339(),
+                    safety_lag.num_seconds()
+                );
             
-            Ok(fallback_hi)
+                Ok(fallback_hi)
+            }
         }
     }
 }

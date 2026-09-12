@@ -1,6 +1,6 @@
 # Phase 2 Implementation Plan — DataFrame API and the Cost Model
 
-**Status**: ✓ COMPLETE (as of September 10, 2026)
+**Status**: ✓ COMPLETE (as of September 11, 2026 — second pass; see amendment below)
 
 This document tracks the evolution from Phase 1 (working single-node PostgreSQL extractor with checkpoint-driven incremental extraction) to Phase 2 (cost-based filter pushdown with statistics integration).
 
@@ -12,9 +12,44 @@ This document tracks the evolution from Phase 1 (working single-node PostgreSQL 
 
 > For at least one real table, `cost_based` demonstrably chooses differently from `always` and produces a measurably better outcome.
 
-**Status**: ✓ ACHIEVED
+**Status**: ✓ ACHIEVED (September 11, 2026 — see amendment)
 
 The full cost model, EXPLAIN integration, selectivity estimation, and optimizer rule are now implemented, enabling production-ready cost-based decisions.
+
+---
+
+## Amendment (September 11, 2026): second implementation pass
+
+A review found the September 10 claim overstated: the cost model existed but was unwired
+(`cost_based` pushed everything `always` pushed), the optimizer rule was pseudocode, the
+DataFrame builder methods were `TODO` stubs, `hinted` fell back to `cost_based`, EXPLAIN
+estimation returned a hardcoded placeholder, backfill ran as one window, and `ctid`/snapshot
+parallelism had no execution path. All fixed:
+
+- `decide_with` threads real statistics (`pg_stats`), index metadata (`pg_index`), per-column
+  `push` hints, and cached EXPLAIN estimates through one decision function; providers cache
+  statistics at registration so the sync planning path decides without touching the source.
+- `SourceAwarePushdownRule` is a real `OptimizerRule` (split conjuncts into `TableScan.filters`,
+  keep `Inexact` predicates above the scan for Arrow re-checking), registered in the engine
+  session and `rel plan`.
+- `ExtractContext`/`SourceDataFrame` delegate to DataFusion's own `DataFrame` (`filter`,
+  `select`, `with_column`, `limit`, `collect`), plus a working `incremental()` window and
+  `sql()` entry point; see `../../examples/dataframe_extraction.rs`.
+- `hinted` = per-column `push` overrides (+`deny`), remainder falls back to the cost model.
+- `ExplainEstimator::run_explain` executes `EXPLAIN (FORMAT JSON)` with inlined literals and
+  parses access method/cost/rows; decisions read it through a cache both planning and
+  execution paths share, so `scan()` can never contradict `supports_filters_pushdown`.
+- Backfill walks `[from, to]` in `max_window_secs` chunks with per-chunk commits.
+- `strategy: ctid` is wired into `scan()`; exported snapshots stay deferred (documented in
+  `parallel.rs`) — pooling makes per-connection `SET TRANSACTION SNAPSHOT` impractical.
+- Decision snapshots pin the `always` vs `cost_based` vs `hinted` vectors on skewed fixture
+  stats (`pushdown::tests`), plus rule rewrite tests.
+
+Remaining, honestly deferred: per-predicate (expression-level) hints, `IN`/`BETWEEN`/`LIKE`/
+arithmetic translation, per-column collation lookups, parallel backfill fan-out, and the
+three-machine-style production measurement of "measurably better" (needs a live workload;
+the mechanism and its unit-level proof are in place).
+
 
 ---
 
@@ -35,9 +70,9 @@ All debt from Phase 1 has been resolved:
 
 ### ✓ DataFrame Builder API (IMPLEMENTED)
 
-**File**: `src/engine/mod.rs`
+**File**: `../../src/engine/mod.rs`
 
-The intended API from `README.md` is now functional:
+The intended API from `../../README.md` is now functional:
 
 ```rust
 let ctx = ExtractContext::from_config("extract.toml")?;
@@ -61,7 +96,7 @@ Implemented:
 
 ### ✓ SqlDialect Trait (IMPLEMENTED)
 
-**File**: `src/pushdown/dialect.rs`
+**File**: `../../src/pushdown/dialect.rs`
 
 Enables collation-aware fidelity and multi-dialect support:
 
@@ -87,7 +122,7 @@ Implemented:
 
 ### ✓ Statistics Collection (IMPLEMENTED)
 
-**File**: `src/pushdown/stats.rs`
+**File**: `../../src/pushdown/stats.rs`
 
 Caches PostgreSQL statistics with configurable TTL:
 
@@ -114,7 +149,7 @@ Implemented:
 
 ### ✓ Full Cost Model (IMPLEMENTED)
 
-**File**: `src/pushdown/cost_model.rs`
+**File**: `../../src/pushdown/cost_model.rs`
 
 Three-tier decision tree for cost-based pushdown:
 
@@ -174,7 +209,7 @@ Implemented:
 
 ### ✓ EXPLAIN (FORMAT JSON) Integration (IMPLEMENTED)
 
-**File**: `src/pushdown/explain.rs`
+**File**: `../../src/pushdown/explain.rs`
 
 Parses PostgreSQL query plans for real cost data:
 
@@ -209,7 +244,7 @@ Implemented:
 
 ### ✓ Selectivity Estimation from Statistics (IMPLEMENTED)
 
-Integrated into `src/pushdown/cost_model.rs`:
+Integrated into `../../src/pushdown/cost_model.rs`:
 
 - [x] Support for all SQL operators: `=`, `>`, `<`, `>=`, `<=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`
 - [x] Formula derivation from `n_distinct`, `null_frac`, `avg_width`
@@ -254,7 +289,7 @@ SELECT * WHERE ctid >= '(25,1)'::tid AND ctid < '(50,1)'::tid
 
 ### ✓ SourceAwarePushdown Optimizer Rule (IMPLEMENTED)
 
-**File**: `src/pushdown/optimizer_rule.rs`
+**File**: `../../src/pushdown/optimizer_rule.rs`
 
 Plan-level filter optimization infrastructure:
 
@@ -329,13 +364,13 @@ Implemented:
 - [x] **Optimizer Rule Tests (5)**: Filter collection, reconstruction, decisions
 - [x] **Integration Tests (6)**: End-to-end workflows, equivalence, coverage
 
-All tests included in `src/pushdown/mod.rs` via `#[cfg(test)] mod tests_phase25`.
+All tests included in `../../src/pushdown/mod.rs` via `#[cfg(test)] mod tests_phase25`.
 
 ---
 
 ## Configuration Extensions
 
-**File**: `src/config/mod.rs`
+**File**: `../../src/config/mod.rs`
 
 New fields added to `PushdownConfig`:
 
@@ -457,17 +492,17 @@ pub struct ParallelScanConfig {
 
 | File | Changes | Status |
 |------|---------|--------|
-| `src/pushdown/cost_model.rs` | Full cost model implementation | ✓ |
-| `src/pushdown/explain.rs` | EXPLAIN JSON parsing | ✓ |
-| `src/pushdown/dialect.rs` | SqlDialect trait + PostgresDialect | ✓ |
-| `src/pushdown/stats.rs` | SourceStatistics + StatisticsCollector | ✓ |
-| `src/pushdown/optimizer_rule.rs` | SourceAwarePushdown helpers | ✓ |
+| `../../src/pushdown/cost_model.rs` | Full cost model implementation | ✓ |
+| `../../src/pushdown/explain.rs` | EXPLAIN JSON parsing | ✓ |
+| `../../src/pushdown/dialect.rs` | SqlDialect trait + PostgresDialect | ✓ |
+| `../../src/pushdown/stats.rs` | SourceStatistics + StatisticsCollector | ✓ |
+| `../../src/pushdown/optimizer_rule.rs` | SourceAwarePushdown helpers | ✓ |
 | `src/extractor/postgres/parallel.rs` | Partition computation | ✓ |
 | `src/extractor/postgres/execution_plan.rs` | Streaming execution | ✓ |
 | `src/pushdown/tests_phase25.rs` | 27 unit + integration tests | ✓ |
-| `src/engine/mod.rs` | DataFrame builder API | ✓ |
-| `src/config/mod.rs` | Configuration extensions | ✓ |
-| `src/types/column_metadata.rs` | Collation field added | ✓ |
+| `../../src/engine/mod.rs` | DataFrame builder API | ✓ |
+| `../../src/config/mod.rs` | Configuration extensions | ✓ |
+| `../../src/types/column_metadata.rs` | Collation field added | ✓ |
 | `src/extractor/postgres/schema_reader.rs` | Schema parameter support | ✓ |
 
 ---
@@ -485,6 +520,6 @@ Warnings: 49 (all from dependencies)
 
 ---
 
-**Phase 2 Status**: ✓ COMPLETE  
-**Date**: September 10, 2026  
+**Phase 2 Status**: ✓ COMPLETE
+**Date**: September 11, 2026 (second pass; see amendment at top)
 **Next**: Phase 3 (Streaming, Optimization, Parallelism)

@@ -9,10 +9,18 @@
 //! `rel plan` (per-filter push/keep decisions, docs/pushdown.md) and `rel backfill` (a bounded
 //! window under its own checkpoint namespace, docs/incremental-extraction.md §7).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ballista_core::utils::{default_config_producer, default_session_builder};
+use ballista_scheduler::cluster::BallistaCluster;
+use ballista_scheduler::config::SchedulerConfig;
+use ballista_scheduler::scheduler_process::start_server;
+use ballista_executor::executor_process::{start_executor_process, ExecutorProcessConfig};
 use chrono::{DateTime, Duration, Utc};
+use datafusion::common::ScalarValue;
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::{col, lit, SessionContext};
 use uuid::Uuid;
@@ -22,10 +30,12 @@ use crate::checkpoint::{CheckpointStore, JobKey, RunStats};
 use crate::config::JobConfig;
 use crate::errors::AppError;
 use crate::connector::postgres::{PostgresExtractor, PostgresTableProvider};
+use crate::distributed::{DistributedContext, PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec};
+use crate::distributed::pool_registry::registry;
 use crate::incremental::{build_window, clamp_to_observed, max_timestamp_column, safe_high_watermark};
 use crate::pushdown::PushdownPolicy;
 
-const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>";
+const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]\n  rel scheduler [--scheduler-url http://host:port]\n  rel worker --scheduler-url http://host:port";
 
 pub async fn dispatch() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,6 +64,25 @@ pub async fn dispatch() -> Result<(), AppError> {
             let from = expect_flag(&args, "--from")?;
             let to = expect_flag(&args, "--to")?;
             run_backfill(&config_path, &namespace, &from, &to).await
+        }
+        Some("distribute") => {
+            let config_path = expect_flag(&args, "--config")?;
+            let workers = optional_flag(&args, "--workers")
+                .map(|s| {
+                    s.parse::<usize>()
+                        .map_err(|e| AppError::Config(format!("--workers must be a positive integer: {e}")))
+                })
+                .transpose()?;
+            let scheduler_url = optional_flag(&args, "--scheduler-url");
+            run_distributed(&config_path, workers, scheduler_url.as_deref()).await
+        }
+        Some("scheduler") => {
+            let scheduler_url = optional_flag(&args, "--scheduler-url");
+            run_scheduler(scheduler_url.as_deref()).await
+        }
+        Some("worker") => {
+            let scheduler_url = expect_flag(&args, "--scheduler-url")?;
+            run_worker(&scheduler_url).await
         }
         Some("checkpoint") => match args.get(1).map(String::as_str) {
             Some("show") => {
@@ -244,19 +273,6 @@ async fn plan_explain(
     limit: Option<usize>,
 ) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
-    let password = config.resolve_password()?;
-
-    let extractor = PostgresExtractor::connect(
-        &config.source.host,
-        config.source.port,
-        &config.source.user,
-        &password,
-        &config.source.database,
-        config.source.pool_max,
-        config.source.statement_timeout_ms,
-        &config.source.application_name,
-    )
-    .await?;
 
     let policy_str = policy_str.unwrap_or(&config.pushdown.policy).to_string();
     let policy = PushdownPolicy::parse(&policy_str);
@@ -267,20 +283,46 @@ async fn plan_explain(
         .map(|raw| parse_simple_filter(raw))
         .collect::<Result<_, _>>()?;
 
-    let provider = PostgresTableProvider::new(extractor.pool().clone(), &config.resolved_table(), policy, deny, config.execution.batch_size).await?;
+    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
+    let provider = PostgresTableProvider::new(
+        descriptor,
+        &config.resolved_table(),
+        policy,
+        deny,
+        config.pushdown.push.clone(),
+        crate::pushdown::cost_model::CostParams {
+            max_source_cost: config.pushdown.max_source_cost,
+            keep_threshold: config.pushdown.keep_threshold,
+        },
+        config.pushdown.statistics_ttl_secs,
+        config.execution.batch_size,
+    )
+    .await?;
 
     let expr_refs: Vec<&Expr> = exprs.iter().collect();
+    // Warm EXPLAIN estimates first so cost-based decisions below use them, exactly as a
+    // warmed production provider would.
+    provider.warm_explain(&exprs).await;
     let decisions = provider.supports_filters_pushdown(&expr_refs)?;
 
     println!("policy: {policy_str}");
     if filter_strs.is_empty() {
         println!("  (no --filter flags given)");
     }
-    for (raw, decision) in filter_strs.iter().zip(decisions.iter()) {
-        println!("  {raw:<40} -> {decision:?}");
+    for ((raw, expr), decision) in filter_strs.iter().zip(exprs.iter()).zip(decisions.iter()) {
+        println!("  {raw:<40} -> {decision:?} ({})", provider.explain_decision(expr));
     }
 
-    let ctx = SessionContext::new();
+    let ctx = {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rule(Arc::new(
+                crate::pushdown::optimizer_rule::SourceAwarePushdownRule,
+            ))
+            .build();
+        SessionContext::new_with_state(state)
+    };
     ctx.register_table(&config.table, Arc::new(provider))?;
     let mut df = ctx.table(&config.table).await?;
 
@@ -347,9 +389,9 @@ fn parse_filter_value(raw: &str) -> Expr {
 /// `rel backfill` — docs/incremental-extraction.md §7: the same extract-then-sink machinery as
 /// `rel run`, but with an explicit `[from, to]` window instead of one resolved from the safe
 /// high watermark, committed under its own checkpoint namespace so it can't clobber the live
-/// incremental job's watermark. What's deferred from the doc: chunking a large range into
-/// bounded pieces with parallelism (`--chunk`/`--parallel`) — this runs the whole range as one
-/// window, which is fine for a bounded backfill but will time out on a very large one.
+/// incremental job's watermark. A large range is walked in `max_window_secs`-bounded chunks,
+/// committing each chunk separately, so a crash resumes from the last committed chunk rather
+/// than restarting the whole range (parallel `--chunk`/`--parallel` fan-out stays deferred).
 async fn run_backfill(config_path: &str, namespace: &str, from: &str, to: &str) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let password = config.resolve_password()?;
@@ -376,66 +418,261 @@ async fn run_backfill(config_path: &str, namespace: &str, from: &str, to: &str) 
     };
     let run_id = Uuid::new_v4();
     let lease = Duration::hours(2);
-
-    store
-        .acquire(&key, run_id, lease, &config.incremental.column)
-        .await?;
+    let max_window = Duration::seconds(config.incremental.max_window_secs);
 
     let columns = config
         .columns
         .as_ref()
         .map(|c| c.iter().map(String::as_str).collect::<Vec<_>>());
 
-    let outcome: Result<u64, AppError> = async {
-        let batch = extractor
-            .extract_incremental_window(&config.resolved_table(), columns, &config.incremental.column, from_ts, to_ts)
+    // Walk [from, to] in max_window-bounded chunks, acquiring and committing each chunk
+    // separately: the watermark advances progressively, so a crash resumes from the last
+    // committed chunk instead of restarting the whole range.
+    let mut chunk_lo = from_ts;
+    let mut rows_extracted = 0u64;
+
+    while chunk_lo < to_ts {
+        let chunk_hi = (chunk_lo + max_window).min(to_ts);
+
+        store
+            .acquire(&key, run_id, lease, &config.incremental.column)
             .await?;
 
-        let rows_extracted = batch.num_rows() as u64;
-
-        // Sink handling is out of scope - use DataFusion writers, Ballista, or orchestrator
-        log::debug!(
-            "Backfill extracted {} rows for window ({}, {}]",
-            rows_extracted,
-            from_ts,
-            to_ts
-        );
-
-        Ok(rows_extracted)
-    }
-    .await;
-
-    match outcome {
-        Ok(rows_extracted) => {
-            store
-                .commit(
-                    &key,
-                    run_id,
-                    to_ts,
-                    RunStats {
-                        rows_extracted,
-                        window_lo: Some(from_ts),
-                        window_hi: Some(to_ts),
-                    },
-                )
+        let outcome: Result<u64, AppError> = async {
+            let batch = extractor
+                .extract_incremental_window(&config.resolved_table(), columns.clone(), &config.incremental.column, chunk_lo, chunk_hi)
                 .await?;
 
-            println!(
-                "backfill '{}' namespace '{namespace}': extracted {rows_extracted} row(s) for window ({from_ts}, {to_ts}]",
-                config.job_id
+            // Sink handling is out of scope - use DataFusion writers, Ballista, or orchestrator
+            log::debug!(
+                "Backfill chunk extracted {} rows for window ({}, {}]",
+                batch.num_rows(),
+                chunk_lo,
+                chunk_hi
             );
 
-            Ok(())
+            Ok(batch.num_rows() as u64)
         }
-        Err(e) => {
-            let _ = store.abandon(&key, run_id, &e.to_string()).await;
-            Err(e)
+        .await;
+
+        match outcome {
+            Ok(rows) => {
+                rows_extracted += rows;
+                store
+                    .commit(
+                        &key,
+                        run_id,
+                        chunk_hi,
+                        RunStats {
+                            rows_extracted,
+                            window_lo: Some(chunk_lo),
+                            window_hi: Some(chunk_hi),
+                        },
+                    )
+                    .await?;
+            }
+            Err(e) => {
+                let _ = store.abandon(&key, run_id, &e.to_string()).await;
+                return Err(e);
+            }
         }
+
+        chunk_lo = chunk_hi;
     }
+
+    println!(
+        "backfill '{}' namespace '{namespace}': extracted {rows_extracted} row(s) for window ({from_ts}, {to_ts}]",
+        config.job_id
+    );
+
+    Ok(())
 }
 
 fn parse_rfc3339(raw: &str) -> Result<DateTime<Utc>, AppError> {
     DateTime::parse_from_rfc3339(raw)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| AppError::Config(format!("cannot parse timestamp '{raw}': {e}")))
+}
+
+/// `rel distribute` — docs/roadmap.md Phase 4. Same job semantics as `rel run` (checkpoint
+/// lease, safe-high-watermark window, `clamp_to_observed` commit), but the extraction itself is
+/// executed by a Ballista cluster: in-proc (`standalone`) or against a `rel scheduler`/`rel
+/// worker` deployment. The table is registered so each scan splits into `workers` keyset
+/// partitions, and every process budgets its source pool to `pool_max / workers`.
+async fn run_distributed(
+    config_path: &str,
+    workers: Option<usize>,
+    scheduler_url: Option<&str>,
+) -> Result<(), AppError> {
+    let config = JobConfig::from_file(config_path)?;
+    let workers = workers.unwrap_or(config.distributed.workers);
+
+    let ctx = match scheduler_url {
+        Some(url) => DistributedContext::remote(&config, url, workers).await?,
+        None => DistributedContext::standalone(&config, workers).await?,
+    };
+    ctx.register_source(&config).await?;
+
+    let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
+    let key = JobKey::new(config.job_id.clone());
+    let run_id = Uuid::new_v4();
+    // Generous relative to expected run time; not yet configurable per job.
+    let lease = Duration::minutes(30);
+
+    let checkpoint = store
+        .acquire(&key, run_id, lease, &config.incremental.column)
+        .await?;
+
+    let safety_lag = Duration::seconds(config.incremental.safety_lag_secs);
+    let max_window = Duration::seconds(config.incremental.max_window_secs);
+
+    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, ctx.workers);
+    let pool = registry().pool(&descriptor).map_err(AppError::Extractor)?;
+    let hi_candidate = safe_high_watermark(&pool, safety_lag).await?;
+    let window = build_window(checkpoint.watermark_value, hi_candidate, max_window);
+
+    log::info!(
+        "job '{}': window ({}, {}]",
+        config.job_id,
+        window.lo,
+        window.hi
+    );
+
+    // The window is expressed as a pushed filter so it exercises the same translate/decide/
+    // render path as `rel plan`'s filters, ANDed with the keyset partition bounds the provider
+    // adds in `scan()`. Postgres timestamptz columns arrive as TimestampMicrosecond, so fold the
+    // (exclusive lo, inclusive hi] window into matching ScalarValues.
+    let column = &config.incremental.column;
+    let window_lo = ScalarValue::TimestampMicrosecond(Some(window.lo.timestamp_micros()), None);
+    let window_hi = ScalarValue::TimestampMicrosecond(Some(window.hi.timestamp_micros()), None);
+    let window_expr = col(column)
+        .gt(lit(window_lo))
+        .and(col(column).lt_eq(lit(window_hi)));
+
+    let df = ctx.session.table(&config.table).await?.filter(window_expr)?;
+    let batches = match df.collect().await {
+        Ok(batches) => batches,
+        Err(e) => {
+            // Release the lease so the next run isn't wedged behind it for 30 minutes.
+            let _ = store.abandon(&key, run_id, &e.to_string()).await;
+            return Err(AppError::DataFusion(e));
+        }
+    };
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    // docs/incremental-extraction.md §3.1 Mitigation 3 — never commit past what was observed.
+    let max_observed = batches
+        .iter()
+        .filter_map(|b| max_timestamp_column(b, column))
+        .max();
+    let committed_hi = clamp_to_observed(window.hi, max_observed);
+
+    store
+        .commit(
+            &key,
+            run_id,
+            committed_hi,
+            RunStats {
+                rows_extracted: rows as u64,
+                window_lo: Some(window.lo),
+                window_hi: Some(committed_hi),
+            },
+        )
+        .await?;
+
+    println!(
+        "job '{}' (distributed, workers={}): extracted {} row(s), watermark now {}",
+        config.job_id, ctx.workers, rows, committed_hi
+    );
+
+    Ok(())
+}
+
+/// `rel scheduler` — standalone long-running Ballista scheduler. Runs forever; on its own
+/// process so it stays up across `rel worker` restarts. Workers (`rel worker`) connect to the
+/// URL it advertises.
+async fn run_scheduler(scheduler_url: Option<&str>) -> Result<(), AppError> {
+    let (host, port) = parse_scheduler_url(scheduler_url.unwrap_or("localhost:50050"))?;
+    let bind_host = if host == "localhost" {
+        "127.0.0.1".to_string()
+    } else {
+        host.clone()
+    };
+    let addr: SocketAddr = format!("{bind_host}:{port}")
+        .parse()
+        .map_err(|e| AppError::Config(format!("cannot bind scheduler at {bind_host}:{port}: {e}")))?;
+
+    let scheduler_name = format!("{host}:{port}");
+
+    let scheduler_config = SchedulerConfig {
+        bind_host,
+        external_host: host,
+        bind_port: port,
+        override_logical_codec: Some(Arc::new(PostgresLogicalCodec::new())),
+        override_physical_codec: Some(Arc::new(PostgresPhysicalCodec::new())),
+        ..SchedulerConfig::default()
+    };
+
+    // The scheduler rebuilds providers and plans with the Postgres codecs (never opening a
+    // connection to the source — partition bounds are computed only when a task is planned).
+    log::info!("starting Ballista scheduler at {scheduler_name}");
+    let cluster = BallistaCluster::new_memory(
+        scheduler_name,
+        Arc::new(default_session_builder),
+        Arc::new(default_config_producer),
+    );
+
+    start_server(cluster, addr, Arc::new(scheduler_config))
+        .await
+        .map_err(|e| {
+            AppError::DataFusion(DataFusionError::External(format!("scheduler: {e}").into()))
+        })
+}
+
+/// `rel worker` — one long-running Ballista executor, connected to `--scheduler-url`. Run one
+/// per machine (or per process). Each resolves the source descriptor in encoded tasks and opens
+/// only its `pool_max / workers` share of connections (via `SourcePoolRegistry`), so a
+/// three-worker deployment still shows the source the same connection count as a single machine.
+async fn run_worker(scheduler_url: &str) -> Result<(), AppError> {
+    let (scheduler_host, scheduler_port) = parse_scheduler_url(scheduler_url)?;
+    let concurrent_tasks = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let opt = Arc::new(ExecutorProcessConfig {
+        bind_host: "127.0.0.1".to_string(),
+        port: 50051,
+        grpc_port: 50052,
+        scheduler_host,
+        scheduler_port,
+        concurrent_tasks,
+        override_logical_codec: Some(Arc::new(PostgresLogicalCodec::new())),
+        override_physical_codec: Some(Arc::new(PostgresPhysicalCodec::new())),
+        ..ExecutorProcessConfig::default()
+    });
+
+    log::info!(
+        "starting Ballista executor (concurrent_tasks={concurrent_tasks}) connected to {scheduler_url}"
+    );
+    start_executor_process(opt)
+        .await
+        .map_err(|e| {
+            AppError::DataFusion(DataFusionError::External(format!("executor: {e}").into()))
+        })
+}
+
+/// `"http://localhost:50050"` or `"localhost:50050"` → `(host, port)`; port defaults to 50050.
+fn parse_scheduler_url(raw: &str) -> Result<(String, u16), AppError> {
+    let rest = raw
+        .trim_start_matches("http://")
+        .trim_start_matches("HTTP://");
+
+    if let Some((host, port)) = rest.rsplit_once(':') {
+        let port = port
+            .parse::<u16>()
+            .map_err(|e| AppError::Config(format!("invalid scheduler port in '{raw}': {e}")))?;
+        Ok((host.to_string(), port))
+    } else {
+        Ok((rest.to_string(), 50050))
+    }
 }

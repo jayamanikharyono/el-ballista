@@ -40,9 +40,9 @@ pub struct JobKey {
 }
 
 impl JobKey {
-    /// A job key in the default namespace. Backfills getting their own namespace (so they don't
-    /// clobber the live incremental job's watermark) is documented in
-    /// docs/incremental-extraction.md §6 but not implemented yet.
+    /// A job key in the default namespace. Backfills construct their own namespace directly
+    /// so they don't clobber the live incremental job's watermark (see
+    /// docs/incremental-extraction.md §6).
     pub fn new(job_id: impl Into<String>) -> Self {
         Self {
             job_id: job_id.into(),

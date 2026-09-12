@@ -280,6 +280,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_from_file_example_config() {
+        // The checked-in example spec must always parse: it is what the examples and the
+        // runbook invoke. Catches renamed/removed serde fields.
+        // Tests run with CWD at the crate root, where examples/ lives.
+        let config =
+            JobConfig::from_file("examples/configs/extract.example.json").unwrap();
+
+        assert_eq!(config.job_id, "orders_incremental");
+        assert_eq!(config.table, "orders");
+        assert_eq!(config.resolved_table(), "public.orders");
+        assert_eq!(config.source.password_env, "ORDERS_PG_PASSWORD");
+        assert_eq!(config.incremental.column, "updated_at");
+        assert!(config.columns.as_ref().unwrap().contains(&"tags".to_string()));
+
+        // Spec blocks absent from older files fall back to defaults.
+        assert_eq!(config.pushdown.push, Vec::<String>::new());
+        assert_eq!(config.distributed.workers, 2);
+        assert_eq!(config.execution.batch_size, 8192);
+        assert_eq!(config.parallel_scan.partition_column, "order_id");
+    }
+
+    #[test]
+    fn test_from_file_missing_is_config_error() {
+        let err = JobConfig::from_file("examples/configs/does-not-exist.json").unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
+    }
+
+    #[test]
     fn test_resolved_table() {
         let mut config = JobConfig {
             job_id: "test".to_string(),

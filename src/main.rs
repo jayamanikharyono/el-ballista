@@ -7,7 +7,7 @@ mod incremental;
 mod pushdown;
 mod cli;
 mod demo;
-mod engine;
+mod distributed;
 
 use crate::errors::AppError;
 

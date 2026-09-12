@@ -6,7 +6,9 @@
 //! 3. Otherwise, keep (execute in Arrow)
 
 use super::{Fidelity, Predicate};
-use crate::pushdown::stats::{SourceStatistics, ColumnStats};
+use crate::pushdown::stats::{ColumnStats, SourceStatistics};
+
+pub use crate::pushdown::stats::IndexInfo;
 
 /// The outcome of a cost-based pushdown decision.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,16 +44,6 @@ impl Default for CostParams {
             keep_threshold: 0.30,
         }
     }
-}
-
-/// Index information from pg_index.
-#[derive(Debug, Clone)]
-pub struct IndexInfo {
-    pub name: String,
-    pub columns: Vec<String>,
-    pub is_unique: bool,
-    pub is_primary: bool,
-    pub index_type: String, // btree, hash, gist, gin, etc.
 }
 
 /// Make a cost-based pushdown decision for a predicate.
@@ -160,6 +152,7 @@ fn extract_columns_recursive(predicate: &Predicate, columns: &mut Vec<String>) {
         Predicate::Not(p) | Predicate::IsNull(p) | Predicate::IsNotNull(p) => {
             extract_columns_recursive(p, columns);
         }
+        Predicate::Cast { expr, .. } => extract_columns_recursive(expr, columns),
     }
 }
 
@@ -220,6 +213,10 @@ pub fn estimate_selectivity_from_stats(
             } else {
                 0.99
             }
+        }
+        Predicate::Cast { expr, .. } => {
+            // A cast preserves row counts; selectivity is the inner predicate's.
+            estimate_selectivity_from_stats(expr, stats)
         }
     }
 }
@@ -359,7 +356,7 @@ mod tests {
         let stats = create_test_stats();
         let pred = Predicate::Cmp {
             left: Box::new(Predicate::Column("id".to_string())),
-            op: "=",
+            op: "=".to_string(),
             right: Box::new(Predicate::Literal(super::super::Literal::Int(42))),
         };
 
@@ -373,12 +370,12 @@ mod tests {
         let pred = Predicate::And(
             Box::new(Predicate::Cmp {
                 left: Box::new(Predicate::Column("id".to_string())),
-                op: "=",
+                op: "=".to_string(),
                 right: Box::new(Predicate::Literal(super::super::Literal::Int(42))),
             }),
             Box::new(Predicate::Cmp {
                 left: Box::new(Predicate::Column("status".to_string())),
-                op: "=",
+                op: "=".to_string(),
                 right: Box::new(Predicate::Literal(super::super::Literal::Text("PAID".to_string()))),
             }),
         );

@@ -102,7 +102,7 @@ Key improvements:
 
 ### ✓ Task 4: Configuration (COMPLETED)
 
-**File**: `src/config/mod.rs`
+**File**: `../../src/config/mod.rs`
 
 Added `ExecutionConfig` with `batch_size`:
 
@@ -138,9 +138,9 @@ pub struct JobConfig {
 **Files Updated**:
 - `src/extractor/postgres/execution_plan.rs`: Added `batch_size` field to `PostgresExecutionPlan`, updated `try_new()` signature
 - `src/extractor/postgres/table_provider.rs`: Added `batch_size` to `PostgresTableProvider`, threaded through to `execute()`
-- `src/cli/mod.rs`: Pass `config.execution.batch_size` when creating `PostgresTableProvider`
-- `src/demo.rs`: Updated JobConfig instantiation with `ExecutionConfig`
-- `Cargo.toml`: Added `async-stream = "0.3"` dependency
+- `../../src/cli/mod.rs`: Pass `config.execution.batch_size` when creating `PostgresTableProvider`
+- `../../src/demo.rs`: Updated JobConfig instantiation with `ExecutionConfig`
+- `../../Cargo.toml`: Added `async-stream = "0.3"` dependency
 
 ### ✓ Task 5: Tests (COMPLETED)
 
@@ -245,10 +245,10 @@ async-stream = "0.3"
 | `src/extractor/postgres/row_adapter.rs` | Added RowBatchBuilder struct with incremental appending | ✓ |
 | `src/extractor/postgres/execution_plan.rs` | Replaced fetch_all() + stream::once() with async_stream | ✓ |
 | `src/extractor/postgres/table_provider.rs` | Added batch_size field and threading | ✓ |
-| `src/config/mod.rs` | Added ExecutionConfig with batch_size | ✓ |
-| `src/cli/mod.rs` | Pass batch_size to PostgresTableProvider::new() | ✓ |
-| `src/demo.rs` | Updated JobConfig instantiation | ✓ |
-| `Cargo.toml` | Added async-stream dependency | ✓ |
+| `../../src/config/mod.rs` | Added ExecutionConfig with batch_size | ✓ |
+| `../../src/cli/mod.rs` | Pass batch_size to PostgresTableProvider::new() | ✓ |
+| `../../src/demo.rs` | Updated JobConfig instantiation | ✓ |
+| `../../Cargo.toml` | Added async-stream dependency | ✓ |
 
 ---
 

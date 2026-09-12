@@ -1,7 +1,7 @@
 # Phase 1 Implementation Plan — Single-Node PostgreSQL Extractor
 
-Status reference: [roadmap.md](roadmap.md#phase-1--single-node-postgresql-extractor). This plan
-takes the current code in `src/` (a single-binary proof of concept: schema read → hardcoded window
+Status reference: [roadmap.md](../roadmap.md#phase-1--single-node-postgresql-extractor). This plan
+takes the current code in `../../src` (a single-binary proof of concept: schema read → hardcoded window
 query → Arrow decode → optional `TableProvider` registration) to the Phase 1 exit criteria:
 
 > A real table extracts incrementally on a schedule for two weeks without intervention. The
@@ -30,7 +30,7 @@ pushdown, the cost model, and MySQL are explicitly Phase 2/3 — out of scope he
 
 ## 1. Crate shape: stay single-crate for Phase 1
 
-`architecture.md` specifies a nine-crate workspace. Splitting it now, before there is working
+`../architecture.md` specifies a nine-crate workspace. Splitting it now, before there is working
 end-to-end behavior, is the "scope creep" failure mode the roadmap warns about — premature crate
 boundaries without a second connector to validate the SPI just add ceremony. Recommendation:
 keep one binary crate through Phase 1, but organize modules so the Phase-3 split is a mechanical
@@ -49,7 +49,7 @@ src/
 └── main.rs
 ```
 
-Rename `src/extractor/` → `src/connector/` while doing this (see §3) so module names match the
+Rename `src/extractor/` → `../../src/connector` while doing this (see §3) so module names match the
 vocabulary the docs already use (`Source`, `SourceTable`, `ScanPlan`) — this repo currently calls
 that layer "extractor," which will get confusing once a checkpoint-driven "incremental extractor"
 concept also exists.
@@ -62,7 +62,7 @@ concept also exists.
 config, and `postgres.md` §6 treats session hygiene as non-negotiable — building more extraction
 logic on top of a connection that skips it just means retrofitting it later under time pressure.
 
-- [ ] `config/mod.rs`: parse the `extract.toml` shape from `architecture.md` §6 (`[sources.*]`,
+- [ ] `config/mod.rs`: parse the `extract.toml` shape from `../architecture.md` §6 (`[sources.*]`,
       `[checkpoints]`, `[sinks.*]`) with `serde` + `toml`. DSNs resolved from environment variables
       named by `dsn_env`, never inlined.
 - [ ] `connector/postgres/connection.rs`: a connect function that, on every new connection, issues
@@ -82,7 +82,7 @@ logic on top of a connection that skips it just means retrofitting it later unde
 ## 3. Connector SPI: replace the stub traits
 
 `src/extractor/traits.rs` currently declares generic traits nothing implements. Replace with the
-real SPI from `connectors/README.md` §1, scoped to what Phase 1 needs (drop `estimate`,
+real SPI from `../connectors/README.md` §1, scoped to what Phase 1 needs (drop `estimate`,
 `consistent_snapshot` fields that aren't used until parallel scan/cost model land in Phase 2, but
 keep the trait shapes so adding them later isn't a breaking change):
 
@@ -103,7 +103,7 @@ keep the trait shapes so adding them later isn't a breaking change):
 ## 4. Checkpoint store
 
 The mechanism that makes extraction *incremental* rather than "run a query with a hardcoded date."
-Implements `incremental-extraction.md` §6.
+Implements `../incremental-extraction.md` §6.
 
 - [ ] `checkpoint/store.rs`: `CheckpointStore` trait (`acquire`, `commit`, `abandon`, `history`) —
       exact signatures from the doc.
@@ -126,14 +126,14 @@ the next invocation can reclaim.
 
 ## 5. Incremental correctness: watermark and window construction
 
-This is `incremental-extraction.md` in full — the part of the project that is actually the point.
+This is `../incremental-extraction.md` in full — the part of the project that is actually the point.
 Replace `execution_plan.rs`'s hardcoded `"updated_at"` / `now() - 30 days` with real window
 resolution.
 
 - [ ] `incremental/watermark.rs`: `WatermarkSpec` (mode, column, primary_key, safety_lag,
       max_window) parsed from job config.
 - [ ] Implement the Postgres safe high watermark query from `postgres.md` §5.2 /
-      `incremental-extraction.md` §3.1 Mitigation 2 (`LEAST(now() - 1s, MIN(xact_start))` over
+      `../incremental-extraction.md` §3.1 Mitigation 2 (`LEAST(now() - 1s, MIN(xact_start))` over
       `pg_stat_activity`). Verify `pg_read_all_stats` at startup; fall back to
       `now() - safety_lag` with a logged warning if the privilege is missing — implement this
       fallback now, don't leave it as a silent gap.
@@ -159,7 +159,7 @@ actual test, not a read-through.
 
 `postgres.md` §2 specifies two extraction paths. Today there's one (`fetch_all` via the extended
 protocol, no streaming, whole result set materialized in memory — which also contradicts
-`architecture.md` §5's backpressure argument, since nothing streams yet).
+`../architecture.md` §5's backpressure argument, since nothing streams yet).
 
 - [ ] Switch the default incremental path to `query_raw` (streaming portal) instead of
       `fetch_all`, and make `PostgresExecutionPlan::execute` yield multiple `RecordBatch`es of
@@ -187,11 +187,11 @@ require: local + GCS Parquet, deterministic paths, `_SUCCESS` markers).
 
 - [ ] `sink/parquet.rs`: write a `SendableRecordBatchStream` to Parquet using DataFusion's own
       `DataFrame::write_parquet` or the `parquet` crate directly, partitioned by `_extracted_date`.
-- [ ] Append the four metadata columns from `architecture.md` §4 (`_extracted_at`,
+- [ ] Append the four metadata columns from `../architecture.md` §4 (`_extracted_at`,
       `_extracted_date`, `_source`, `_watermark_hi`) to every batch before it reaches the sink —
       this belongs in the scan/adapter layer, not the sink, since the sink shouldn't know about
       watermarks.
-- [ ] Deterministic object paths from `incremental-extraction.md` §5:
+- [ ] Deterministic object paths from `../incremental-extraction.md` §5:
       `.../w=<lo_epoch>-<hi_epoch>/part-NNNNN.parquet`.
 - [ ] `_SUCCESS` marker written last, naming the expected object count; readers/loaders (out of
       scope for Phase 1 itself, but don't build a sink that makes this impossible later) should be
@@ -228,7 +228,7 @@ with no manual intervention.
 
 ## 9. Observability
 
-`architecture.md` §7's metric list, scoped to what Phase 1 actually produces (drop
+`../architecture.md` §7's metric list, scoped to what Phase 1 actually produces (drop
 `rel_pushdown_decision_total` — no pushdown decisions exist yet):
 
 - [ ] `tracing` spans: one per job run, one per partition scan (single partition in Phase 1, but
@@ -249,7 +249,7 @@ job, and drops back down once it resumes.
 
 ## 10. Differential correctness suite
 
-`pushdown.md` §6 calls this "the single highest-value test in the project," and the roadmap makes
+`../pushdown.md` §6 calls this "the single highest-value test in the project," and the roadmap makes
 it an explicit exit criterion. Phase 1 scope is narrower than the full doc (no pushdown policy
 comparison yet, since there's no cost model) — but the hostile-value fixture and the decode-level
 correctness checks apply now, against plain vs. no-pushdown-equivalent reads.

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use async_trait::async_trait;
+
 use crate::connector::errors::ExtractorError;
 
 /// Per-column statistics from pg_stats.
@@ -28,6 +30,32 @@ pub struct SourceStatistics {
     pub table_size_bytes: u64,
     pub columns: HashMap<String, ColumnStats>,
     pub fetched_at: DateTime<Utc>,
+}
+
+/// Index information from pg_index. Lives here (rather than cost_model) so both the
+/// statistics collector and the cost model share one definition without a module cycle.
+#[derive(Debug, Clone)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub index_type: String, // btree, hash, gist, gin, etc.
+}
+
+impl SourceStatistics {
+    /// Empty statistics for contexts that cannot reach the source (e.g. a provider rebuilt
+    /// from a serialized plan on a scheduler). Selectivity falls back to conservative
+    /// defaults, so cost-based decisions degrade to keeping — never to pushing blindly.
+    pub fn empty(table_name: &str) -> Self {
+        Self {
+            table_name: table_name.to_string(),
+            row_count_estimate: 0.0,
+            table_size_bytes: 0,
+            columns: HashMap::new(),
+            fetched_at: Utc::now(),
+        }
+    }
 }
 
 pub struct StatisticsCollector {
@@ -65,8 +93,8 @@ impl StatisticsCollector {
             }
         }
 
-        // Fetch fresh statistics.
-        let stats = self.fetch_statistics(schema_name, table_name).await?;
+        // Fetch fresh statistics through the source trait (per-backend catalog queries).
+        let stats = self.pool.table_statistics(schema_name, table_name).await?;
 
         // Update cache.
         {
@@ -76,8 +104,43 @@ impl StatisticsCollector {
 
         Ok(stats)
     }
+}
 
-    async fn fetch_statistics(
+/// What the cost model needs from a source, independent of backend: table/column statistics
+/// (`pg_stats` on Postgres; the MySQL equivalent per docs/connectors/mysql.md §6) and index
+/// metadata (`pg_index`; MySQL `SHOW INDEX`). [`StatisticsCollector`] adds TTL caching on top.
+#[async_trait]
+pub trait TableStatsSource {
+    /// Row-count estimate, table size, and per-column distinctness/null-fraction/width.
+    async fn table_statistics(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<SourceStatistics, ExtractorError>;
+
+    /// Index metadata for recognizing near-free indexed predicates.
+    async fn table_indexes(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Vec<IndexInfo>, ExtractorError>;
+
+    /// Columns whose type is a true Postgres enum (present in `pg_enum`). The pushdown
+    /// layer recasts enum-vs-text comparisons to label comparisons for exactly these
+    /// columns; everything else keeps native operator resolution. Defaults to empty
+    /// (no normalization) for backends without enum catalogs.
+    async fn table_enum_columns(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+    ) -> Result<std::collections::HashSet<String>, ExtractorError> {
+        Ok(std::collections::HashSet::new())
+    }
+}
+
+#[async_trait]
+impl TableStatsSource for PgPool {
+    async fn table_statistics(
         &self,
         schema_name: &str,
         table_name: &str,
@@ -87,7 +150,7 @@ impl StatisticsCollector {
             r#"
             SELECT
                 COALESCE(reltuples, 0)::float8 AS row_count,
-                COALESCE(pg_total_relation_size(relid), 0)::int8 AS table_size
+                COALESCE(pg_total_relation_size(pg_class.oid), 0)::int8 AS table_size
             FROM pg_class
             JOIN information_schema.tables ON
                 pg_class.relname = information_schema.tables.table_name
@@ -97,7 +160,7 @@ impl StatisticsCollector {
         )
         .bind(schema_name)
         .bind(table_name)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional(self)
         .await
         .map_err(|e| {
             ExtractorError::Statistics(format!(
@@ -123,7 +186,7 @@ impl StatisticsCollector {
         )
         .bind(schema_name)
         .bind(table_name)
-        .fetch_all(self.pool.as_ref())
+        .fetch_all(self)
         .await
         .map_err(|e| {
             ExtractorError::Statistics(format!(
@@ -150,6 +213,89 @@ impl StatisticsCollector {
             columns,
             fetched_at: Utc::now(),
         })
+    }
+
+    /// Index metadata from pg_index, so the cost model recognizes near-free indexed
+    /// predicates without needing EXPLAIN.
+    async fn table_indexes(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Vec<IndexInfo>, ExtractorError> {
+        let rows: Vec<(String, Vec<String>, bool, bool, String)> = sqlx::query_as(
+            r#"
+            SELECT
+                i.relname AS index_name,
+                COALESCE(array_agg(a.attname ORDER BY array_position(ix.indkey, a.attnum)), '{}') AS columns,
+                ix.indisunique AS is_unique,
+                ix.indisprimary AS is_primary,
+                am.amname AS index_type
+            FROM pg_index ix
+            JOIN pg_class i ON i.oid = ix.indexrelid
+            JOIN pg_class t ON t.oid = ix.indrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_am am ON am.oid = i.relam
+            LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (ix.indkey)
+            WHERE n.nspname = $1
+              AND t.relname = $2
+            GROUP BY i.relname, ix.indisunique, ix.indisprimary, am.amname
+            ORDER BY i.relname
+            "#,
+        )
+        .bind(schema_name)
+        .bind(table_name)
+        .fetch_all(self)
+        .await
+        .map_err(|e| {
+            ExtractorError::Statistics(format!(
+                "cannot fetch index metadata for {}.{}: {}",
+                schema_name, table_name, e
+            ))
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(name, columns, is_unique, is_primary, index_type)| IndexInfo {
+                    name,
+                    columns,
+                    is_unique,
+                    is_primary,
+                    index_type,
+                },
+            )
+            .collect())
+    }
+
+    async fn table_enum_columns(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<std::collections::HashSet<String>, ExtractorError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT a.attname AS column_name
+            FROM pg_attribute a
+            JOIN pg_class t ON t.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_type ty ON ty.oid = a.atttypid
+            JOIN pg_enum e ON e.enumtypid = ty.oid
+            WHERE n.nspname = $1
+              AND t.relname = $2
+            "#,
+        )
+        .bind(schema_name)
+        .bind(table_name)
+        .fetch_all(self)
+        .await
+        .map_err(|e| {
+            ExtractorError::Statistics(format!(
+                "cannot fetch enum metadata for {}.{}: {}",
+                schema_name, table_name, e
+            ))
+        })?;
+
+        Ok(rows.into_iter().map(|(column_name,)| column_name).collect())
     }
 }
 

@@ -53,6 +53,7 @@ pub struct ExplainEstimate {
 }
 
 /// Caches EXPLAIN estimates for query patterns to avoid repeated estimation.
+#[derive(Debug)]
 pub struct ExplainEstimator {
     pool: Arc<PgPool>,
     cache: Arc<RwLock<HashMap<String, ExplainEstimate>>>,
@@ -70,13 +71,14 @@ impl ExplainEstimator {
 
     /// Estimate the cost of a query without executing it.
     /// Returns cached estimate if available and fresh, otherwise runs EXPLAIN and caches.
+    /// The cache is keyed by table *and* predicate: different predicates plan differently.
     pub async fn estimate_cost(
         &self,
         table_name: &str,
         schema_name: &str,
         predicate: &str,
     ) -> Result<ExplainEstimate, ExtractorError> {
-        let cache_key = format!("{}.{}", schema_name, table_name);
+        let cache_key = format!("{schema_name}.{table_name}::{predicate}");
 
         // Check cache.
         {
@@ -101,26 +103,56 @@ impl ExplainEstimator {
         Ok(estimate)
     }
 
+    /// Best-effort synchronous read of a cached estimate. Used on the sync planning path
+    /// (`supports_filters_pushdown`), which cannot run EXPLAIN itself. Returns `None` on a
+    /// cold cache — the cost model then falls back to statistics alone. This keeps the sync
+    /// and async decision paths consistent: both decide over the same cached inputs, so
+    /// `scan()` can never contradict what `supports_filters_pushdown` promised.
+    pub fn cached_estimate(
+        &self,
+        table_name: &str,
+        schema_name: &str,
+        predicate: &str,
+    ) -> Option<ExplainEstimate> {
+        // Synchronous read of an async lock: try_read never blocks; a contended lock simply
+        // looks like a cold cache, which is always a safe answer.
+        let cache = self.cache.try_read().ok()?;
+        let estimate = cache
+            .get(&format!("{schema_name}.{table_name}::{predicate}"))?
+            .clone();
+        let age = Utc::now().signed_duration_since(estimate.estimated_at);
+        if age < Duration::seconds(self.ttl_secs as i64) {
+            Some(estimate)
+        } else {
+            None
+        }
+    }
+
     async fn run_explain(
         &self,
         schema_name: &str,
         table_name: &str,
         predicate: &str,
     ) -> Result<ExplainEstimate, ExtractorError> {
-        // For now, return a placeholder since dynamic predicate injection is complex.
-        // Phase 2.5+: Use QueryBuilder or parameterized approach.
-        log::debug!(
-            "EXPLAIN estimation for {}.{} with predicate: {} (placeholder)",
-            schema_name, table_name, predicate
+        // `predicate` is rendered by `Predicate::render_inline` (literals inlined, text
+        // quoted) — never user SQL. Identifiers are quoted here. EXPLAIN plans without
+        // executing, so even a surprising predicate costs a plan, not a scan.
+        let sql = format!(
+            "EXPLAIN (FORMAT JSON) SELECT * FROM \"{}\" . \"{}\" WHERE {}",
+            schema_name.replace('"', "\"\""),
+            table_name.replace('"', "\"\""),
+            predicate,
         );
+        log::debug!("EXPLAIN estimation: {sql}");
 
-        Ok(ExplainEstimate {
-            access_method: AccessMethod::Unknown,
-            total_cost: 0.0,
-            plan_rows: 0.0,
-            index_name: None,
-            estimated_at: Utc::now(),
-        })
+        let row: (String,) = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(self.pool.as_ref())
+            .await
+            .map_err(|e| {
+                ExtractorError::Statistics(format!("EXPLAIN failed for {schema_name}.{table_name}: {e}"))
+            })?;
+
+        parse_explain_json(&row.0)
     }
 }
 

@@ -6,4 +6,5 @@ pub mod config;
 pub mod checkpoint;
 pub mod incremental;
 pub mod pushdown;
+pub mod distributed;
 pub mod engine;

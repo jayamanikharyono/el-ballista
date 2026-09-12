@@ -925,30 +925,82 @@ mod tests {
     }
 
     #[test]
-    fn test_translate_comparisons_and_fidelities() {
-        // Int comparison -> Exact
-        let int_expr = col("id").eq(lit(42i64));
-        let (f, _) = translate(&int_expr).unwrap();
-        assert_eq!(f, Fidelity::Exact);
+    fn test_translate_render_matrix() {
+        use crate::pushdown::dialect::PostgresDialect;
+        use datafusion::common::ScalarValue;
 
-        // String comparison -> Inexact (due to potential collation differences)
-        let str_expr = col("status").eq(lit("PAID"));
-        let (f, _) = translate(&str_expr).unwrap();
-        assert_eq!(f, Fidelity::Inexact);
+        let pg = PostgresDialect;
+        let ts = ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), None);
 
-        // Float comparison -> Inexact (due to NaN differences)
-        let float_expr = col("amount").gt(lit(10.5f64));
-        let (f, _) = translate(&float_expr).unwrap();
-        assert_eq!(f, Fidelity::Inexact);
+        // (expr, fidelity, postgres SQL). Params asserted separately below.
+        let cases: Vec<(Expr, Fidelity, &str)> = vec![
+            (col("id").eq(lit(42i64)), Fidelity::Exact, "(\"id\" = $1)"),
+            (col("id").not_eq(lit(42i64)), Fidelity::Exact, "(\"id\" <> $1)"),
+            (col("id").lt(lit(42i64)), Fidelity::Exact, "(\"id\" < $1)"),
+            (col("id").lt_eq(lit(42i64)), Fidelity::Exact, "(\"id\" <= $1)"),
+            (col("id").gt(lit(42i64)), Fidelity::Exact, "(\"id\" > $1)"),
+            (col("id").gt_eq(lit(42i64)), Fidelity::Exact, "(\"id\" >= $1)"),
+            (col("active").eq(lit(true)), Fidelity::Exact, "(\"active\" = $1)"),
+            (
+                col("updated_at").gt(lit(ts.clone())),
+                Fidelity::Exact,
+                "(\"updated_at\" > $1)",
+            ),
+            (
+                col("status").eq(lit("PAID")),
+                Fidelity::Inexact,
+                "(\"status\" = $1)",
+            ),
+            (
+                col("amount").gt(lit(10.5f64)),
+                Fidelity::Inexact,
+                "(\"amount\" > $1)",
+            ),
+            (
+                col("id").eq(lit(1i64)).and(col("active").eq(lit(true))),
+                Fidelity::Exact,
+                "((\"id\" = $1) AND (\"active\" = $2))",
+            ),
+            (
+                col("id").eq(lit(1i64)).or(col("status").eq(lit("x"))),
+                Fidelity::Inexact,
+                "((\"id\" = $1) OR (\"status\" = $2))",
+            ),
+            (
+                Expr::Not(Box::new(col("id").eq(lit(1i64)))),
+                Fidelity::Exact,
+                "NOT ((\"id\" = $1))",
+            ),
+            (col("id").is_null(), Fidelity::Exact, "\"id\" IS NULL"),
+            (
+                col("id").is_not_null(),
+                Fidelity::Exact,
+                "\"id\" IS NOT NULL",
+            ),
+        ];
 
-        // AND combines fidelities
-        let and_expr = col("id").eq(lit(1i64)).and(col("status").eq(lit("PAID")));
-        let (f, _) = translate(&and_expr).unwrap();
-        assert_eq!(f, Fidelity::Inexact);
+        for (expr, fidelity, sql) in &cases {
+            let (f, pred) = translate(expr).unwrap_or_else(|| {
+                panic!("expected translatable expr: {expr:?}")
+            });
+            assert_eq!(*fidelity, f, "fidelity for {expr:?}");
+            let mut params = Vec::new();
+            assert_eq!(*sql, pred.render_sql(&pg, &mut params), "SQL for {expr:?}");
+        }
 
-        let both_exact = col("id").eq(lit(1i64)).and(col("active").eq(lit(true)));
-        let (f, _) = translate(&both_exact).unwrap();
-        assert_eq!(f, Fidelity::Exact);
+        // Params arrive left-to-right: compound case yields [Int(1), Bool(true)].
+        let (_, pred) = translate(
+            &col("id").eq(lit(1i64)).and(col("active").eq(lit(true))),
+        )
+        .unwrap();
+        let mut params = Vec::new();
+        pred.render_sql(&pg, &mut params);
+        assert_eq!(params, vec![SqlParam::Int(1), SqlParam::Bool(true)]);
+
+        // Outside the allowlist: arithmetic, LIKE, and casts stay in Arrow.
+        assert!(translate(&(col("a") + col("b"))).is_none());
+        assert!(translate(&col("x").like(lit("a%"))).is_none());
+        assert!(translate(&Expr::Not(Box::new(Expr::Not(Box::new(col("x").is_null()))))).is_some());
     }
 
     #[test]
@@ -964,6 +1016,49 @@ mod tests {
         // Denylist blocks
         let deny = vec!["secret".to_string()];
         assert!(matches!(decide(&expr, PushdownPolicy::Always, &deny), Decision::Keep));
+    }
+
+    #[test]
+    fn test_policy_matrix_legacy_fallbacks_and_deny() {
+        // Without statistics, cost_based and the unhinted remainder of hinted degrade to
+        // optimistic push (legacy behavior for contexts that cannot reach the source).
+        // Strict is the exception: no stats means keep everything.
+        // Deny blocks under every policy except the never that already keeps.
+        let expr = col("secret").eq(lit(100i64));
+        let deny = vec!["secret".to_string()];
+        let cases: Vec<(PushdownPolicy, &[String], Option<&CostInputs>, &str)> = vec![
+            (PushdownPolicy::Always, &[], None, "push:exact"),
+            (PushdownPolicy::Never, &[], None, "keep"),
+            (PushdownPolicy::Never, &deny, None, "keep"),
+            (PushdownPolicy::CostBased, &[], None, "push:exact"),
+            (PushdownPolicy::CostBased, &deny, None, "keep"),
+            (PushdownPolicy::Hinted, &[], None, "push:exact"),
+            (PushdownPolicy::Hinted, &deny, None, "keep"),
+            (PushdownPolicy::Strict, &[], None, "keep"),
+            (PushdownPolicy::Strict, &deny, None, "keep"),
+        ];
+        for (policy, deny, cost, expected) in cases {
+            let got = summarize(&decide_with(&expr, policy, deny, &[], cost));
+            assert_eq!(got, expected, "policy={policy:?}");
+        }
+
+        // Untranslatable expressions keep under every policy, even always.
+        let untranslatable = col("a") + col("b");
+        for policy in [
+            PushdownPolicy::Always,
+            PushdownPolicy::Never,
+            PushdownPolicy::CostBased,
+            PushdownPolicy::Strict,
+            PushdownPolicy::Hinted,
+        ] {
+            assert!(
+                matches!(
+                    decide_with(&untranslatable, policy, &[], &[], None),
+                    Decision::Keep
+                ),
+                "untranslatable must keep under {policy:?}"
+            );
+        }
     }
 
     /// Skewed fixture: `id` is highly selective *and* indexed, `status` has two values,

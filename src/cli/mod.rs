@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_scheduler::cluster::BallistaCluster;
-use ballista_scheduler::config::SchedulerConfig;
+use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::start_server;
 use ballista_executor::executor_process::{start_executor_process, ExecutorProcessConfig};
 use chrono::{DateTime, Duration, Utc};
@@ -35,7 +35,7 @@ use crate::distributed::pool_registry::registry;
 use crate::incremental::{build_window, clamp_to_observed, max_timestamp_column, safe_high_watermark};
 use crate::pushdown::PushdownPolicy;
 
-const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]\n  rel scheduler [--scheduler-url http://host:port]\n  rel worker --scheduler-url http://host:port";
+const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]";
 
 pub async fn dispatch() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -78,11 +78,26 @@ pub async fn dispatch() -> Result<(), AppError> {
         }
         Some("scheduler") => {
             let scheduler_url = optional_flag(&args, "--scheduler-url");
-            run_scheduler(scheduler_url.as_deref()).await
+            let bind_host = optional_flag(&args, "--bind-host");
+            run_scheduler(scheduler_url.as_deref(), bind_host.as_deref()).await
         }
         Some("worker") => {
             let scheduler_url = expect_flag(&args, "--scheduler-url")?;
-            run_worker(&scheduler_url).await
+            let bind_host = optional_flag(&args, "--bind-host");
+            let external_host = optional_flag(&args, "--external-host");
+            let concurrent_tasks = optional_flag(&args, "--concurrent-tasks")
+                .map(|s| {
+                    s.parse::<usize>()
+                        .map_err(|e| AppError::Config(format!("--concurrent-tasks must be a positive integer: {e}")))
+                })
+                .transpose()?;
+            run_worker(
+                &scheduler_url,
+                bind_host.as_deref(),
+                external_host.as_deref(),
+                concurrent_tasks,
+            )
+            .await
         }
         Some("checkpoint") => match args.get(1).map(String::as_str) {
             Some("show") => {
@@ -398,6 +413,12 @@ async fn run_backfill(config_path: &str, namespace: &str, from: &str, to: &str) 
 
     let from_ts = parse_rfc3339(from)?;
     let to_ts = parse_rfc3339(to)?;
+    if from_ts > to_ts {
+        return Err(AppError::Config(format!(
+            "backfill --from ({}) is after --to ({}): empty range",
+            from, to
+        )));
+    }
 
     let extractor = PostgresExtractor::connect(
         &config.source.host,
@@ -590,14 +611,17 @@ async fn run_distributed(
 
 /// `rel scheduler` — standalone long-running Ballista scheduler. Runs forever; on its own
 /// process so it stays up across `rel worker` restarts. Workers (`rel worker`) connect to the
-/// URL it advertises.
-async fn run_scheduler(scheduler_url: Option<&str>) -> Result<(), AppError> {
+/// URL it advertises. `bind_host` is the local interface to listen on (default: 127.0.0.1 for
+/// `localhost`, else the URL host); containers pass `0.0.0.0` so other containers reach it.
+async fn run_scheduler(scheduler_url: Option<&str>, bind_host: Option<&str>) -> Result<(), AppError> {
     let (host, port) = parse_scheduler_url(scheduler_url.unwrap_or("localhost:50050"))?;
-    let bind_host = if host == "localhost" {
-        "127.0.0.1".to_string()
-    } else {
-        host.clone()
-    };
+    let bind_host = bind_host.map(str::to_string).unwrap_or_else(|| {
+        if host == "localhost" {
+            "127.0.0.1".to_string()
+        } else {
+            host.clone()
+        }
+    });
     let addr: SocketAddr = format!("{bind_host}:{port}")
         .parse()
         .map_err(|e| AppError::Config(format!("cannot bind scheduler at {bind_host}:{port}: {e}")))?;
@@ -610,6 +634,10 @@ async fn run_scheduler(scheduler_url: Option<&str>) -> Result<(), AppError> {
         bind_port: port,
         override_logical_codec: Some(Arc::new(PostgresLogicalCodec::new())),
         override_physical_codec: Some(Arc::new(PostgresPhysicalCodec::new())),
+        // Round-robin, not the default Bias: Bias eagerly fills the first executor with
+        // free slots (all 4 scan tasks landing on one worker), RoundRobin deals one task
+        // per executor. With partitions == workers this forces an even 1:1:1:1 split.
+        task_distribution: TaskDistributionPolicy::RoundRobin,
         ..SchedulerConfig::default()
     };
 
@@ -633,14 +661,29 @@ async fn run_scheduler(scheduler_url: Option<&str>) -> Result<(), AppError> {
 /// per machine (or per process). Each resolves the source descriptor in encoded tasks and opens
 /// only its `pool_max / workers` share of connections (via `SourcePoolRegistry`), so a
 /// three-worker deployment still shows the source the same connection count as a single machine.
-async fn run_worker(scheduler_url: &str) -> Result<(), AppError> {
+/// `bind_host` (default 127.0.0.1) is the local listen interface; `external_host` (default none
+/// = localhost behavior) is the name other components dial back on — containers must set both
+/// (`0.0.0.0` + the container name), otherwise the scheduler cannot reach the executor.
+/// `concurrent_tasks` (default: host CPU count) is the task-slot budget — the closest thing
+/// Ballista has to "CPUs per executor" (there is no CPU pinning; tasks run on a shared Tokio
+/// runtime over all visible cores).
+async fn run_worker(
+    scheduler_url: &str,
+    bind_host: Option<&str>,
+    external_host: Option<&str>,
+    concurrent_tasks: Option<usize>,
+) -> Result<(), AppError> {
     let (scheduler_host, scheduler_port) = parse_scheduler_url(scheduler_url)?;
-    let concurrent_tasks = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let concurrent_tasks = match concurrent_tasks {
+        // 0 means "no opinion" — same as omitting the flag.
+        Some(0) | None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        Some(n) => n,
+    };
 
     let opt = Arc::new(ExecutorProcessConfig {
-        bind_host: "127.0.0.1".to_string(),
+        bind_host: bind_host.unwrap_or("127.0.0.1").to_string(),
         port: 50051,
         grpc_port: 50052,
         scheduler_host,
@@ -648,6 +691,7 @@ async fn run_worker(scheduler_url: &str) -> Result<(), AppError> {
         concurrent_tasks,
         override_logical_codec: Some(Arc::new(PostgresLogicalCodec::new())),
         override_physical_codec: Some(Arc::new(PostgresPhysicalCodec::new())),
+        external_host: external_host.map(str::to_string),
         ..ExecutorProcessConfig::default()
     });
 

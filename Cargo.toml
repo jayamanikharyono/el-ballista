@@ -16,7 +16,7 @@ arrow = "58.4"
 ballista = "54.1.0"
 ballista-core = "54.1.0"
 ballista-executor = { version = "54.1.0", default-features = false, features = ["arrow-ipc-optimizations"] }
-ballista-scheduler = { version = "54.1.0", default-features = false, features = ["rest-api", "build-binary"] }
+ballista-scheduler = { version = "54.1.0", default-features = false, features = ["rest-api", "tracing"] }
 bigdecimal = "0.4.10"
 chrono = { version = "0.4.45", features = ["serde"] }
 datafusion = "54.1.0"
@@ -33,9 +33,6 @@ futures = "0.3.34"
 serde_json = "1.0.151"
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
 async-stream = "0.3"
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-0_8"] }
-bytes = "1"
-byteorder = "1.5"
 
 [[example]]
 name = "incremental_extraction"
@@ -68,3 +65,7 @@ path = "examples/distributed_extraction.rs"
 [[example]]
 name = "dataframe_extraction"
 path = "examples/dataframe_extraction.rs"
+
+[[example]]
+name = "bench_full_load"
+path = "examples/bench_full_load.rs"

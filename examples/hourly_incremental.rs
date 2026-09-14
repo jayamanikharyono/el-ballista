@@ -110,8 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Update checkpoint
     println!("\n► Step 7: Update checkpoint");
     
+    // The checkpoint advances to extraction_end (not window_end): the lagged tail
+    // (extraction_end, window_end] is picked up by the next run, so consecutive
+    // windows tile with no gap. Advancing to window_end would skip it forever.
     let new_checkpoint = extraction_end;
-    let next_window_start = window_end;
+    let next_window_start = extraction_end;
     let next_window_end = next_window_start + window_duration;
     
     let checkpoint_data = serde_json::json!({

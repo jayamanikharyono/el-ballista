@@ -63,14 +63,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window_end = DateTime::from_naive_utc_and_offset(window_end, Utc);
     let window_start = window_end - Duration::days(1);
     
-    // Add safety lag (5 minutes) to avoid uncommitted transactions
-    let safety_lag = Duration::minutes(5);
-    let extraction_end = window_end - safety_lag;
+    // This example runs after the day boundary (see step 6: 01:00 UTC), so the
+    // uncommitted-transaction risk the safety lag guards against has already passed
+    // for yesterday's rows — extract the full day through midnight. Cutting at
+    // window_end - lag with no checkpoint would permanently skip the day's last
+    // minutes, since no later run covers them.
+    let extraction_end = window_end;
     
     println!("  Processing window:");
     println!("    Window start: {}", window_start.to_rfc3339());
     println!("    Window end:   {}", window_end.to_rfc3339());
-    println!("    Safety lag:   {} minutes", safety_lag.num_minutes());
     println!("    Extraction to: {}", extraction_end.to_rfc3339());
     
     // 4. Execute daily incremental extraction

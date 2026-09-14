@@ -113,18 +113,26 @@ impl DistributedContext {
     }
 
     /// Opens (once, process-wide) the budgeted source pool, discovers the table schema, and
-    /// registers a `PostgresTableProvider` that splits its scan into `workers` keyset
-    /// partitions when a partition column is configured.
+    /// registers a `PostgresTableProvider` that splits its scan into keyset partitions when
+    /// a partition column is configured. Partition *count* comes from
+    /// `parallel_scan.partitions` (so scans can oversubscribe workers, e.g. 128 partitions
+    /// over 4 workers, for placement spread); `workers` only divides the connection budget
+    /// and is the fallback count when `partitions <= 1`.
     pub async fn register_source(&self, config: &JobConfig) -> Result<(), AppError> {
         let descriptor = PostgresConnectionDescriptor::from_config(&config.source, self.workers);
         let policy = PushdownPolicy::parse(&config.pushdown.policy);
 
+        let configured = config.parallel_scan.partitions;
+        // workers doubles as the default count, so existing configs (partitions <= 1)
+        // behave exactly as before.
+        let partitions = if configured > 1 { configured } else { self.workers };
         log::info!(
-            "registering {}.{} with {}-worker budget (pool_max/workers = {})",
+            "registering {}.{} with {}-worker budget (pool_max/workers = {}) and {} scan partitions",
             config.source.schema,
             config.table,
             self.workers,
             descriptor.budgeted_max_connections(),
+            partitions,
         );
 
         let provider = PostgresTableProvider::new(
@@ -143,7 +151,7 @@ impl DistributedContext {
         .await?;
 
         let provider = provider
-            .with_parallel_workers(self.workers, self.partition_column.clone())
+            .with_parallel_workers(partitions, self.partition_column.clone())
             .with_parallel_strategy(crate::connector::postgres::parallel::ParallelStrategy::parse(
                 &config.parallel_scan.strategy,
             ));

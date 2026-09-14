@@ -62,9 +62,24 @@ pub fn decide_push(
 ) -> CostDecision {
     // Step 1: Check if predicate references any indexed columns.
     let indexed_columns = extract_predicate_columns(predicate);
-    let has_applicable_index = available_indexes.iter().any(|idx| {
-        indexed_columns.iter().any(|col| idx.columns.contains(col))
-    });
+    // For an OR, every branch must touch an indexed column: Postgres can only use a
+    // plain index path for the whole OR (bitmapOr) when no branch forces a full scan.
+    // `indexed_col = .. OR unindexed_col = ..` must NOT take the near-free shortcut.
+    let has_applicable_index = match predicate {
+        Predicate::Or(..) => {
+            let mut branches = Vec::new();
+            flatten_or_branches(predicate, &mut branches);
+            !branches.is_empty()
+                && branches.iter().all(|branch| {
+                    extract_predicate_columns(branch).iter().any(|col| {
+                        available_indexes.iter().any(|idx| idx.columns.contains(col))
+                    })
+                })
+        }
+        _ => available_indexes
+            .iter()
+            .any(|idx| indexed_columns.iter().any(|col| idx.columns.contains(col))),
+    };
 
     if has_applicable_index {
         // Index is available: push (near-free, huge win).
@@ -131,6 +146,18 @@ fn extract_predicate_columns(predicate: &Predicate) -> Vec<String> {
     columns.sort();
     columns.dedup();
     columns
+}
+
+/// Flatten a (possibly nested) OR tree into its branches: `a OR (b OR c)` → [a, b, c].
+/// Used by the index shortcut, which requires every branch to touch an indexed column.
+fn flatten_or_branches<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Predicate>) {
+    match predicate {
+        Predicate::Or(left, right) => {
+            flatten_or_branches(left, out);
+            flatten_or_branches(right, out);
+        }
+        _ => out.push(predicate),
+    }
 }
 
 fn extract_columns_recursive(predicate: &Predicate, columns: &mut Vec<String>) {
@@ -329,6 +356,47 @@ mod tests {
         let pred = Predicate::Column("id".to_string());
         let columns = extract_predicate_columns(&pred);
         assert_eq!(columns, vec!["id"]);
+    }
+
+    #[test]
+    fn test_or_requires_index_on_every_branch() {
+        use super::super::{Fidelity, Predicate};
+        use super::super::super::pushdown::stats::IndexInfo;
+
+        let stats = create_test_stats();
+        let params = CostParams::default();
+        let indexes = vec![IndexInfo {
+            name: "orders_pkey".to_string(),
+            columns: vec!["id".to_string()],
+            is_unique: true,
+            is_primary: true,
+            index_type: "btree".to_string(),
+        }];
+        let cmp = |col: &str, v: i64| {
+            Predicate::Cmp {
+                left: Box::new(Predicate::Column(col.to_string())),
+                op: "=".to_string(),
+                right: Box::new(Predicate::Literal(
+                    super::super::Literal::Int(v),
+                )),
+            }
+        };
+
+        // Both branches indexed -> index shortcut.
+        let both = Predicate::Or(Box::new(cmp("id", 1)), Box::new(cmp("id", 2)));
+        assert!(matches!(
+            decide_push(&both, Fidelity::Exact, &stats, &params, None, &indexes),
+            CostDecision::Push { has_index: true, .. }
+        ));
+
+        // One branch unindexed -> must NOT take the near-free index shortcut.
+        // (status has 5 distinct values over 1000 rows: selective enough that only
+        // the shortcut could have pushed it.)
+        let mixed = Predicate::Or(Box::new(cmp("id", 1)), Box::new(cmp("status", 1)));
+        assert!(!matches!(
+            decide_push(&mixed, Fidelity::Exact, &stats, &params, None, &indexes),
+            CostDecision::Push { has_index: true, .. }
+        ));
     }
 
     #[test]

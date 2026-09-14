@@ -276,7 +276,7 @@ cargo run -- plan --config examples/configs/extract.example.json \
 
 ## Scope: Completed and Current
 
-**Phase 1 (Completed):** PostgreSQL connector with schema resolution, streaming scans (cursor-based; binary-`COPY` path exists but is unused), type mapping (incl. `text[]`, enums-as-text, tz-aware timestamps), timestamp watermark mode with safe-high-watermark, checkpoint store with leases (local JSON, atomic rename), projection/filter/limit pushdown with fidelity rules, Arrow output, `run`/`plan`/`checkpoint` CLI, logging.
+**Phase 1 (Completed):** PostgreSQL connector with schema resolution, cursor-based streaming scans, type mapping (incl. `text[]`, enums-as-text, tz-aware timestamps), timestamp watermark mode with safe-high-watermark, checkpoint store with leases (local JSON, atomic rename), projection/filter/limit pushdown with fidelity rules, Arrow output, `run`/`plan`/`checkpoint` CLI, logging. (The binary-`COPY` bulk path was removed in a dependency slimming pass — zero callers, zero tests; restorable from git, spec retained in `docs/connectors/postgres.md` §2.1.)
 
 **Phase 2 (Completed):** DataFrame API over DataFusion's `DataFrame`. Cost-based pushdown with real statistics (`pg_stats`/`pg_class`), index metadata, EXPLAIN estimates, and policy engine (`always`/`never`/`cost_based`/`strict`/`hinted`). Real `SourceAwarePushdown` optimizer rule. Enum-vs-text normalization. Keyset + ctid partition strategies (exported snapshots deferred). Backfill with per-chunk commits under a separate namespace.
 
@@ -291,6 +291,34 @@ cargo run -- plan --config examples/configs/extract.example.json \
 **Testing:** 83 lib + 81 bin unit tests green (see [`docs/testing-plan.md`](docs/testing-plan.md), Phase A done; integration suites planned).
 
 **Explicitly deferred:** Python wrapper (placeholder design in [`docs/python-bindings.md`](docs/python-bindings.md)), log-based CDC, connectors beyond Postgres/MySQL, metrics/tracing, sink implementations.
+
+---
+
+## Benchmark Summary
+
+Benchmarked against PySpark 3.5.4 using PostgreSQL 17.11 across 4 GB and 8 GB memory configurations and multiple batch sizes. Full benchmark results are available in [`benchmark/README.md`](benchmark/README.md).
+
+| Workload  | Engine                   |   Elapsed Range |   Max RSS Range | Summary                                            |
+| --------- | ------------------------ | --------------: | --------------: | -------------------------------------------------- |
+| Full      | PySpark                  |     17.3–19.7 s |     1.9–3.8 GiB | Baseline                                           |
+| Full      | Rust Ballista Standalone |     18.8–21.3 s | **127–303 MiB** | Comparable latency with substantially lower memory |
+| Full      | Rust Ballista Remote     | **15.5–19.3 s** |     294–584 MiB | **Fastest full extraction**                        |
+| Selective | PySpark                  |     4.16–4.44 s |     593–767 MiB | Baseline                                           |
+| Selective | Rust Ballista Standalone |     6.16–6.28 s |   **16–17 MiB** | Lower resource usage, but slower                   |
+| Selective | Rust Ballista Remote     | **0.60–0.70 s** |     219–491 MiB | **Fastest selective extraction**                   |
+
+### Key Findings
+
+* **Full extraction:** Rust Ballista Remote achieved the best observed latency at **15.5 s**, while Rust Standalone remained broadly comparable to PySpark.
+* **Selective extraction:** Rust Ballista Remote completed the workload in **0.60–0.70 s**, approximately **6–7× faster than PySpark** and **9–10× faster than Rust Standalone**.
+* **Resource efficiency:** Rust Standalone used dramatically less memory: **127–303 MiB** for full extraction (roughly **6–30× less** than PySpark's 1.9–3.8 GiB) and only **16–17 MiB** for selective extraction.
+* **Rust Standalone trade-off:** The standalone engine prioritizes low resource consumption but does not currently match the latency of PySpark for selective workloads.
+* **Distributed execution:** The benchmark shows that Ballista's distributed execution can be beneficial even for the selective workload in this setup, with the remote configuration outperforming both PySpark and standalone execution.
+* **Worker utilization:** The remote full-extraction workload is distributed relatively evenly across the four workers, demonstrating effective parallel execution.
+* **Memory limits:** Moving from 8 GB to 4 GB did not fundamentally change the relative performance characteristics.
+* **Batch size:** A 64k batch size produced competitive or improved full-extraction latency in several configurations, while selective workloads remained dominated by the execution mode rather than batch size.
+
+> **Note:** These are engineering benchmarks for the current experimental implementation, not a general-purpose PySpark vs. Rust performance comparison. Results depend on workload, hardware, memory limits, batch size, execution plan, and distributed topology. Ranges above span all four run configurations (4 GB / 8 GB × tool-default / 64k batching); see [`benchmark/README.md`](benchmark/README.md) for the per-run tables.
 
 ---
 

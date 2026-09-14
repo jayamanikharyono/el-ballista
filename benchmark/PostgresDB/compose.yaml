@@ -1,0 +1,45 @@
+name: pg-learust
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    container_name: pg-learust
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+      # The connector sets `SET TIME ZONE 'UTC'` per session; make the server agree.
+      TZ: UTC
+      PGTZ: UTC
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Scripts here run once, in filename order, only when pgdata is empty.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    command:
+      - postgres
+      # Needed for the exact safe high watermark via pg_stat_activity.xact_start.
+      - -c
+      - track_activities=on
+      # Autovacuum keeps pg_stats fresh, which the cost model reads.
+      - -c
+      - autovacuum=on
+      # Leaves the door open for the logical-replication (CDC) path.
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  pgdata:

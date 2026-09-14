@@ -1,0 +1,43 @@
+{
+  "job_id": "orders_bench",
+  "table": "orders",
+  "source": {
+    "host": "bench-pg",
+    "port": 5432,
+    "user": "postgres",
+    "password_env": "BENCH_PG_PASSWORD",
+    "database": "app",
+    "pool_max": 256,
+    "statement_timeout_ms": 300000,
+    "application_name": "rel-bench-rust",
+    "schema": "public"
+  },
+  "incremental": {
+    "column": "updated_at",
+    "safety_lag_secs": 300,
+    "max_window_secs": 21600
+  },
+  "checkpoint": {
+    "dir": "/tmp/.checkpoints"
+  },
+  "sink": {
+    "path": "/tmp/bench_sink"
+  },
+  "pushdown": {
+    "policy": "cost_based",
+    "deny": [],
+    "push": []
+  },
+  "parallel_scan": {
+    "strategy": "keyset",
+    "partitions": 1,
+    "partition_column": "order_id"
+  },
+  "execution": {
+    "batch_size": 64000
+  },
+  "distributed": {
+    "scheduler_url": "http://bench-scheduler:50050",
+    "workers": 4
+  }
+}

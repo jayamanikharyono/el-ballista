@@ -620,6 +620,7 @@ impl TableProvider for PostgresTableProvider {
             self.window,
             self.batch_size,
             partitions,
+            crate::connector::query_tag::fresh_run_id(),
         )?;
 
         Ok(Arc::new(plan))

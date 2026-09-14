@@ -120,6 +120,7 @@ mod tests {
             window: None,
             batch_size: 8192,
             partitions: vec![],
+            run_id: "r_test".to_string(),
         };
 
         let codec = PostgresPhysicalCodec::new();

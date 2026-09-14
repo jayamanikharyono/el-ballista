@@ -145,14 +145,21 @@ impl ExplainEstimator {
         );
         log::debug!("EXPLAIN estimation: {sql}");
 
-        let row: (String,) = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
-            .fetch_one(self.pool.as_ref())
-            .await
-            .map_err(|e| {
-                ExtractorError::Statistics(format!("EXPLAIN failed for {schema_name}.{table_name}: {e}"))
-            })?;
+        // `EXPLAIN (FORMAT JSON)` returns its single output column as SQL type `json`
+        // (not `text`), so sqlx must be told to decode it as JSON -- a bare `String`
+        // target fails with "SQL type JSON is not compatible with Rust type String".
+        // `sqlx::types::Json<Value>` decodes the `json` column directly; re-stringify
+        // once here so `parse_explain_json` (already unit-tested against raw strings)
+        // stays the single parsing implementation for both this path and those tests.
+        let row: (sqlx::types::Json<serde_json::Value>,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+                .fetch_one(self.pool.as_ref())
+                .await
+                .map_err(|e| {
+                    ExtractorError::Statistics(format!("EXPLAIN failed for {schema_name}.{table_name}: {e}"))
+                })?;
 
-        parse_explain_json(&row.0)
+        parse_explain_json(&row.0.0.to_string())
     }
 }
 
@@ -240,18 +247,47 @@ mod tests {
     }
 
     #[test]
-    fn test_explain_estimate_creation() {
-        let estimate = ExplainEstimate {
-            access_method: AccessMethod::IndexScan,
-            total_cost: 100.0,
-            plan_rows: 500.0,
-            index_name: Some("idx_orders_updated_at".to_string()),
-            estimated_at: Utc::now(),
-        };
+    fn test_parse_explain_json_rejects_invalid_json() {
+        // Devil's advocate: a truncated/corrupt EXPLAIN response (connection hiccup,
+        // Postgres version producing an unexpected format) must surface as an error, not
+        // panic or silently return a zeroed/default estimate that looks like real data.
+        let err = parse_explain_json("not json at all").unwrap_err();
+        assert!(matches!(err, ExtractorError::Statistics(_)));
+    }
 
-        assert_eq!(estimate.access_method, AccessMethod::IndexScan);
-        assert_eq!(estimate.total_cost, 100.0);
-        assert!(estimate.index_name.is_some());
+    #[test]
+    fn test_parse_explain_json_rejects_empty_plan_array() {
+        // Well-formed JSON, but no plan at index 0: must error rather than fabricate a
+        // default estimate that downstream cost logic would treat as "cheap, no index".
+        let err = parse_explain_json("[]").unwrap_err();
+        assert!(matches!(err, ExtractorError::Statistics(_)));
+    }
+
+    #[test]
+    fn test_parse_explain_json_rejects_missing_plan_key() {
+        let err = parse_explain_json(r#"[{"NotPlan": {}}]"#).unwrap_err();
+        assert!(matches!(err, ExtractorError::Statistics(_)));
+    }
+
+    #[test]
+    fn test_parse_explain_json_missing_fields_default_conservatively() {
+        // A Plan node with none of the fields we look for (rather than a hard parse
+        // failure) must default to Unknown/0.0/no-index — never crash on a missing key,
+        // and never silently invent a positive cost or an index name.
+        let estimate = parse_explain_json(r#"[{"Plan": {}}]"#).unwrap();
+        assert_eq!(estimate.access_method, AccessMethod::Unknown);
+        assert_eq!(estimate.total_cost, 0.0);
+        assert_eq!(estimate.plan_rows, 0.0);
+        assert!(estimate.index_name.is_none());
+    }
+
+    #[test]
+    fn test_parse_explain_json_accepts_plans_rows_key_variant() {
+        // Some EXPLAIN shapes use "Plans Rows" instead of "Plan Rows" (checked first);
+        // both must be honored, or a whole class of plans silently reports plan_rows: 0.
+        let json = r#"[{"Plan": {"Node Type": "Seq Scan", "Plans Rows": 42}}]"#;
+        let estimate = parse_explain_json(json).unwrap();
+        assert_eq!(estimate.plan_rows, 42.0);
     }
 
     #[test]

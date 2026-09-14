@@ -13,12 +13,12 @@ use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::prelude::*;
 use std::sync::Arc;
 
-use crate::config::{CheckpointConfig, ExecutionConfig, IncrementalConfig, JobConfig, ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig, DistributedConfig};
-use crate::errors::AppError;
-use crate::connector::postgres::PostgresExtractor;
-use crate::pushdown::dialect::{SqlDialect, PostgresDialect};
-use crate::pushdown::stats::StatisticsCollector;
-use crate::types::ColumnMetadata;
+use rust_ballista_extraction_layer::config::{CheckpointConfig, ExecutionConfig, IncrementalConfig, JobConfig, ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig, DistributedConfig};
+use rust_ballista_extraction_layer::errors::AppError;
+use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+use rust_ballista_extraction_layer::pushdown::dialect::{SqlDialect, PostgresDialect};
+use rust_ballista_extraction_layer::pushdown::stats::StatisticsCollector;
+use rust_ballista_extraction_layer::types::ColumnMetadata;
 
 pub async fn run() -> Result<(), AppError> {
     println!("\n=== Phase 1 & Phase 2 Feature Demonstration ===\n");

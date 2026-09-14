@@ -11,6 +11,8 @@ env:
   # every integration/e2e test self-provisions one (see tests/common/mod.rs), so this
   # workflow needs no `services:` container and no manual setup step.
   RUST_LOG: warn
+  CARGO_BUILD_JOBS: 2
+  RUSTFLAGS: "-C debuginfo=0"
 
 jobs:
   build-and-test:

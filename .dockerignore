@@ -1,0 +1,12 @@
+# Keep the build context small: sources + manifests only.
+target/
+.git/
+.gitignore
+output/
+warehouse/
+data/
+demo_output/
+benchmark/results/
+benchmark/output/
+.checkpoints/
+**/.DS_Store

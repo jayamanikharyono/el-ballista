@@ -132,16 +132,21 @@ impl RowBatchBuilder {
             }
             "numeric" => {
                 let value: Option<BigDecimal> = row.try_get(column.column_name.as_str())?;
-                let scale = column.numeric_scale.unwrap_or(10) as i8;
-                
+                // Arrow Decimal128 stores the *unscaled* integer (123.45 scale 2 -> 12345),
+                // so rescale before converting: with_scale alone only changes representation
+                // and to_i128 would truncate to 123. powi handles negative scales and
+                // cannot overflow; only the final i128 fit is fallible.
+                let scale = column.numeric_scale.unwrap_or(10) as i64;
+
                 let i128_value = value
                     .map(|decimal| {
-                        decimal
-                            .with_scale(scale as i64)
+                        let text = decimal.to_string();
+                        let unscaled = decimal * BigDecimal::from(10).powi(scale);
+                        unscaled
                             .to_i128()
                             .ok_or_else(|| {
                                 ExtractorError::Internal(
-                                    format!("numeric value cannot fit into i128: {}", decimal)
+                                    format!("numeric value cannot fit into i128: {}", text)
                                 )
                             })
                     })
@@ -670,6 +675,25 @@ mod tests {
                     collation_name: None,
                 },
             ],
+        }
+    }
+
+    #[test]
+    fn test_numeric_unscaled_conversion() {
+        use std::str::FromStr;
+        // Mirrors the "numeric" arms in append_row: Arrow Decimal128 stores the
+        // unscaled integer, so 123.45 at scale 2 must become 12345 (not 123).
+        // Regression test: with_scale().to_i128() truncated to the integer part.
+        for (text, scale, expected) in [
+            ("123.45", 2i64, 12345i128),
+            ("123.45", 0, 123),
+            ("-7.5", 1, -75),
+            ("0.00", 2, 0),
+            ("1200", -2, 12),
+        ] {
+            let decimal = BigDecimal::from_str(text).unwrap();
+            let unscaled = (decimal * BigDecimal::from(10).powi(scale)).to_i128().unwrap();
+            assert_eq!(unscaled, expected, "text={} scale={}", text, scale);
         }
     }
 

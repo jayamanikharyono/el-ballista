@@ -23,7 +23,12 @@ Three capabilities that MySQL lacks make Postgres the reference implementation:
 
 ## 2. Extraction path
 
-### 2.1 Binary COPY (default for full scans)
+### 2.1 Binary COPY (removed September 2026 — spec retained)
+
+> The implementation below was removed to slim the dependency tree (`tokio-postgres` and
+> friends): it had no callers — every scan path used §2.2 — and no tests. Restorable from
+> git history. What follows is kept as the spec for reintroducing it, since the format
+> knowledge is the expensive part.
 
 ```sql
 COPY (
@@ -51,7 +56,7 @@ with parameters and having `COPY` reference it, or — where that is not possibl
 *typed, connector-formatted* literals (never user strings) into the `COPY` body. Arbitrary
 user-supplied string literals force a fallback to §2.2.
 
-### 2.2 Extended query protocol with a portal (fallback, and default for incremental)
+### 2.2 Extended query protocol with a portal (the only path)
 
 ```rust
 let stmt = client.prepare_typed(&sql, &param_types).await?;

@@ -203,18 +203,28 @@ pub async fn compute_ctid_partitions(
     let mut partitions = Vec::new();
     for i in 0..num_partitions {
         let page_lo = i * pages_per_partition;
-        let page_hi = if i == num_partitions - 1 {
-            relpages as usize
-        } else {
-            (i + 1) * pages_per_partition
-        };
 
-        // ctid format: (page, tuple_offset)
-        // Create predicate: ctid >= '(page_lo,1)'::tid AND ctid < '(page_hi,1)'::tid
-        let predicate = format!(
-            "ctid >= '({},1)'::tid AND ctid < '({},1)'::tid",
-            page_lo, page_hi
-        );
+        // ctid format: (page, tuple_offset). The last partition is open-ended
+        // (no upper bound): relpages is a planner estimate that goes stale, and any
+        // tuples on pages >= relpages (growth after ANALYZE, or relpages smaller
+        // than the partition count) would otherwise never be scanned. An open tail
+        // also avoids emitting an inverted (>= (94,1) AND < (3,1)) always-empty range
+        // when relpages < num_partitions.
+        let (page_hi, predicate) = if i == num_partitions - 1 {
+            (
+                relpages as usize,
+                format!("ctid >= '({},1)'::tid", page_lo),
+            )
+        } else {
+            let hi = (i + 1) * pages_per_partition;
+            (
+                hi,
+                format!(
+                    "ctid >= '({},1)'::tid AND ctid < '({},1)'::tid",
+                    page_lo, hi
+                ),
+            )
+        };
 
         partitions.push(ScanPartition {
             partition_id: i,

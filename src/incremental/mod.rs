@@ -280,4 +280,36 @@ mod tests {
         let later_observed = DateTime::<Utc>::from_timestamp(1200, 0).unwrap();
         assert_eq!(clamp_to_observed(hi, Some(later_observed)), hi);
     }
+
+    #[test]
+    fn test_build_window_skewed_hi_below_lo() {
+        // Clock skew (or a stale checkpoint against a restored database) can present a
+        // hi_candidate below lo. The window is pinned as-is — inverted, empty in practice —
+        // rather than silently widened: callers, not the constructor, decide recovery.
+        let lo = DateTime::<Utc>::from_timestamp(1000, 0).unwrap();
+        let hi_candidate = DateTime::<Utc>::from_timestamp(900, 0).unwrap();
+        let max_window = Duration::seconds(500);
+
+        let window = build_window(Some(lo), hi_candidate, max_window);
+        assert_eq!(window.lo, lo);
+        assert_eq!(window.hi, hi_candidate);
+    }
+
+    #[test]
+    fn test_build_window_zero_max_window() {
+        // A zero cap collapses the window to a point: extracts nothing, advances nothing.
+        let lo = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let hi_candidate = DateTime::<Utc>::from_timestamp(300, 0).unwrap();
+
+        let window = build_window(Some(lo), hi_candidate, Duration::seconds(0));
+        assert_eq!(window.lo, lo);
+        assert_eq!(window.hi, lo);
+    }
+
+    #[test]
+    fn test_clamp_to_observed_equal_is_stable() {
+        // Observed exactly at hi: commit hi (not "less than", not "greater than" — equal).
+        let hi = DateTime::<Utc>::from_timestamp(1000, 0).unwrap();
+        assert_eq!(clamp_to_observed(hi, Some(hi)), hi);
+    }
 }

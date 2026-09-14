@@ -191,3 +191,149 @@ impl CheckpointStore for JsonCheckpointStore {
         self.read_file(key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique temp dir per test: the store is file-backed, so parallel tests must not share.
+    /// Best-effort cleanup; a leftover dir is harmless.
+    fn test_store() -> (JsonCheckpointStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rel_checkpoint_test_{}_{}",
+            std::process::id(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = JsonCheckpointStore::new(&dir).unwrap();
+        (store, dir)
+    }
+
+    fn stats() -> RunStats {
+        RunStats {
+            rows_extracted: 10,
+            window_lo: None,
+            window_hi: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_acquire_commit_read_cycle() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+        let run_id = Uuid::new_v4();
+
+        // Fresh job: no checkpoint yet, acquire starts clean with no watermark.
+        assert!(store.read(&key).await.unwrap().is_none());
+        let checkpoint = store
+            .acquire(&key, run_id, Duration::minutes(30), "updated_at")
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.state, RunState::Running);
+        assert_eq!(checkpoint.watermark_value, None);
+
+        // Commit advances the watermark and clears the lease.
+        let hi = DateTime::<Utc>::from_timestamp(1000, 0).unwrap();
+        store.commit(&key, run_id, hi, stats()).await.unwrap();
+
+        let checkpoint = store.read(&key).await.unwrap().unwrap();
+        assert_eq!(checkpoint.state, RunState::Committed);
+        assert_eq!(checkpoint.watermark_value, Some(hi));
+        assert_eq!(checkpoint.run_id, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_double_acquire_live_lease_fails() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+
+        store
+            .acquire(&key, Uuid::new_v4(), Duration::minutes(30), "updated_at")
+            .await
+            .unwrap();
+
+        // A second run while the lease is live must fail, not steal.
+        let err = store
+            .acquire(&key, Uuid::new_v4(), Duration::minutes(30), "updated_at")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already running"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_expired_lease_reclaimed() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+
+        // Zero-second lease is already expired: the next acquire reclaims it.
+        store
+            .acquire(&key, Uuid::new_v4(), Duration::seconds(0), "updated_at")
+            .await
+            .unwrap();
+        let checkpoint = store
+            .acquire(&key, Uuid::new_v4(), Duration::minutes(30), "updated_at")
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.state, RunState::Running);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_commit_wrong_run_id_fails() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+        let run_id = Uuid::new_v4();
+
+        store
+            .acquire(&key, run_id, Duration::minutes(30), "updated_at")
+            .await
+            .unwrap();
+
+        // A stale run committing under its own id must not clobber the lease holder.
+        let err = store
+            .commit(&key, Uuid::new_v4(), Utc::now(), stats())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lost the lease"));
+
+        // The real holder still commits fine.
+        store
+            .commit(&key, run_id, Utc::now(), stats())
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_abandon_is_idempotent() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+        let run_id = Uuid::new_v4();
+
+        // Abandoning a job that was never acquired is a no-op, not an error.
+        store.abandon(&key, run_id, "nothing to abandon").await.unwrap();
+
+        store
+            .acquire(&key, run_id, Duration::minutes(30), "updated_at")
+            .await
+            .unwrap();
+        store.abandon(&key, run_id, "boom").await.unwrap();
+
+        let checkpoint = store.read(&key).await.unwrap().unwrap();
+        assert_eq!(checkpoint.state, RunState::Failed);
+
+        // Second abandon: lease already gone, still fine.
+        store.abandon(&key, run_id, "boom again").await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -107,3 +107,106 @@ impl LogicalExtensionCodec for PostgresLogicalCodec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distributed::connection::PostgresConnectionDescriptor;
+    use crate::types::table_metadata::TableMetadata;
+    use datafusion::common::TableReference;
+
+    fn test_model() -> PostgresTableProviderModel {
+        PostgresTableProviderModel {
+            descriptor: PostgresConnectionDescriptor {
+                host: "db.internal".to_string(),
+                port: 5433,
+                user: "reader".to_string(),
+                password_env: "READER_PW".to_string(),
+                database: "app".to_string(),
+                pool_max: 8,
+                expected_workers: 2,
+                statement_timeout_ms: 1000,
+                application_name: "test".to_string(),
+                schema: "public".to_string(),
+            },
+            table_metadata: TableMetadata {
+                schema_name: "public".to_string(),
+                table_name: "orders".to_string(),
+                columns: vec![],
+            },
+            policy: crate::pushdown::PushdownPolicy::CostBased,
+            deny: vec!["secret".to_string()],
+            push: vec![],
+            watermark_column: Some("updated_at".to_string()),
+            window: None,
+            batch_size: 1024,
+            parallel_workers: 4,
+            partition_column: Some("order_id".to_string()),
+            strategy: crate::connector::postgres::parallel::ParallelStrategy::Keyset,
+            enum_columns: vec!["status".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_logical_codec_round_trip() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let codec = PostgresLogicalCodec::new();
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "order_id",
+            DataType::Int64,
+            false,
+        )]));
+        // from_model needs no pool: decode-side providers resolve lazily.
+        let provider = PostgresTableProvider::from_model(schema.clone(), test_model());
+        let table_ref = TableReference::bare("orders");
+
+        let mut buf = Vec::new();
+        codec
+            .try_encode_table_provider(&table_ref, Arc::new(provider), &mut buf)
+            .unwrap();
+        assert!(
+            buf.starts_with(POSTGRES_SCAN_MAGIC),
+            "our payload must carry the magic prefix"
+        );
+
+        let decoded = codec
+            .try_decode_table_provider(&buf, &table_ref, schema, &TaskContext::default())
+            .unwrap();
+        let decoded = decoded
+            .downcast_ref::<PostgresTableProvider>()
+            .expect("decoded back into PostgresTableProvider");
+
+        // Spot-check the model survived: descriptor, policy knobs, partitioning intent.
+        let model = decoded.to_model();
+        assert_eq!(model.descriptor.host, "db.internal");
+        assert_eq!(model.descriptor.port, 5433);
+        assert_eq!(model.deny, vec!["secret".to_string()]);
+        assert_eq!(model.parallel_workers, 4);
+        assert_eq!(model.batch_size, 1024);
+        assert_eq!(model.enum_columns, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn test_logical_codec_non_magic_delegates() {
+        // Bytes without our magic prefix fall through to Ballista's default codec, which
+        // must reject them as an error — never panic, never misdecode as ours.
+        let codec = PostgresLogicalCodec::new();
+        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::empty());
+        let table_ref = TableReference::bare("orders");
+
+        let err = codec
+            .try_decode_table_provider(
+                b"not-our-payload",
+                &table_ref,
+                schema,
+                &TaskContext::default(),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("PostgresTableProvider"),
+            "non-magic bytes must not reach our decoder, got: {msg}"
+        );
+    }
+}

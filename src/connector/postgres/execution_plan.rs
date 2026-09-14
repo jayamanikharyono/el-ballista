@@ -154,7 +154,7 @@ impl PostgresExecutionPlan {
     /// inlined.
     ///
     /// [`Predicate::render_to`]: crate::pushdown::Predicate::render_to
-    fn build_query(&self, partition_idx: usize) -> QueryBuilder<Postgres> {
+    pub(crate) fn build_query(&self, partition_idx: usize) -> QueryBuilder<Postgres> {
         use crate::pushdown::dialect::{PostgresDialect, SqlDialect};
         use crate::pushdown::{PgParamSink, SqlParam, SqlSink};
 

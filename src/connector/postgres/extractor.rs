@@ -5,17 +5,13 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgConnection, PgRow};
 use sqlx::{PgPool, Postgres, QueryBuilder, Connection, Executor, Row, Transaction};
-use tokio_postgres::{Config, CopyOutStream, Row as TokioPgRow};
-use tokio_postgres::binary_copy::BinaryCopyOutRow;
 use uuid::Uuid;
-use bigdecimal::{BigDecimal, ToPrimitive};
-use bytes::Bytes;
+use bigdecimal::ToPrimitive;
 
 use arrow::record_batch::RecordBatch;
 use arrow::array::{ArrayRef, ArrayBuilder, Int16Builder, Int32Builder, Int64Builder, Float32Builder, Float64Builder, BooleanBuilder, StringBuilder, BinaryBuilder, Date32Builder, TimestampMicrosecondBuilder, Decimal128Builder, ListBuilder};
 use arrow::datatypes::{DataType, TimeUnit, Schema, Field};
 use std::sync::Arc;
-use futures::StreamExt;
 
 use crate::connector::postgres::{
     query_builder::PostgresQueryBuilder,
@@ -92,76 +88,6 @@ impl PostgresExtractor {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
-
-    /// Extract via binary COPY — highest throughput path for full table scans.
-    /// Uses `COPY (SELECT ...) TO STDOUT (FORMAT BINARY)` and decodes PostgreSQL's
-    /// binary wire format directly into Arrow arrays. Memory bounded to one batch.
-    pub async fn extract_full_table_via_copy(
-        &self,
-        table_name: &str,
-        columns: Option<Vec<&str>>,
-        batch_size: usize,
-    ) -> Result<Vec<RecordBatch>, ExtractorError> {
-        let schema_reader = PostgresSchemaReader::new(&self.pool);
-        let table_metadata = schema_reader.get_table_metadata(table_name).await?;
-        let table_metadata = table_metadata.select_columns(columns.as_deref());
-        let arrow_schema = PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
-
-        // Build the COPY query
-        let mut query_builder = QueryBuilder::<Postgres>::new("");
-        PostgresQueryBuilder::build_full_table(&mut query_builder, &table_metadata);
-        let sql_str = query_builder.sql();
-        let copy_sql = format!("COPY ({}) TO STDOUT (FORMAT BINARY)", sql_str.as_str());
-
-        // Create a direct tokio-postgres connection for COPY
-        let pg_config = self.build_pg_config().await?;
-        let (client, connection) = pg_config.connect(tokio_postgres::NoTls).await
-            .map_err(|e| ExtractorError::Internal(format!("pg connect failed: {e}")))?;
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                log::error!("postgres connection error: {e}");
-            }
-        });
-
-        let copy_stream = client.copy_out(&copy_sql).await
-            .map_err(|e| ExtractorError::Internal(format!("COPY failed: {e}")))?;
-
-        let batches = Self::decode_binary_copy_stream(copy_stream, &arrow_schema, &table_metadata, batch_size).await?;
-        Ok(batches)
-    }
-
-    /// Build tokio-postgres Config from connection parameters.
-    async fn build_pg_config(&self) -> Result<Config, ExtractorError> {
-        let mut conn = self.pool.acquire().await?;
-        let row = sqlx::query(
-            "SELECT current_user, inet_server_addr()::text as host, inet_server_port() as port, current_database()"
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-
-        let user: String = row.try_get("current_user")?;
-        let host: String = row.try_get("host")?;
-        let port: i32 = row.try_get("port")?;
-        let database: String = row.try_get("current_database")?;
-
-        // Note: password is not retrievable from the pool, so we need it from the env
-        // The caller should ensure the same password_env is available
-        let password = std::env::var("PGPASSWORD")
-            .or_else(|_| std::env::var("POSTGRES_PASSWORD"))
-            .unwrap_or_default();
-
-        let mut config = Config::new();
-        config.host(&host);
-        config.port(port as u16);
-        config.user(&user);
-        config.dbname(&database);
-        config.password(&password);
-        config.application_name("rust-extract-layer-copy");
-
-        Ok(config)
-    }
-
     /// Extract via server-side cursor (portal) — true streaming with bounded memory.
     /// Uses `DECLARE CURSOR ... WITH HOLD` + `FETCH FORWARD n` + `CLOSE`.
     /// Each FETCH returns up to `batch_size` rows, processed incrementally.
@@ -190,9 +116,15 @@ impl PostgresExtractor {
         // Use a unique cursor name to avoid conflicts
         let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
         
-        // Declare cursor
+        // Declare cursor. The SELECT text carries $1/$2 placeholders from QueryBuilder,
+        // so the lo/hi values must be bound here — executing without binds fails with
+        // "there is no parameter $1".
         let declare_sql = format!("DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
-        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str())).execute(&mut *tx).await?;
+        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
+            .bind(lo)
+            .bind(hi)
+            .execute(&mut *tx)
+            .await?;
 
         let mut batches = Vec::new();
         let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
@@ -253,7 +185,12 @@ impl PostgresExtractor {
 
         let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
         let declare_sql = format!("DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
-        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str())).execute(&mut *tx).await?;
+        // build_keyset_partition emits $1/$2 placeholders — bind lo/hi here.
+        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
+            .bind(lo)
+            .bind(hi)
+            .execute(&mut *tx)
+            .await?;
 
         let mut batches = Vec::new();
         let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
@@ -491,157 +428,6 @@ impl PostgresExtractor {
         Ok(combined)
     }
 
-    /// Decode PostgreSQL binary COPY stream into Arrow RecordBatches.
-    async fn decode_binary_copy_stream(
-        mut stream: CopyOutStream,
-        schema: &Arc<Schema>,
-        table_metadata: &TableMetadata,
-        batch_size: usize,
-    ) -> Result<Vec<RecordBatch>, ExtractorError> {
-        use futures::StreamExt;
-        let mut batches = Vec::new();
-        let mut builder = CursorBatchBuilder::new(table_metadata)?;
-        let mut stream = std::pin::pin!(stream);
-
-        while let Some(row_result) = stream.next().await {
-            let row_bytes = row_result.map_err(|e| ExtractorError::Internal(format!("COPY stream error: {e}")))?;
-            Self::decode_binary_copy_row(&mut builder, &row_bytes, table_metadata)?;
-            
-            if builder.row_count() >= batch_size {
-                batches.push(builder.finish()?);
-                builder = CursorBatchBuilder::new(table_metadata)?;
-            }
-        }
-
-        if !builder.is_empty() {
-            batches.push(builder.finish()?);
-        }
-
-        Ok(batches)
-    }
-
-    /// Decode a single binary COPY row (raw bytes) into the builder.
-    /// PostgreSQL binary COPY format per row:
-    ///   Int16: number of columns
-    ///   For each column: Int32 length (-1 for NULL), then that many bytes of data
-    fn decode_binary_copy_row(
-        builder: &mut CursorBatchBuilder,
-        row_bytes: &Bytes,
-        table_metadata: &TableMetadata,
-    ) -> Result<(), ExtractorError> {
-use std::io::{Cursor, Read};
-use byteorder::{BigEndian, ReadBytesExt};
-        
-        let mut cursor = Cursor::new(row_bytes.as_ref());
-        
-        // Read number of columns
-        let num_columns = cursor.read_i16::<BigEndian>()
-            .map_err(|e| ExtractorError::Internal(format!("failed to read column count: {e}")))?;
-        
-        if num_columns as usize != table_metadata.columns.len() {
-            return Err(ExtractorError::Internal(format!(
-                "column count mismatch: expected {}, got {}",
-                table_metadata.columns.len(), num_columns
-            )));
-        }
-
-        for (idx, column) in table_metadata.columns.iter().enumerate() {
-            // Read column length
-            let len = cursor.read_i32::<BigEndian>()
-                .map_err(|e| ExtractorError::Internal(format!("failed to read column {} length: {e}", idx)))?;
-            
-            if len == -1 {
-                // NULL value
-                builder.append_null(idx)?;
-                continue;
-            }
-            
-            if len < 0 {
-                return Err(ExtractorError::Internal(format!("invalid column length: {}", len)));
-            }
-            
-            // Read column data
-            let len = len as usize;
-            let mut data = vec![0u8; len];
-            cursor.read_exact(&mut data)
-                .map_err(|e| ExtractorError::Internal(format!("failed to read column {} data: {e}", idx)))?;
-            
-            let value_bytes = Bytes::from(data);
-            Self::decode_column_value(builder, idx, column, &value_bytes)?;
-        }
-        builder.row_count += 1;
-        Ok(())
-    }
-
-    fn decode_column_value(
-        builder: &mut CursorBatchBuilder,
-        idx: usize,
-        column: &crate::types::ColumnMetadata,
-        bytes: &[u8],
-    ) -> Result<(), ExtractorError> {
-        use crate::connector::postgres::arrow_type_mapper::ArrowTypeMapper;
-        let data_type = ArrowTypeMapper::map(column)?;
-        
-        match data_type {
-            DataType::Int16 => {
-                let val = i16::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad int2 bytes".into()))?);
-                builder.append_int16(idx, val)?;
-            }
-            DataType::Int32 => {
-                let val = i32::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad int4 bytes".into()))?);
-                builder.append_int32(idx, val)?;
-            }
-            DataType::Int64 => {
-                let val = i64::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad int8 bytes".into()))?);
-                builder.append_int64(idx, val)?;
-            }
-            DataType::Float32 => {
-                let val = f32::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad float4 bytes".into()))?);
-                builder.append_float32(idx, val)?;
-            }
-            DataType::Float64 => {
-                let val = f64::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad float8 bytes".into()))?);
-                builder.append_float64(idx, val)?;
-            }
-            DataType::Boolean => {
-                let val = bytes[0] != 0;
-                builder.append_bool(idx, val)?;
-            }
-            DataType::Utf8 => {
-                let val = std::str::from_utf8(bytes).map_err(|_| ExtractorError::Internal("bad utf8".into()))?;
-                builder.append_string(idx, val)?;
-            }
-            DataType::Binary => {
-                builder.append_binary(idx, bytes)?;
-            }
-            DataType::Date32 => {
-                let pg_days = i32::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad date bytes".into()))?);
-                let arrow_days = pg_days + 10957; // days between 1970-01-01 and 2000-01-01
-                builder.append_date32(idx, arrow_days)?;
-            }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                let pg_micros = i64::from_be_bytes(bytes.try_into().map_err(|_| ExtractorError::Internal("bad timestamp bytes".into()))?);
-                let arrow_micros = pg_micros + 946684800_000_000; // micros between 1970 and 2000
-                builder.append_timestamp_micros(idx, arrow_micros)?;
-            }
-            DataType::Decimal128(precision, scale) => {
-                // Postgres numeric binary format is complex - for now fall back to text
-                builder.append_null(idx)?; // placeholder
-            }
-            DataType::List(_) => {
-                // COPY BINARY array payloads need an element-wise parser (dims + per-
-                // element lengths); refuse loudly rather than nulling user data.
-                return Err(ExtractorError::UnsupportedType(format!(
-                    "array column '{}' over COPY BINARY (use cursor extract instead)",
-                    column.column_name
-                )));
-            }
-            _ => {
-                builder.append_null(idx)?; // unsupported type -> null
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Batch builder for cursor-based streaming extraction.
@@ -701,9 +487,12 @@ impl CursorBatchBuilder {
             }
             "numeric" => {
                 let value: Option<bigdecimal::BigDecimal> = row.try_get(column.column_name.as_str())?;
-                let scale = column.numeric_scale.unwrap_or(10) as i8;
+                // Arrow Decimal128 stores the *unscaled* integer (123.45 scale 2 -> 12345).
+                let scale = column.numeric_scale.unwrap_or(10) as i64;
                 let i128_value = value.map(|decimal| {
-                    decimal.with_scale(scale as i64).to_i128().ok_or_else(|| ExtractorError::Internal(format!("numeric overflow: {}", decimal)))
+                    let text = decimal.to_string();
+                    let unscaled = decimal * bigdecimal::BigDecimal::from(10).powi(scale);
+                    unscaled.to_i128().ok_or_else(|| ExtractorError::Internal(format!("numeric overflow: {}", text)))
                 }).transpose()?;
                 let b = builder.as_any_mut().downcast_mut::<Decimal128Builder>().ok_or_else(|| ExtractorError::Internal("downcast Decimal128Builder".into()))?;
                 b.append_option(i128_value);
@@ -775,66 +564,6 @@ impl CursorBatchBuilder {
                 return Err(ExtractorError::UnsupportedType(column.data_type.clone()));
             }
         }
-        Ok(())
-    }
-
-    fn append_null(&mut self, idx: usize) -> Result<(), ExtractorError> {
-        let builder = &mut self.builders[idx];
-        if let Some(b) = builder.as_any_mut().downcast_mut::<Int16Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<Int32Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<Int64Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<Float32Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<Float64Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<BooleanBuilder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<StringBuilder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<BinaryBuilder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<Date32Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<TimestampMicrosecondBuilder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<Decimal128Builder>() { b.append_null(); }
-        else if let Some(b) = builder.as_any_mut().downcast_mut::<ListBuilder<StringBuilder>>() { b.append_null(); }
-        else { return Err(ExtractorError::Internal("unknown builder type for null".into())); }
-        Ok(())
-    }
-
-    // Direct value appenders for COPY binary decoding
-    fn append_int16(&mut self, idx: usize, val: i16) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<Int16Builder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_int32(&mut self, idx: usize, val: i32) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<Int32Builder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_int64(&mut self, idx: usize, val: i64) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<Int64Builder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_float32(&mut self, idx: usize, val: f32) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<Float32Builder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_float64(&mut self, idx: usize, val: f64) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<Float64Builder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_bool(&mut self, idx: usize, val: bool) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<BooleanBuilder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_string(&mut self, idx: usize, val: &str) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<StringBuilder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_binary(&mut self, idx: usize, val: &[u8]) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<BinaryBuilder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_date32(&mut self, idx: usize, val: i32) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<Date32Builder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
-        Ok(())
-    }
-    fn append_timestamp_micros(&mut self, idx: usize, val: i64) -> Result<(), ExtractorError> {
-        self.builders[idx].as_any_mut().downcast_mut::<TimestampMicrosecondBuilder>().ok_or_else(|| ExtractorError::Internal("downcast".into()))?.append_value(val);
         Ok(())
     }
 

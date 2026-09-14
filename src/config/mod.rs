@@ -262,7 +262,58 @@ impl JobConfig {
         let config: JobConfig = serde_json::from_str(&text)
             .map_err(|e| AppError::Config(format!("invalid config {}: {e}", path.display())))?;
 
+        config.validate()?;
+
         Ok(config)
+    }
+
+    /// Reject degenerate values that cause silent misbehavior downstream: a zero
+    /// `max_window_secs` freezes backfill chunking in an infinite loop, a zero
+    /// `batch_size` makes every FETCH return zero rows, and zero pools/workers/
+    /// partitions divide budgets by zero or scan nothing.
+    pub fn validate(&self) -> Result<(), AppError> {
+        let mut bad = Vec::new();
+        if self.incremental.max_window_secs < 1 {
+            bad.push(format!(
+                "incremental.max_window_secs must be >= 1 (got {})",
+                self.incremental.max_window_secs
+            ));
+        }
+        if self.incremental.safety_lag_secs < 0 {
+            bad.push(format!(
+                "incremental.safety_lag_secs must be >= 0 (got {})",
+                self.incremental.safety_lag_secs
+            ));
+        }
+        if self.execution.batch_size < 1 {
+            bad.push(format!(
+                "execution.batch_size must be >= 1 (got {})",
+                self.execution.batch_size
+            ));
+        }
+        if self.parallel_scan.partitions < 1 {
+            bad.push(format!(
+                "parallel_scan.partitions must be >= 1 (got {})",
+                self.parallel_scan.partitions
+            ));
+        }
+        if self.distributed.workers < 1 {
+            bad.push(format!(
+                "distributed.workers must be >= 1 (got {})",
+                self.distributed.workers
+            ));
+        }
+        if self.source.pool_max < 1 {
+            bad.push(format!(
+                "source.pool_max must be >= 1 (got {})",
+                self.source.pool_max
+            ));
+        }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Config(format!("invalid job spec: {}", bad.join("; "))))
+        }
     }
 
     pub fn resolve_password(&self) -> Result<String, AppError> {
@@ -278,6 +329,76 @@ impl JobConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_from_file_example_config() {
+        // The checked-in example spec must always parse: it is what the examples and the
+        // runbook invoke. Catches renamed/removed serde fields.
+        // Tests run with CWD at the crate root, where examples/ lives.
+        let config =
+            JobConfig::from_file("examples/configs/extract.example.json").unwrap();
+
+        assert_eq!(config.job_id, "orders_incremental");
+        assert_eq!(config.table, "orders");
+        assert_eq!(config.resolved_table(), "public.orders");
+        assert_eq!(config.source.password_env, "ORDERS_PG_PASSWORD");
+        assert_eq!(config.incremental.column, "updated_at");
+        assert!(config.columns.as_ref().unwrap().contains(&"tags".to_string()));
+
+        // Spec blocks absent from older files fall back to defaults.
+        assert_eq!(config.pushdown.push, Vec::<String>::new());
+        assert_eq!(config.distributed.workers, 2);
+        assert_eq!(config.execution.batch_size, 8192);
+        assert_eq!(config.parallel_scan.partition_column, "order_id");
+    }
+
+    #[test]
+    fn test_from_file_missing_is_config_error() {
+        let err = JobConfig::from_file("examples/configs/does-not-exist.json").unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
+    }
+
+    #[test]
+    fn test_from_file_bench_config() {
+        // The benchmark job spec must parse too — a missing block here fails inside the
+        // container at runtime, where the error is expensive to see.
+        let config =
+            JobConfig::from_file("benchmark/rust/bench-config.json").unwrap();
+        assert_eq!(config.table, "orders");
+        assert_eq!(config.source.host, "bench-pg");
+        assert_eq!(config.execution.batch_size, 64000);
+    }
+
+    #[test]
+    fn test_validate_rejects_degenerate_values() {
+        // A zero max_window_secs freezes backfill chunking in an infinite loop;
+        // zero batch/partitions/workers/pool silently scan nothing or divide by zero.
+        let mut config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
+        config.validate().unwrap();
+
+        config.incremental.max_window_secs = 0;
+        assert!(config.validate().is_err());
+        config.incremental.max_window_secs = 3600;
+
+        config.execution.batch_size = 0;
+        assert!(config.validate().is_err());
+        config.execution.batch_size = 8192;
+
+        config.parallel_scan.partitions = 0;
+        assert!(config.validate().is_err());
+        config.parallel_scan.partitions = 1;
+
+        config.distributed.workers = 0;
+        assert!(config.validate().is_err());
+        config.distributed.workers = 2;
+
+        config.source.pool_max = 0;
+        assert!(config.validate().is_err());
+        config.source.pool_max = 8;
+
+        config.incremental.safety_lag_secs = -1;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn test_resolved_table() {

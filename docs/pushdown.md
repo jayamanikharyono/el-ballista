@@ -79,15 +79,13 @@ byte strings) out of our hands.
 | Category | Pushed | Notes |
 | --- | --- | --- |
 | Column reference | yes | Quoted per dialect |
-| Literals: int, float, bool, utf8, date, timestamp, decimal | yes | Bound as typed parameters |
+| Literals: int (8/16/32/64-bit, unsigned ≤32-bit), float, bool, utf8 | yes | Bound as typed parameters |
+| Literals: timestamp-microsecond | yes | Bound as typed parameter |
+| Literals: date, decimal, binary, NULL, anything else | **no** | `translate_literal` returns `None` → kept in Arrow |
 | Comparison: `= != < <= > >=` | yes | Fidelity depends on column type — see §3 |
 | `AND` / `OR` / `NOT` | yes | Fidelity is the *minimum* of the children's |
 | `IS NULL` / `IS NOT NULL` | yes | Exact in both dialects |
-| `IN (list)` | yes | Expanded to bound params; capped at 1000 elements |
-| `BETWEEN` | yes | Rewritten as two comparisons |
-| `LIKE` | Inexact | Collation-sensitive in MySQL; escape handling differs |
-| `CAST` | limited | Only widening numeric casts, and date↔timestamp |
-| Arithmetic `+ - * /` | Inexact | Overflow and division-by-zero semantics differ — see §3.4 |
+| `IN (list)`, `BETWEEN`, `LIKE`, `CAST`, arithmetic `+ - * /` | **no** | `translate` returns `None` (deliberate for arithmetic — see §3.4); kept in Arrow. The `Predicate::Cast` variant exists but is only ever produced by internal enum-label normalization, never from user predicates |
 | Regex, JSON path, string functions | **no** | Kept in Arrow; usually much faster there anyway |
 | UDFs | **no** | By definition not expressible in the source |
 

@@ -446,7 +446,16 @@ impl PostgresTableProvider {
             return;
         };
         for expr in filters {
-            let Some((_, predicate)) = pushdown::translate(expr) else {
+            let Some((fidelity, predicate)) = pushdown::translate(expr) else {
+                continue;
+            };
+            // Warm the normalized shape — the cache is keyed by SQL text, and lookups use
+            // the normalized form, so warming the raw form would never hit.
+            let Some((_, predicate)) = pushdown::normalize_enum_comparison(
+                fidelity,
+                predicate,
+                &self.enum_columns,
+            ) else {
                 continue;
             };
             let inline = predicate.render_inline();
@@ -511,23 +520,29 @@ impl TableProvider for PostgresTableProvider {
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         // DataFusion only ever passes filters here that `supports_filters_pushdown` already
-        // marked Exact or Inexact, so every received filter is pushed unconditionally — the
-        // decision lives in exactly one place (`decide_cost`), and `scan` can never contradict
-        // what planning promised. (For an `Exact` filter DataFusion drops its own check, so a
-        // second independent judgment here would risk wrong results, not just slow ones.)
+        // marked Exact or Inexact. Every received filter goes back through `decide_cost` and
+        // pushes the predicate *it* returns — translated and normalized (enum casts) exactly
+        // as planning saw it. Re-translating here instead would silently drop the
+        // normalization and push unresolvable SQL (e.g. `order_status = text` → 42883).
+        // (For an `Exact` filter DataFusion drops its own check, so any divergence here
+        // would risk wrong results, not just slow ones.)
         let mut pushed = Vec::new();
         let mut any_inexact = false;
 
         for f in filters {
-            let Some((fidelity, predicate)) = pushdown::translate(f) else {
-                return Err(datafusion::error::DataFusionError::Internal(
-                    "scan received a filter the planner never marked pushable".to_string(),
-                ));
-            };
-            if fidelity == pushdown::Fidelity::Inexact {
-                any_inexact = true;
+            match self.decide_cost(f) {
+                Decision::Push { fidelity, predicate } => {
+                    if fidelity == pushdown::Fidelity::Inexact {
+                        any_inexact = true;
+                    }
+                    pushed.push(predicate);
+                }
+                Decision::Keep => {
+                    return Err(datafusion::error::DataFusionError::Internal(
+                        "scan received a filter the planner never marked pushable".to_string(),
+                    ));
+                }
             }
-            pushed.push(predicate);
         }
 
         // docs/pushdown.md §5 — never push LIMIT alongside an Inexact filter: a source-side
@@ -608,5 +623,86 @@ impl TableProvider for PostgresTableProvider {
         )?;
 
         Ok(Arc::new(plan))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::postgres::parallel::ParallelStrategy;
+    use datafusion::prelude::{col, lit, SessionContext};
+
+    /// A decode-side provider (no pool): `scan()` resolves the pool lazily, so with a
+    /// dummy password env var this exercises the full filter→SQL path with zero network.
+    fn test_provider() -> PostgresTableProvider {
+        use crate::types::TableMetadata;
+
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "status",
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )]));
+        let model = PostgresTableProviderModel {
+            descriptor: PostgresConnectionDescriptor {
+                host: "test-invalid-host".to_string(),
+                port: 1,
+                user: "test".to_string(),
+                password_env: "REL_TEST_DUMMY_PW".to_string(),
+                database: "testdb".to_string(),
+                pool_max: 1,
+                expected_workers: 1,
+                statement_timeout_ms: 1000,
+                application_name: "test".to_string(),
+                schema: "public".to_string(),
+            },
+            table_metadata: TableMetadata {
+                schema_name: "public".to_string(),
+                table_name: "orders".to_string(),
+                columns: vec![],
+            },
+            policy: PushdownPolicy::CostBased,
+            deny: vec![],
+            push: vec![],
+            watermark_column: None,
+            window: None,
+            batch_size: 8192,
+            parallel_workers: 1,
+            partition_column: None,
+            strategy: ParallelStrategy::None,
+            enum_columns: vec!["status".to_string()],
+        };
+        PostgresTableProvider::from_model(schema, model)
+    }
+
+    #[tokio::test]
+    async fn test_scan_pushes_normalized_enum_predicate() {
+        // Regression test for the 42883 that escaped `decide_cost`: `scan()` used to
+        // re-translate raw Exprs and push `"status" = $1`, while planning had approved the
+        // normalized `"status"::text = $1`. Now scan reuses the single decision point.
+        unsafe {
+            std::env::set_var("REL_TEST_DUMMY_PW", "dummy");
+        }
+        let provider = test_provider();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = provider
+            .scan(&state, None, &[col("status").eq(lit("PAID"))], None)
+            .await
+            .unwrap();
+        let plan = plan
+            .downcast_ref::<PostgresExecutionPlan>()
+            .expect("a PostgresExecutionPlan");
+        let sql_str = plan.build_query(0).sql();
+        let sql = sql_str.as_str();
+
+        assert!(
+            sql.contains(r#""status"::text = $1"#),
+            "scan must push the normalized label comparison, got: {sql}"
+        );
+
+        unsafe {
+            std::env::remove_var("REL_TEST_DUMMY_PW");
+        }
     }
 }

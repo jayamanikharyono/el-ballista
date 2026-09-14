@@ -19,6 +19,7 @@ use crate::connector::postgres::{
     schema_reader::PostgresSchemaReader,
     arrow_type_mapper::ArrowTypeMapper,
 };
+use crate::connector::query_tag::QuerySession;
 
 use crate::{
     connector::errors::ExtractorError,
@@ -28,6 +29,11 @@ use crate::{
 
 pub struct PostgresExtractor {
     pool: PgPool,
+    /// Debug SQL comment identity (see `connector::query_tag`): `pipeline` reuses
+    /// `application_name` (already passed to `connect`, already identifying this
+    /// connection); `run_id` is generated once per extractor instance, i.e. once per
+    /// process/session, and shared by every query this extractor issues.
+    query_session: QuerySession,
 }
 
 impl PostgresExtractor {
@@ -80,13 +86,23 @@ impl PostgresExtractor {
             .connect_with(connect_options)
             .await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            query_session: QuerySession::new(application_name),
+        })
     }
 
     /// The underlying pool, for callers (e.g. the safe-high-watermark query in
     /// `crate::incremental`) that need to run something other than a table scan.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Render a fresh debug tag for one query issued through this extractor. See
+    /// `connector::query_tag`; prepended to DECLARE/FETCH statements below so the running
+    /// statement is identifiable directly in `pg_stat_activity`.
+    fn tag(&self, strategy: &str) -> String {
+        self.query_session.tag(strategy).render()
     }
     /// Extract via server-side cursor (portal) — true streaming with bounded memory.
     /// Uses `DECLARE CURSOR ... WITH HOLD` + `FETCH FORWARD n` + `CLOSE`.
@@ -118,8 +134,11 @@ impl PostgresExtractor {
         
         // Declare cursor. The SELECT text carries $1/$2 placeholders from QueryBuilder,
         // so the lo/hi values must be bound here — executing without binds fails with
-        // "there is no parameter $1".
-        let declare_sql = format!("DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
+        // "there is no parameter $1". The debug tag is prepended to both DECLARE and
+        // every FETCH: DECLARE embeds the real SELECT, but FETCH is what's actually
+        // running (and visible in pg_stat_activity) for the bulk of a long extraction.
+        let tag = self.tag("incremental_cursor");
+        let declare_sql = format!("{tag}DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
         sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
             .bind(lo)
             .bind(hi)
@@ -130,16 +149,16 @@ impl PostgresExtractor {
         let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
 
         loop {
-            let fetch_sql = format!("FETCH FORWARD {} FROM {}", batch_size, cursor_name);
+            let fetch_sql = format!("{tag}FETCH FORWARD {} FROM {}", batch_size, cursor_name);
             let rows = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str())).fetch_all(&mut *tx).await?;
-            
+
             if rows.is_empty() {
                 break;
             }
 
             for row in rows {
                 batch_builder.append_row(&row, &table_metadata)?;
-                
+
                 if batch_builder.row_count() >= batch_size {
                     let batch = batch_builder.finish()?;
                     batches.push(batch);
@@ -149,7 +168,7 @@ impl PostgresExtractor {
         }
 
         // Close cursor
-        let close_sql = format!("CLOSE {}", cursor_name);
+        let close_sql = format!("{tag}CLOSE {}", cursor_name);
         sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str())).execute(&mut *tx).await?;
         tx.commit().await?;
 
@@ -184,7 +203,8 @@ impl PostgresExtractor {
         let mut tx = conn.begin().await?;
 
         let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
-        let declare_sql = format!("DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
+        let tag = self.tag("keyset_cursor");
+        let declare_sql = format!("{tag}DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
         // build_keyset_partition emits $1/$2 placeholders — bind lo/hi here.
         sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
             .bind(lo)
@@ -196,16 +216,16 @@ impl PostgresExtractor {
         let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
 
         loop {
-            let fetch_sql = format!("FETCH FORWARD {} FROM {}", batch_size, cursor_name);
+            let fetch_sql = format!("{tag}FETCH FORWARD {} FROM {}", batch_size, cursor_name);
             let rows = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str())).fetch_all(&mut *tx).await?;
-            
+
             if rows.is_empty() {
                 break;
             }
 
             for row in rows {
                 batch_builder.append_row(&row, &table_metadata)?;
-                
+
                 if batch_builder.row_count() >= batch_size {
                     let batch = batch_builder.finish()?;
                     batches.push(batch);
@@ -214,7 +234,7 @@ impl PostgresExtractor {
             }
         }
 
-        let close_sql = format!("CLOSE {}", cursor_name);
+        let close_sql = format!("{tag}CLOSE {}", cursor_name);
         sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str())).execute(&mut *tx).await?;
         tx.commit().await?;
 
@@ -331,23 +351,24 @@ impl PostgresExtractor {
         let mut tx = conn.begin().await?;
 
         let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
-        let declare_sql = format!("DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
+        let tag = self.tag("full");
+        let declare_sql = format!("{tag}DECLARE {} CURSOR WITH HOLD FOR {}", cursor_name, select_sql);
         sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str())).execute(&mut *tx).await?;
 
         let mut batches = Vec::new();
         let mut batch_builder = CursorBatchBuilder::new(&table_metadata_full)?;
 
         loop {
-            let fetch_sql = format!("FETCH FORWARD 8192 FROM {}", cursor_name);
+            let fetch_sql = format!("{tag}FETCH FORWARD 8192 FROM {}", cursor_name);
             let rows = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str())).fetch_all(&mut *tx).await?;
-            
+
             if rows.is_empty() {
                 break;
             }
 
             for row in rows {
                 batch_builder.append_row(&row, &table_metadata_full)?;
-                
+
                 if batch_builder.row_count() >= 8192 {
                     let batch = batch_builder.finish()?;
                     batches.push(batch);
@@ -356,7 +377,7 @@ impl PostgresExtractor {
             }
         }
 
-        let close_sql = format!("CLOSE {}", cursor_name);
+        let close_sql = format!("{tag}CLOSE {}", cursor_name);
         sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str())).execute(&mut *tx).await?;
         tx.commit().await?;
 

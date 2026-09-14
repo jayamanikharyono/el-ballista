@@ -1,15 +1,12 @@
-mod connector;
-mod types;
-mod errors;
-mod config;
-mod checkpoint;
-mod incremental;
-mod pushdown;
+// `cli` and `demo` are bin-only entry points (not part of the library crate); everything
+// else is `rust_ballista_extraction_layer::...` — this binary is a thin wrapper around the
+// lib crate, not a second copy of it. See docs/testing-plan.md §7 for why that used to
+// matter: main.rs re-declaring every lib module meant the lib and bin targets each
+// compiled (and `cargo test --bins` ran) their own copy of every unit test.
 mod cli;
 mod demo;
-mod distributed;
 
-use crate::errors::AppError;
+use rust_ballista_extraction_layer::errors::AppError;
 
 struct SimpleLogger;
 

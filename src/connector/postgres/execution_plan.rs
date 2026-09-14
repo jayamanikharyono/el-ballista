@@ -22,6 +22,7 @@ use crate::connector::postgres::{
     query_builder::PostgresQueryBuilder,
     row_adapter,
 };
+use crate::connector::query_tag::QuerySession;
 use crate::distributed::connection::PostgresConnectionDescriptor;
 use crate::distributed::pool_registry::registry;
 use crate::pushdown::Predicate;
@@ -41,6 +42,10 @@ pub struct PostgresExecutionPlanModel {
     pub window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub batch_size: usize,
     pub partitions: Vec<ScanPartition>,
+    /// Debug identity for the SQL comment tag (see `connector::query_tag`) — carried across
+    /// the wire so every executor tags its partition's query with the *same* run_id the
+    /// scheduler generated, rather than each process inventing its own.
+    pub run_id: String,
 }
 
 /// A streaming `SELECT` against one Postgres table. Whenever more than one partition is
@@ -63,6 +68,7 @@ pub struct PostgresExecutionPlan {
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     batch_size: usize,
     partitions: Vec<ScanPartition>,
+    query_session: QuerySession,
 }
 
 impl PostgresExecutionPlan {
@@ -76,7 +82,19 @@ impl PostgresExecutionPlan {
         window: Option<(DateTime<Utc>, DateTime<Utc>)>,
         batch_size: usize,
         partitions: Vec<ScanPartition>,
+        run_id: String,
     ) -> DataFusionResult<Self> {
+        // Pipeline label for the debug SQL comment tag (`connector::query_tag`): reuses
+        // `application_name`, already threaded through config to identify the Postgres
+        // connection itself, rather than plumbing a second identifier through for the same
+        // purpose. `run_id` is caller-supplied (not generated here) so it can be shared
+        // across every executor task working the same logical scan — see the model's
+        // `run_id` field doc.
+        let pipeline = descriptor
+            .as_ref()
+            .map(|d| d.application_name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let query_session = QuerySession::from_parts(pipeline, run_id);
         // Ballista schedules one task per partition. A single (or empty) partition list means
         // one task; several means several — the keyset-scan parallelism of docs/roadmap.md
         // Phase 3 carried over unchanged into the distributed phase.
@@ -104,6 +122,7 @@ impl PostgresExecutionPlan {
             window,
             batch_size,
             partitions,
+            query_session,
         })
     }
 
@@ -124,6 +143,7 @@ impl PostgresExecutionPlan {
             window: self.window,
             batch_size: self.batch_size,
             partitions: self.partitions.clone(),
+            run_id: self.query_session.run_id().to_string(),
         })
     }
 
@@ -142,6 +162,7 @@ impl PostgresExecutionPlan {
             model.window,
             model.batch_size,
             model.partitions,
+            model.run_id,
         )
     }
 
@@ -149,7 +170,7 @@ impl PostgresExecutionPlan {
     /// backend-neutral [`Predicate::render_to`] into a Postgres sink, which binds each literal
     /// at render position (sqlx `push_bind` appends `$n` inline, so text and numbering align
     /// by construction); a MySQL connector would render the same way into its own sink. The
-    /// watermark window is the half-open `(lo, hi]` from docs/incremental-extraction.md §2,
+    /// watermark window is the half-open `[lo, hi]` from docs/incremental-extraction.md §2,
     /// and the partition bounds (composed in parallel.rs from source min/max queries) are
     /// inlined.
     ///
@@ -159,7 +180,24 @@ impl PostgresExecutionPlan {
         use crate::pushdown::{PgParamSink, SqlParam, SqlSink};
 
         let dialect = PostgresDialect;
-        let mut qb = QueryBuilder::<Postgres>::new("SELECT ");
+
+        // Debug tag: identifies this exact statement on the Postgres instance itself
+        // (pg_stat_activity, pg_stat_statements, logs) without cross-referencing anything
+        // in this process. `strategy` names the scan shape; `partition` (1-based) is
+        // included only when this table is actually split across more than one scan.
+        let strategy = match (self.watermark_column.is_some(), self.pushed_filters.is_empty()) {
+            (true, true) => "incremental",
+            (true, false) => "incremental+pushdown",
+            (false, true) => "full",
+            (false, false) => "full+pushdown",
+        };
+        let mut tag = self.query_session.tag(strategy);
+        if self.partitions.len() > 1 {
+            tag = tag.with_partition(partition_idx + 1, self.partitions.len());
+        }
+
+        let mut qb = QueryBuilder::<Postgres>::new(tag.render());
+        qb.push("SELECT ");
 
         PostgresQueryBuilder::push_columns(&mut qb, &self.table_metadata);
 
@@ -394,6 +432,7 @@ mod tests {
             )),
             8192,
             vec![],
+            "test-run".to_string(),
         )
         .unwrap();
 
@@ -410,6 +449,76 @@ mod tests {
             "filter placeholder third, got: {sql}"
         );
         assert!(sql.contains("LIMIT $4"), "limit placeholder last, got: {sql}");
+    }
+
+    #[test]
+    fn test_build_query_is_tagged_with_debug_comment() {
+        use chrono::TimeZone;
+
+        // The debug SQL comment tag (connector::query_tag) must actually be there, with the
+        // right strategy/pipeline defaults, so it's visible in pg_stat_activity as intended
+        // -- this isn't optional decoration, it was the whole point of adding it.
+        let schema = Arc::new(Schema::empty());
+        let table_metadata = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![],
+        };
+        let plan = PostgresExecutionPlan::try_new(
+            None,
+            table_metadata,
+            schema,
+            vec![],
+            None,
+            Some("updated_at".to_string()),
+            Some((
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap(),
+            )),
+            8192,
+            vec![],
+            "r_fixedtest".to_string(),
+        )
+        .unwrap();
+
+        let sql = plan.build_query(0).sql();
+        let sql = sql.as_str();
+        assert!(sql.starts_with("/* rust-extract query_id=q_"), "got: {sql}");
+        assert!(sql.contains("pipeline=unknown"), "no descriptor -> pipeline defaults to unknown, got: {sql}");
+        assert!(sql.contains("run_id=r_fixedtest"), "must carry the caller-supplied run_id, got: {sql}");
+        assert!(sql.contains("strategy=incremental"), "watermark set, no pushed filters, got: {sql}");
+        assert!(!sql.contains("partition="), "single/unsplit scan must omit partition, got: {sql}");
+    }
+
+    #[test]
+    fn test_build_query_tag_includes_partition_when_split() {
+        let schema = Arc::new(Schema::empty());
+        let table_metadata = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![],
+        };
+        let partitions = vec![
+            ScanPartition { partition_id: 0, lo: Some(0), hi: Some(1), predicate: Some("id >= 0 AND id < 1".to_string()) },
+            ScanPartition { partition_id: 1, lo: Some(1), hi: Some(2), predicate: Some("id >= 1 AND id < 2".to_string()) },
+        ];
+        let plan = PostgresExecutionPlan::try_new(
+            None,
+            table_metadata,
+            schema,
+            vec![],
+            None,
+            None,
+            None,
+            8192,
+            partitions,
+            "r_fixedtest".to_string(),
+        )
+        .unwrap();
+
+        // 1-based partition index in the tag, out of the total partition count.
+        assert!(plan.build_query(0).sql().as_str().contains("partition=1/2"));
+        assert!(plan.build_query(1).sql().as_str().contains("partition=2/2"));
     }
 
     #[test]
@@ -431,6 +540,7 @@ mod tests {
             None,
             8192,
             vec![],
+            "test-run".to_string(),
         )
         .unwrap();
 
@@ -461,6 +571,7 @@ mod tests {
             None,
             8192,
             vec![],
+            "test-run".to_string(),
         )
         .unwrap();
         match &single.properties().partitioning {
@@ -486,6 +597,7 @@ mod tests {
             None,
             8192,
             partitions,
+            "test-run".to_string(),
         )
         .unwrap();
         match &split.properties().partitioning {

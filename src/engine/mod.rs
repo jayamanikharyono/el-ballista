@@ -264,14 +264,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_watermark_timestamp() {
+    fn test_watermark_timestamp_stores_column_name() {
         let wm = Watermark::timestamp("updated_at");
         assert_eq!(wm.column_name, "updated_at");
     }
 
     #[test]
-    fn test_watermark_sequence() {
-        let wm = Watermark::sequence("id");
-        assert_eq!(wm.column_name, "id");
+    fn test_watermark_sequence_is_not_yet_distinguished_from_timestamp() {
+        // Devil's advocate: `sequence` and `timestamp` currently produce identical
+        // `Watermark` values, and `SourceDataFrame::incremental` always builds a
+        // chrono-timestamp predicate regardless of which constructor was used. That
+        // matches the documented scope ("Not implemented yet: append_id / snapshot / log
+        // modes" in incremental/mod.rs), but it means `Watermark::sequence` is currently a
+        // trap for a caller who expects integer-cursor semantics. This test pins today's
+        // actual (identical) behavior so a future implementer notices they need to also
+        // update `incremental()`'s predicate-building, not just add a new constructor.
+        let by_sequence = Watermark::sequence("id");
+        let by_timestamp = Watermark::timestamp("id");
+        assert_eq!(by_sequence.column_name, by_timestamp.column_name);
     }
 }

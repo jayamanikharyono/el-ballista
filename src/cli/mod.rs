@@ -25,15 +25,15 @@ use datafusion::logical_expr::Expr;
 use datafusion::prelude::{col, lit, SessionContext};
 use uuid::Uuid;
 
-use crate::checkpoint::json_store::JsonCheckpointStore;
-use crate::checkpoint::{CheckpointStore, JobKey, RunStats};
-use crate::config::JobConfig;
-use crate::errors::AppError;
-use crate::connector::postgres::{PostgresExtractor, PostgresTableProvider};
-use crate::distributed::{DistributedContext, PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec};
-use crate::distributed::pool_registry::registry;
-use crate::incremental::{build_window, clamp_to_observed, max_timestamp_column, safe_high_watermark};
-use crate::pushdown::PushdownPolicy;
+use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
+use rust_ballista_extraction_layer::checkpoint::{CheckpointStore, JobKey, RunStats};
+use rust_ballista_extraction_layer::config::JobConfig;
+use rust_ballista_extraction_layer::errors::AppError;
+use rust_ballista_extraction_layer::connector::postgres::{PostgresExtractor, PostgresTableProvider};
+use rust_ballista_extraction_layer::distributed::{DistributedContext, PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec};
+use rust_ballista_extraction_layer::distributed::pool_registry::registry;
+use rust_ballista_extraction_layer::incremental::{build_window, clamp_to_observed, max_timestamp_column, safe_high_watermark};
+use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
 
 const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]";
 
@@ -305,7 +305,7 @@ async fn plan_explain(
         policy,
         deny,
         config.pushdown.push.clone(),
-        crate::pushdown::cost_model::CostParams {
+        rust_ballista_extraction_layer::pushdown::cost_model::CostParams {
             max_source_cost: config.pushdown.max_source_cost,
             keep_threshold: config.pushdown.keep_threshold,
         },
@@ -333,7 +333,7 @@ async fn plan_explain(
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_optimizer_rule(Arc::new(
-                crate::pushdown::optimizer_rule::SourceAwarePushdownRule,
+                rust_ballista_extraction_layer::pushdown::optimizer_rule::SourceAwarePushdownRule,
             ))
             .build();
         SessionContext::new_with_state(state)

@@ -54,7 +54,10 @@ impl PhysicalExtensionCodec for PostgresPhysicalCodec {
 
             buf.extend_from_slice(POSTGRES_SCAN_MAGIC);
             buf.extend_from_slice(&bytes);
-            log::debug!("encoded PostgresExecutionPlan ({} bytes payload)", bytes.len());
+            log::debug!(
+                "encoded PostgresExecutionPlan ({} bytes payload)",
+                bytes.len()
+            );
 
             Ok(())
         } else {

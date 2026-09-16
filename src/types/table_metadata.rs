@@ -1,6 +1,6 @@
-use std::fmt;
-use serde::{Deserialize, Serialize};
 use crate::types::ColumnMetadata;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableMetadata {
@@ -28,10 +28,7 @@ impl fmt::Display for TableMetadata {
 }
 
 impl TableMetadata {
-    pub fn select_columns(
-        &self,
-        column_names: Option<&[&str]>,
-    ) -> TableMetadata {
+    pub fn select_columns(&self, column_names: Option<&[&str]>) -> TableMetadata {
         match column_names {
             Some(names) => {
                 let columns = names

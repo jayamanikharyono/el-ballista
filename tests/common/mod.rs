@@ -1,3 +1,4 @@
+#![allow(dead_code, clippy::all)]
 //! Self-provisioning Postgres test harness (testing-plan.md Phase B, revised).
 //!
 //! No external database, container, or manual setup is required: `TestDb::connect()`
@@ -34,11 +35,11 @@
 //! trade-off for "no container, no manual setup, fully portable."
 
 use postgresql_embedded::PostgreSQL;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
@@ -104,7 +105,9 @@ impl TestDb {
         // Machine-generated identifier, safe by construction; assert it anyway so a
         // future refactor can't turn this into an injection sink.
         assert!(
-            schema.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            schema
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "unsafe schema name"
         );
         let sql = format!("CREATE SCHEMA {}", schema);
@@ -170,8 +173,8 @@ impl TestDb {
             )"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-        .execute(&self.pool)
-        .await?;
+            .execute(&self.pool)
+            .await?;
         // One row per edge; row 8 is the mostly-NULL row. Deterministic ids 1..8.
         let sql = format!(
             "INSERT INTO {s}.hostile
@@ -207,8 +210,8 @@ impl TestDb {
               NULL, NULL,               NULL, NULL, NULL, NULL, NULL, '2024-01-08')"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-        .execute(&self.pool)
-        .await?;
+            .execute(&self.pool)
+            .await?;
         let sql = format!("ANALYZE {s}.hostile");
         sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(&self.pool)
@@ -265,7 +268,9 @@ async fn embedded_url() -> String {
             postgresql
                 .create_database("test")
                 .await
-                .unwrap_or_else(|e| panic!("embedded Postgres: cannot create 'test' database: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("embedded Postgres: cannot create 'test' database: {e}")
+                });
             postgresql
         })
         .await;
@@ -294,10 +299,7 @@ fn parse_url(url: &str) -> Option<(String, u16, String, String, String)> {
 }
 
 /// Fetch a Decimal128 column as unscaled i128s (None for NULL) for exact assertions.
-pub fn decimal_col(
-    batch: &arrow::record_batch::RecordBatch,
-    name: &str,
-) -> Vec<Option<i128>> {
+pub fn decimal_col(batch: &arrow::record_batch::RecordBatch, name: &str) -> Vec<Option<i128>> {
     use arrow::array::Array;
     let idx = batch.schema().index_of(name).expect("column exists");
     let arr = batch
@@ -305,7 +307,9 @@ pub fn decimal_col(
         .as_any()
         .downcast_ref::<arrow::array::Decimal128Array>()
         .expect("decimal column");
-    (0..arr.len()).map(|i| arr.is_valid(i).then(|| arr.value(i))).collect()
+    (0..arr.len())
+        .map(|i| arr.is_valid(i).then(|| arr.value(i)))
+        .collect()
 }
 
 /// Fetch an Int64 column as values for set comparisons.
@@ -317,5 +321,7 @@ pub fn int64_col(batch: &arrow::record_batch::RecordBatch, name: &str) -> Vec<i6
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .expect("int64 column");
-    (0..arr.len()).filter_map(|i| arr.is_valid(i).then(|| arr.value(i))).collect()
+    (0..arr.len())
+        .filter_map(|i| arr.is_valid(i).then(|| arr.value(i)))
+        .collect()
 }

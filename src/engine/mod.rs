@@ -26,9 +26,9 @@ use crate::connector::postgres::{PostgresExtractor, PostgresTableProvider};
 use crate::distributed::connection::PostgresConnectionDescriptor;
 use crate::errors::AppError;
 use crate::incremental::{build_window, safe_high_watermark};
+use crate::pushdown::PushdownPolicy;
 use crate::pushdown::cost_model::CostParams;
 use crate::pushdown::optimizer_rule::SourceAwarePushdownRule;
-use crate::pushdown::PushdownPolicy;
 
 /// The primary entry point for extraction pipelines. Wraps DataFusion's SessionContext,
 /// manages source connectors and checkpoints, and provides a fluent builder API.
@@ -70,9 +70,9 @@ impl ExtractContext {
         sources.insert("postgres".to_string(), Arc::new(pool));
 
         // Initialize checkpoint store.
-        let checkpoint_store = Arc::new(
-            crate::checkpoint::json_store::JsonCheckpointStore::new(&config.checkpoint.dir)?,
-        );
+        let checkpoint_store = Arc::new(crate::checkpoint::json_store::JsonCheckpointStore::new(
+            &config.checkpoint.dir,
+        )?);
 
         Ok(Self {
             session_ctx,
@@ -111,8 +111,7 @@ impl ExtractContext {
     ) -> Result<SourceDataFrame<'_>, AppError> {
         let _pool = self.pool_for(connector_ref)?;
         let policy = PushdownPolicy::parse(&self.config.pushdown.policy);
-        let descriptor =
-            PostgresConnectionDescriptor::from_config(&self.config.source, 1);
+        let descriptor = PostgresConnectionDescriptor::from_config(&self.config.source, 1);
 
         let provider = PostgresTableProvider::new(
             descriptor,
@@ -130,8 +129,7 @@ impl ExtractContext {
         .await
         .map_err(AppError::Extractor)?;
 
-        let strategy =
-            ParallelStrategy::parse(&self.config.parallel_scan.strategy);
+        let strategy = ParallelStrategy::parse(&self.config.parallel_scan.strategy);
         let provider = provider.with_parallel_strategy(strategy);
 
         self.session_ctx
@@ -177,10 +175,8 @@ impl<'a> SourceDataFrame<'a> {
         let lo = checkpoint.and_then(|c| c.watermark_value);
 
         let pool = ctx.pool_for("postgres")?;
-        let safety_lag =
-            chrono::Duration::seconds(ctx.config.incremental.safety_lag_secs);
-        let max_window =
-            chrono::Duration::seconds(ctx.config.incremental.max_window_secs);
+        let safety_lag = chrono::Duration::seconds(ctx.config.incremental.safety_lag_secs);
+        let max_window = chrono::Duration::seconds(ctx.config.incremental.max_window_secs);
         let hi_candidate = safe_high_watermark(&pool, safety_lag).await?;
         let window = build_window(lo, hi_candidate, max_window);
 
@@ -212,22 +208,37 @@ impl<'a> SourceDataFrame<'a> {
 
     /// Add a filter predicate to the query.
     pub fn filter(self, expr: Expr) -> Result<Self, AppError> {
-        Ok(Self { ctx: self.ctx, df: self.df.filter(expr).map_err(AppError::DataFusion)? })
+        Ok(Self {
+            ctx: self.ctx,
+            df: self.df.filter(expr).map_err(AppError::DataFusion)?,
+        })
     }
 
     /// Select specific columns.
     pub fn select(self, columns: Vec<Expr>) -> Result<Self, AppError> {
-        Ok(Self { ctx: self.ctx, df: self.df.select(columns).map_err(AppError::DataFusion)? })
+        Ok(Self {
+            ctx: self.ctx,
+            df: self.df.select(columns).map_err(AppError::DataFusion)?,
+        })
     }
 
     /// Add or rename a column with an expression.
     pub fn with_column(self, name: &str, expr: Expr) -> Result<Self, AppError> {
-        Ok(Self { ctx: self.ctx, df: self.df.with_column(name, expr).map_err(AppError::DataFusion)? })
+        Ok(Self {
+            ctx: self.ctx,
+            df: self
+                .df
+                .with_column(name, expr)
+                .map_err(AppError::DataFusion)?,
+        })
     }
 
     /// Limit results to N rows.
     pub fn limit(self, skip: usize, fetch: Option<usize>) -> Result<Self, AppError> {
-        Ok(Self { ctx: self.ctx, df: self.df.limit(skip, fetch).map_err(AppError::DataFusion)? })
+        Ok(Self {
+            ctx: self.ctx,
+            df: self.df.limit(skip, fetch).map_err(AppError::DataFusion)?,
+        })
     }
 
     /// Execute the query and collect Arrow RecordBatches — the handoff point to DataFusion

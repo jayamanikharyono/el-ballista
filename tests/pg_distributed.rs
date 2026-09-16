@@ -8,7 +8,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{TestDb, TEST_PASSWORD_ENV};
+use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
@@ -66,7 +66,12 @@ async fn standalone_collects_hostile_table() -> Result<(), Box<dyn std::error::E
     ctx.register_source(&config).await?;
 
     // Full collect: 8 rows across 4 keyset partitions.
-    let batches = ctx.session.sql("SELECT id FROM hostile").await?.collect().await?;
+    let batches = ctx
+        .session
+        .sql("SELECT id FROM hostile")
+        .await?
+        .collect()
+        .await?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 8);
 

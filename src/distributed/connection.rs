@@ -10,8 +10,8 @@ use std::env;
 use serde::{Deserialize, Serialize};
 
 use crate::config::SourceConfig;
-use crate::connector::errors::ExtractorError;
 use crate::connector::SourceDescriptor;
+use crate::connector::errors::ExtractorError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostgresConnectionDescriptor {

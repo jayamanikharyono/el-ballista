@@ -1,62 +1,27 @@
 # PostgreSQL Connector
 
-Crate: `rel-connector-postgres`. Built on `tokio-postgres` (raw protocol access, streaming, binary
-`COPY`) rather than an ORM or a query builder — we generate SQL from the planner and need the wire
-format, not row-mapping convenience.
+Crate: `rel-connector-postgres`. Built on `sqlx` (text protocol, streaming cursors) — we generate
+SQL from the planner and need parameterized queries, not binary `COPY`.
 
 Covers self-managed PostgreSQL, Cloud SQL for PostgreSQL, and AlloyDB. Read replicas and hot
 standbys are supported with an important watermark caveat in §5.3.
 
 ---
 
-## 1. Why Postgres is the better-behaved of the two connectors
+## 1. Why Postgres is the reference implementation
 
-Three capabilities that MySQL lacks make Postgres the reference implementation:
+Postgres provides three capabilities that make it the reference:
 
-- **Binary `COPY`** gives a bulk export path with far less per-row protocol overhead than the
-  extended query protocol.
-- **`pg_export_snapshot()`** lets multiple connections read the same MVCC snapshot, so a parallel
-  scan is genuinely atomic.
+- **Cursor-based portal scans** give a streaming path with bound parameters and no full
+  result-set buffering.
 - **`pg_stat_activity.xact_start`** lets us compute an exact — not heuristic — safe high watermark.
+- Deterministic collations (`C` / `POSIX`) make `Exact` fidelity comparisons possible.
 
 ---
 
 ## 2. Extraction path
 
-### 2.1 Binary COPY (removed September 2026 — spec retained)
-
-> The implementation below was removed to slim the dependency tree (`tokio-postgres` and
-> friends): it had no callers — every scan path used §2.2 — and no tests. Restorable from
-> git history. What follows is kept as the spec for reintroducing it, since the format
-> knowledge is the expensive part.
-
-```sql
-COPY (
-  SELECT order_id, user_id, amount, updated_at
-  FROM   public.orders
-  WHERE  updated_at > $1 AND updated_at <= $2
-) TO STDOUT (FORMAT binary)
-```
-
-`tokio-postgres` exposes this as `BinaryCopyOutStream`. `COPY` skips per-row `DataRow` message
-framing overhead and result-set metadata, and the binary format needs no text parsing — a
-`timestamp` arrives as an 8-byte integer, not as `2026-09-04 15:30:00.123456+07`, which for
-timestamp- and numeric-heavy tables is the difference between decoding being free and decoding
-being the bottleneck.
-
-The stream format is a fixed header (`PGCOPY\n\377\r\n\0`, a flags word, and a header-extension
-length), then per tuple a big-endian `int16` field count followed by, per field, a big-endian
-`int32` byte length (`-1` meaning null) and that many bytes. We decode field bytes directly into
-Arrow builders.
-
-`COPY` has one real limitation: **no bound parameters**. The window bounds above must be literals in
-the `COPY` text. Since [pushdown](../pushdown.md#2-expression-translation) mandates bound
-parameters, the connector resolves this by preparing the inner `SELECT` as a server-side statement
-with parameters and having `COPY` reference it, or — where that is not possible — by rendering only
-*typed, connector-formatted* literals (never user strings) into the `COPY` body. Arbitrary
-user-supplied string literals force a fallback to §2.2.
-
-### 2.2 Extended query protocol with a portal (the only path)
+### 2.1 Extended query protocol with a portal (the only path)
 
 ```rust
 let stmt = client.prepare_typed(&sql, &param_types).await?;
@@ -64,43 +29,41 @@ let stream = client.query_raw(&stmt, params).await?;   // streams, does not buff
 ```
 
 `query_raw` returns a `RowStream` backed by a portal, so rows arrive incrementally rather than the
-whole result set materializing client-side. Slightly more per-row overhead than `COPY`, but it
-supports bound parameters and, importantly, it composes with the transaction and snapshot handling
-below. Incremental runs — which are dominated by a small, selective window — default to this path;
-`COPY` is used for backfills, snapshots, and any run whose estimated row count exceeds
-`copy_threshold` (default 1,000,000).
+whole result set materializing client-side. The cursor-based path supports bound parameters and
+composes with transaction and snapshot handling. All scan paths use this portal-based approach.
 
-Result format is requested as **binary** in both paths. Text format would mean parsing every
-numeric and timestamp from a string.
+Result format is requested as **text** via the extended query protocol; sqlx handles decoding of
+text-encoded values into Rust types. Binary format is not used (the `tokio-postgres` binary
+decoder was removed when the COPY path was removed).
 
 ---
 
 ## 3. Type mapping
 
-| PostgreSQL | Arrow | Notes |
-| --- | --- | --- |
-| `bool` | `Boolean` | 1 byte on the wire |
-| `int2` / `int4` / `int8` | `Int16` / `Int32` / `Int64` | Big-endian |
-| `float4` / `float8` | `Float32` / `Float64` | IEEE-754; `NaN` ordering differs from Arrow — see [pushdown §3.3](../pushdown.md#33-numeric-type-width-and-precision) |
-| `numeric(p,s)`, p ≤ 38 | `Decimal128(p, s)` | Wire format is base-10000 digit groups; must be reassembled |
-| `numeric`, unconstrained | `Decimal128(38, 9)` by default | Overflow → error or null per `on_unrepresentable`. `NaN`/`±Infinity` sign words map to null |
-| `text`, `varchar`, `char`, `name` | `Utf8` | Collation recorded in `ColumnMeta`; drives `Exact` vs `Inexact` |
-| `citext` | `Utf8` | Comparisons are always `Inexact` |
-| `bytea` | `Binary` | |
-| `uuid` | `FixedSizeBinary(16)` | `Utf8` optionally, via `uuid_as_string` |
-| `date` | `Date32` | Wire value is **days since 2000-01-01**; add 10,957 for the Unix epoch |
-| `timestamp` | `Timestamp(Microsecond, None)` | **Microseconds since 2000-01-01**; add 946,684,800,000,000 |
-| `timestamptz` | `Timestamp(Microsecond, "UTC")` | Same encoding; already UTC internally |
-| `time` | `Time64(Microsecond)` | Microseconds since midnight |
-| `timetz` | `Utf8` | An offset-carrying time has no clean Arrow type; discouraged upstream |
-| `interval` | `Interval(MonthDayNano)` | Wire is (int64 µs, int32 days, int32 months) |
-| `json` | `Utf8` | Plain UTF-8 |
-| `jsonb` | `Utf8` | **Leading version byte (`0x01`) precedes the text in binary format — strip it** |
-| enum types | `Dictionary(Int32, Utf8)` | Labels read from `pg_enum` at plan time |
-| `T[]` | `List(map(T))` | Binary array header: ndim, flags, element OID, dims, lower bounds. Only 1-D arrays with lower bound 1 are supported; anything else errors |
-| `money` | error by default | Scale depends on the server's `lc_monetary`. Explicit `cast_to` required |
-| range, `hstore`, `tsvector`, geometry | error | No mapping; use `cast_to = "utf8"` to take the text form deliberately |
-| `oid`, `xid`, `cid` | `UInt32` | |
+| PostgreSQL | Arrow | Status | Notes |
+| --- | --- | --- | --- |
+| `bool` | `Boolean` | **Implemented** | 1 byte on the wire |
+| `int2` / `int4` / `int8` | `Int16` / `Int32` / `Int64` | **Implemented** | Big-endian |
+| `float4` / `float8` | `Float32` / `Float64` | **Implemented** | IEEE-754; `NaN` ordering differs from Arrow — see [pushdown §3.3](../pushdown.md#33-numeric-type-width-and-precision) |
+| `numeric(p,s)`, p ≤ 38 | `Decimal128(p, s)` | **Implemented** | Text protocol; sqlx decodes to BigDecimal |
+| `numeric`, unconstrained | `Decimal128(38, 10)` by default | **Implemented** | Overflow → error or null. `NaN`/`±Infinity` sign words map to null |
+| `text`, `varchar`, `char`, `name` | `Utf8` | **Implemented** | Collation recorded in `ColumnMeta`; drives `Exact` vs `Inexact` |
+| `citext` | `Utf8` | **NOT IMPLEMENTED** | Comparisons would always be `Inexact` |
+| `bytea` | `Binary` | **Implemented** | |
+| `uuid` | `Utf8` | **Implemented** | Text protocol (not `FixedSizeBinary(16)`) |
+| `date` | `Date32` | **Implemented** | Unix epoch days; text protocol handles epoch |
+| `timestamp` | `Timestamp(Microsecond, None)` | **Implemented** | Text protocol; epoch handled by sqlx |
+| `timestamptz` | `Timestamp(Microsecond, "UTC")` | **Implemented** | Text protocol; epoch handled by sqlx |
+| `time` | — | **NOT IMPLEMENTED** | |
+| `timetz` | — | **NOT IMPLEMENTED** | |
+| `interval` | — | **NOT IMPLEMENTED** | |
+| `json` | `Utf8` | **Implemented** | Plain UTF-8 |
+| `jsonb` | `Utf8` | **Implemented** | Text protocol; no binary version byte |
+| enum types | `Utf8` | **Implemented** | `::text` label cast; not `Dictionary(Int32, Utf8)` |
+| `T[]` | — | **NOT IMPLEMENTED** | Only `text[]` supported via text protocol |
+| `money` | — | **NOT IMPLEMENTED** | No `cast_to` config |
+| range, `hstore`, `tsvector`, geometry | — | **NOT IMPLEMENTED** | No `cast_to` config |
+| `oid`, `xid`, `cid` | — | **NOT IMPLEMENTED** | |
 
 Two encodings deserve extra care in review because they are the ones most likely to be subtly wrong:
 
@@ -149,31 +112,7 @@ boundaries without a `min`/`max` scan.
 
 ## 5. Consistency and watermark computation
 
-### 5.1 Exported snapshots for atomic parallel scans
-
-Postgres is the only one of the two connectors that can make a parallel scan atomic:
-
-```sql
--- Coordinator connection
-BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
-SELECT pg_export_snapshot();          -- e.g. '00000003-0000001B-1'
-
--- Each worker connection
-BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
-SET TRANSACTION SNAPSHOT '00000003-0000001B-1';
-COPY (SELECT … WHERE ctid >= '(0,0)' AND ctid < '(12500,0)') TO STDOUT (FORMAT binary);
-```
-
-Every partition then sees exactly the same MVCC snapshot, so the union of partitions is a
-consistent point-in-time read even though it arrived over four connections.
-
-The constraint: the exporting transaction **must stay open** until every worker has executed
-`SET TRANSACTION SNAPSHOT`. That is a long-lived read-only transaction, which holds back the xmin
-horizon and therefore delays vacuum. The connector caps the whole snapshot scan with
-`snapshot_max_duration` (default 30 minutes) and aborts rather than exceeding it, because a stuck
-extraction job that prevents vacuum on a busy table is a genuine production incident.
-
-### 5.2 The safe high watermark
+---
 
 The exact form of the [commit-skew mitigation](../incremental-extraction.md#31-commit-time-vs-updated_at-skew--the-primary-hazard):
 
@@ -192,29 +131,6 @@ Requires `pg_read_all_stats` membership (or superuser) to see other roles' `xact
 the column is NULL for other sessions and the query silently returns `now()`. The connector
 **verifies the privilege at startup** and falls back to a fixed `safety_lag` with a loud warning if
 it is missing — a silent downgrade here means silent data loss later.
-
-### 5.3 Reading from a hot standby
-
-Two things change on a replica, and both are traps.
-
-**The watermark must be bounded by replay progress, not by the clock.** A standby's `now()` is
-current wall-clock time, but its *data* is as of the last replayed transaction. Setting
-`hi = now()` on a replica advances the watermark past rows that have not arrived yet — they are
-then never re-read. The correct bound:
-
-```sql
-SELECT LEAST(pg_last_xact_replay_timestamp(), now() - INTERVAL '1 second');
-```
-
-This is exact and it makes replica reads safe. It is also the single most valuable line in this
-document.
-
-**Queries get cancelled by recovery conflicts.** A long read on a standby can be killed with
-`canceling statement due to conflict with recovery` when replay needs to remove rows the query can
-still see. Mitigations: enable `hot_standby_feedback` on the standby (at the cost of bloat on the
-primary), raise `max_standby_streaming_delay`, or keep scans short. The connector classifies error
-code `40001` on a standby as retryable and retries the whole partition with backoff, because a
-partial partition is discardable by design.
 
 ---
 
@@ -251,16 +167,14 @@ GRANT pg_read_all_stats TO rel_extract;   -- for the exact safe high watermark (
 
 ## 7. Partitioning strategies
 
-| Strategy | Predicate | When |
-| --- | --- | --- |
-| `physical` | `ctid >= '(a,0)' AND ctid < '(b,0)'` | Best for full scans inside an exported snapshot. Bounds derived from `relpages`; evenly sized regardless of key distribution. Only valid within one snapshot, since `ctid` moves on update/vacuum |
-| `keyset` | `pk >= $1 AND pk < $2` | Default. Bounds from `histogram_bounds`, which handles non-uniform keys |
-| `native` | one partition per child table of a declarative partitioned table | Best when it applies; aligns with the source's own pruning |
-| `modulo` | `hashint8(pk) % n = i` | Last resort; forces a full scan per partition |
+| Strategy | Predicate | Status | When |
+| --- | --- | --- | --- |
+| `ctid` | `ctid >= '(a,0)' AND ctid < '(b,0)'` | **Implemented** | Evenly sized physical page ranges; bounds from `relpages`. **Only valid within a single snapshot** (concurrent updates move rows between ranges). Exported snapshots not yet implemented. |
+| `keyset` | `pk >= $1 AND pk < $2` | **Implemented (default)** | Bounds from `histogram_bounds`, handles non-uniform key distribution |
+| `native` | one partition per child table of a declarative partitioned table | **NOT IMPLEMENTED** | Aligns with source's own pruning |
+| `modulo` | `hashint8(pk) % n = i` | **NOT IMPLEMENTED** | Last resort; forces a full scan per partition |
 
-`ctid` ranging is genuinely fast and is the reason full snapshots on Postgres parallelize well — but
-it is only correct under the exported snapshot of §5.1. Outside one, concurrent updates move rows
-between ranges and a row can be read twice or not at all.
+`ctid` ranging requires an exported snapshot for correctness — outside one, concurrent updates move rows between ranges. Exported snapshots are not yet implemented.
 
 ---
 

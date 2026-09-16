@@ -48,7 +48,7 @@ cached binary. CI caches this directory too (see §5).
 | Rule | If it needs a pool, it doesn't belong here | If it can be a fixture, it doesn't belong here |
 | Skip behavior | N/A | **None.** Every test gets a real database or fails |
 
-## 2. Unit tests — 103 tests across 20 files, zero database access
+## 2. Unit tests — 109 tests across 18 files, zero database access
 
 All of these run under plain `cargo test --lib` in milliseconds; none opens a network
 connection. Breakdown by module:
@@ -175,14 +175,10 @@ trip is covered by `distributed::plan_codec::tests::test_round_trip` and
   test proving `PushdownPolicy::Strict` keeps a predicate in Arrow but still returns
   exactly the same rows `always` would — i.e. the paranoid mode is *correct*, not just
   quiet. `pg_pushdown.rs` currently only differentials `always` vs `never`.
-- **`main.rs` module duplication (hygiene debt, pre-existing)**: `main.rs` still declares
-  `mod connector; mod types; ...` instead of `use rust_ballista_extraction_layer::...`, so
-  the lib crate and the bin crate each compile (and `cargo test --bins` runs) their own
-  copy of every unit test except `engine` (which `main.rs` doesn't declare at all). Net
-  effect: 103 unit tests under the lib target, 101 under the bin target — the same tests,
-  counted twice, plus a second copy of every dead-code/unused-import warning. Migrating
-  `main.rs` to import from the lib crate and deleting its `mod` declarations is small and
-  mechanical whenever someone picks it up.
+- **`main.rs` module duplication (resolved)**: `main.rs` now uses `use rust_ballista_extraction_layer::...`
+  imports instead of re-declaring `mod` blocks, so the lib crate and bin crate share the same
+  compiled code. Unit tests run once under the lib target (109 tests); `cargo test --bins`
+  runs the integration/e2e tests only.
 - **Coverage gate (optional, not started)**: `cargo-tarpaulin` with a ratchet (fail only on
   a coverage *drop*, never an absolute threshold).
 - **Property/`proptest` suites and hostile-value differential at scale**: the roadmap's

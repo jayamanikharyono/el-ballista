@@ -18,7 +18,7 @@ The whole vertical slice, narrow. One connector, no sink implementation — a jo
 Arrow RecordBatches come out, a checkpoint advances. Sink functionality is handled by DataFusion
 or Ballista (ParquetWriter, CSVWriter, etc.) or by the orchestrator.
 
-- PostgreSQL connector: schema resolution, binary `COPY` and portal-based scans, type mapping,
+- PostgreSQL connector: schema resolution, **cursor-based portal scans**, type mapping,
   streaming decode into Arrow builders
 - Incremental extraction in `timestamp` mode with the exact
   [safe high watermark](connectors/postgres.md#52-the-safe-high-watermark)
@@ -58,7 +58,7 @@ let batches = df.collect().await?;
 - `SourceAwarePushdown` optimizer rule with statistics collection, `EXPLAIN`-based estimation, and
   the `always` / `never` / `cost_based` / `hinted` policy modes
 - `rel plan --explain` printing per-operator push/keep decisions and their reasoning
-- Parallel scan: `keyset` and `ctid` strategies under exported snapshots
+- Parallel scan: `keyset` and `ctid` partition strategies (exported snapshots for atomic parallel scans **deferred**)
 - Backfill orchestration with chunking and a separate checkpoint namespace
 - Arrow RecordBatch output for consumption by DataFusion writers or orchestrator
 
@@ -107,8 +107,7 @@ correctness and memory efficiency.
 
 ## Phase 4 — Distributed Execution
 
-Only when single-node throughput is genuinely the bottleneck, which for the target workloads it may
-never be.
+Distributed execution is applied when single-node throughput is the bottleneck.
 
 ```
                   Scheduler
@@ -124,9 +123,7 @@ never be.
 ```
 
 Ballista adds a scheduler and workers over DataFusion, using Arrow IPC for shuffle. It tracks
-DataFusion's version numbering and is actively developed, with current work focused on closing the
-gap with single-node DataFusion, adaptive query execution, and operational predictability — which
-is a fair description of "promising, still maturing", and a good reason to keep this phase last.
+DataFusion's version numbering.
 
 - Ballista deployment: scheduler, workers, and the distribution of source partitions across them
 - Serializable physical plans, including our `SourceScanExec`
@@ -152,7 +149,7 @@ is the right second connector because it is *worse* at everything Postgres does 
 export, no exportable snapshot, opt-in histograms, unrepresentable values. If the SPI survives
 MySQL, it will survive anything.
 
-- MySQL connector per [its detailed plan](connectors/mysql.md), including:
+**NOT YET IMPLEMENTED.** MySQL connector per [its detailed plan](connectors/mysql.md), including:
   - Collation fidelity rules (binary vs. `utf8_unicode_ci` vs. `utf8mb4_general_ci`)
   - Zero-date handling (`0000-00-00` → NULL / error / custom mapping)
   - Replica lag bounding (GTIDs, `Seconds_Behind_Master` monitoring)
@@ -160,7 +157,7 @@ MySQL, it will survive anything.
   - Streaming LIMIT-OFFSET pagination instead of exported snapshots
   - Type mapping for MySQL-specific types (ENUM, SET, JSON, GEOMETRY)
 
-**Exit criteria.** The MySQL differential correctness suite passes, including collation fidelity
+**Exit criteria (when implemented).** The MySQL differential correctness suite passes, including collation fidelity
 (`_ci`, `_cs`, `_bin`). Zero-date handling is correctly configurable. Replica lag is bounded and
 monitored. The SPI required no breaking change to accommodate MySQL — or if it did, the change is
 documented as a lesson.
@@ -183,28 +180,23 @@ not part of this project's scope:
 | Checkpoint finalization | Orchestrator or external checkpoint service |
 
 ### Other Out of Scope Items
-| Item | Why it is out of scope |
-| --- | --- |
-| [Python wrapper](python-bindings.md) | Not part of core extraction engine. Placeholder design exists so the Rust API stays bindable |
-| Cross-source joins | Better handled by orchestrator or DataFusion, not part of extraction scope |
-| Log-based CDC ([Postgres](connectors/postgres.md#8-future-logical-replication-cdc), [MySQL](connectors/mysql.md#9-future-binlog-cdc)) | Replication slots and binlog retention are operational footguns |
-| Aggregate and join pushdown | High translation risk, low value for extraction workloads |
-| Additional connectors (ScyllaDB, MongoDB, SQL Server) | Wait for second connector proof of concept (MySQL) first |
-| Web UI | Orchestrators provide their own. CLI and metrics are the interface |
-| Object store source (Parquet/CSV) | DataFusion handles this natively |
+| Item | Status | Why it is out of scope |
+| --- | --- | --- |
+| [Python wrapper](python-bindings.md) | **NOT IMPLEMENTED** (placeholder design) | Not part of core extraction engine. Placeholder design exists so the Rust API stays bindable |
+| Cross-source joins | **NOT IMPLEMENTED** | Better handled by orchestrator or DataFusion, not part of extraction scope |
+| Log-based CDC ([Postgres](connectors/postgres.md#8-future-logical-replication-cdc), [MySQL](connectors/mysql.md#9-future-binlog-cdc)) | **NOT IMPLEMENTED** | Replication slots and binlog retention are operational footguns |
+| Aggregate and join pushdown | **NOT IMPLEMENTED** | High translation risk, low value for extraction workloads |
+| Additional connectors (ScyllaDB, MongoDB, SQL Server) | **NOT IMPLEMENTED** | Wait for second connector proof of concept (MySQL) first |
+| Web UI | **NOT IMPLEMENTED** | Orchestrators provide their own. CLI and metrics are the interface |
+| Object store source (Parquet/CSV) | **NOT IMPLEMENTED** | DataFusion handles this natively |
+| Native / modulo partitioning | **NOT IMPLEMENTED** | Keyset and ctid only |
+| Sinks (Parquet/CSV/GCS/BigQuery) | **NOT IMPLEMENTED** | Delegated to DataFusion/Ballista/orchestrator |
+| Metrics/observability | **NOT IMPLEMENTED** | Structured logging only; no metrics endpoint |
 
 ---
 
 ## What would make this project fail
 
-Worth writing down, since these are the ways a hobby project like this quietly dies:
-
-- **Scope creep into building Spark.** The moment work starts on a scheduler, resource manager, or
-  cluster UI, the project is doomed. Everything in that category is either DataFusion's job,
-  Ballista's job, or the orchestrator's job.
-- **Pushdown that is fast and wrong.** A silent correctness bug destroys trust permanently, and
-  it is trivially easy to introduce here. This is why fidelity rules and the differential test
-  suite are Phase 1 work rather than a later hardening pass.
-- **Becoming a sink framework.** The moment work starts on Parquet writers, BigQuery integration, or
-  S3 upload, this project loses focus. Sinks are DataFusion's job, Ballista's job, or the
-  orchestrator's job — not ours. We extract to Arrow and stop.
+- **Scope creep into building Spark.** Scheduler, resource manager, and cluster UI are DataFusion's, Ballista's, or the orchestrator's responsibility.
+- **Incorrect pushdown.** A correctness bug in pushdown produces wrong results. Fidelity rules and the differential test suite address this.
+- **Becoming a sink framework.** Parquet writers, BigQuery integration, or S3 upload are DataFusion's, Ballista's, or the orchestrator's responsibility. This project extracts to Arrow and stops.

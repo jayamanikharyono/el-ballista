@@ -62,4 +62,7 @@ jobs:
         run: cargo test --lib --bins
 
       - name: cargo test — integration + e2e (self-provisioned Postgres, no container)
-        run: cargo test --tests
+        timeout-minutes: 20
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: cargo test --tests -- --test-threads=1 --nocapture

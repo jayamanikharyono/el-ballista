@@ -49,7 +49,7 @@ impl E2E {
                 user: self.db.user.clone(),
                 password_env: TEST_PASSWORD_ENV.to_string(),
                 database: self.db.database.clone(),
-                pool_max: 4,
+                pool_max: 16,
                 statement_timeout_ms: 300_000,
                 application_name: "relex-e2e".to_string(),
                 schema: self.db.schema.clone(),

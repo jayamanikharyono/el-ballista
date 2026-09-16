@@ -18,8 +18,10 @@ use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 
-use crate::connector::postgres::table_provider::{PostgresTableProvider, PostgresTableProviderModel};
 use super::plan_codec::POSTGRES_SCAN_MAGIC;
+use crate::connector::postgres::table_provider::{
+    PostgresTableProvider, PostgresTableProviderModel,
+};
 
 #[derive(Debug)]
 pub struct PostgresLogicalCodec {
@@ -103,7 +105,8 @@ impl LogicalExtensionCodec for PostgresLogicalCodec {
 
             Ok(Arc::new(provider))
         } else {
-            self.default.try_decode_table_provider(buf, table_ref, schema, ctx)
+            self.default
+                .try_decode_table_provider(buf, table_ref, schema, ctx)
         }
     }
 }

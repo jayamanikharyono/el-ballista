@@ -16,10 +16,13 @@
 mod common;
 
 use chrono::{Duration, TimeZone, Utc};
-use common::{TestDb, TEST_PASSWORD_ENV};
+use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::checkpoint::{
-    json_store::JsonCheckpointStore, CheckpointStore, JobKey, RunStats,
+    CheckpointStore, JobKey, RunStats, json_store::JsonCheckpointStore,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
@@ -39,8 +42,17 @@ impl E2E {
     }
 
     fn job(&self, partitions: usize) -> JobConfig {
+        // Unique pool per test invocation to avoid cross-test pool sharing when
+        // 4 tests run sequentially in the same binary (global registry is per-process).
+        // Budget = pool_max / workers, so step by workers*2 to guarantee unique budget.
+        let n = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pool_max = 32 + (n * 4) as u32;
+        self.job_with_pool(partitions, pool_max)
+    }
+
+    fn job_with_pool(&self, partitions: usize, pool_max: u32) -> JobConfig {
         JobConfig {
-            job_id: "e2e".to_string(),
+            job_id: format!("e2e-{}", pool_max),
             table: "hostile".to_string(),
             columns: None,
             source: SourceConfig {
@@ -49,9 +61,9 @@ impl E2E {
                 user: self.db.user.clone(),
                 password_env: TEST_PASSWORD_ENV.to_string(),
                 database: self.db.database.clone(),
-                pool_max: 4,
+                pool_max,
                 statement_timeout_ms: 300_000,
-                application_name: "relex-e2e".to_string(),
+                application_name: format!("relex-e2e-{}", pool_max),
                 schema: self.db.schema.clone(),
             },
             incremental: IncrementalConfig {
@@ -92,9 +104,13 @@ impl E2E {
 
     /// Direct-from-Postgres expected ids for a predicate (the oracle).
     async fn expected_ids(&self, pred: &str) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
-        let sql = format!("SELECT id FROM {}.hostile WHERE {} ORDER BY id", self.db.schema, pred);
-        let rows: Vec<(i64,)> =
-            sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str())).fetch_all(&self.db.pool).await?;
+        let sql = format!(
+            "SELECT id FROM {}.hostile WHERE {} ORDER BY id",
+            self.db.schema, pred
+        );
+        let rows: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_all(&self.db.pool)
+            .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
@@ -137,7 +153,10 @@ async fn e2e_incremental_extraction() -> Result<(), Box<dyn std::error::Error>> 
 
     // First extraction: everything through 2024-01-04, then commit the watermark.
     let first = e
-        .remote_ids(&ctx, "SELECT id FROM hostile WHERE updated_at <= '2024-01-04T00:00:00Z'")
+        .remote_ids(
+            &ctx,
+            "SELECT id FROM hostile WHERE updated_at <= '2024-01-04T00:00:00Z'",
+        )
         .await?;
     assert_eq!(first, vec![1, 2, 3, 4]);
 
@@ -184,10 +203,18 @@ async fn e2e_incremental_extraction() -> Result<(), Box<dyn std::error::Error>> 
     // rows" -- it's the full post-watermark set, which must match Postgres exactly (the
     // real checkpoint-semantics proof is the two targeted checks below).
     let second = e
-        .remote_ids(&ctx, "SELECT id FROM hostile WHERE updated_at > '2024-01-04T00:00:00Z'")
+        .remote_ids(
+            &ctx,
+            "SELECT id FROM hostile WHERE updated_at > '2024-01-04T00:00:00Z'",
+        )
         .await?;
-    let expected = e.expected_ids("updated_at > '2024-01-04T00:00:00Z'").await?;
-    assert_eq!(second, expected, "must match Postgres exactly: nothing lost or duplicated");
+    let expected = e
+        .expected_ids("updated_at > '2024-01-04T00:00:00Z'")
+        .await?;
+    assert_eq!(
+        second, expected,
+        "must match Postgres exactly: nothing lost or duplicated"
+    );
 
     // The row sitting exactly ON the watermark must be excluded: (lo, hi] is exclusive-lo,
     // inclusive-hi at commit time, but a *new* extraction's lower bound is that same hi,
@@ -202,7 +229,11 @@ async fn e2e_incremental_extraction() -> Result<(), Box<dyn std::error::Error>> 
     // The two rows sharing one timestamp (past the watermark) must both survive: a
     // window boundary must never arbitrarily keep one and drop the other.
     let dup_ids = e.expected_ids("name IN ('n1', 'n2')").await?;
-    assert_eq!(dup_ids.len(), 2, "fixture inserted exactly two duplicate-timestamp rows");
+    assert_eq!(
+        dup_ids.len(),
+        2,
+        "fixture inserted exactly two duplicate-timestamp rows"
+    );
     assert!(
         dup_ids.iter().all(|id| second.contains(id)),
         "both duplicate-timestamp rows must survive the boundary"

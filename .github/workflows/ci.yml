@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, master]
   pull_request:
 
 env:
@@ -62,4 +60,11 @@ jobs:
         run: cargo test --lib --bins
 
       - name: cargo test — integration + e2e (self-provisioned Postgres, no container)
-        run: cargo test --tests
+        timeout-minutes: 25
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: |
+          for t in pg_catalog pg_distributed pg_edge pg_numeric pg_pushdown e2e; do
+            echo "=== cargo test --test $t ==="
+            cargo test --test $t -- --test-threads=1 --nocapture
+          done

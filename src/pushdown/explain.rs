@@ -156,7 +156,9 @@ impl ExplainEstimator {
                 .fetch_one(self.pool.as_ref())
                 .await
                 .map_err(|e| {
-                    ExtractorError::Statistics(format!("EXPLAIN failed for {schema_name}.{table_name}: {e}"))
+                    ExtractorError::Statistics(format!(
+                        "EXPLAIN failed for {schema_name}.{table_name}: {e}"
+                    ))
                 })?;
 
         parse_explain_json(&row.0.0.to_string())
@@ -167,9 +169,8 @@ impl ExplainEstimator {
 fn parse_explain_json(json_str: &str) -> Result<ExplainEstimate, ExtractorError> {
     use serde_json::Value;
 
-    let parsed: Value = serde_json::from_str(json_str).map_err(|e| {
-        ExtractorError::Statistics(format!("cannot parse EXPLAIN JSON: {}", e))
-    })?;
+    let parsed: Value = serde_json::from_str(json_str)
+        .map_err(|e| ExtractorError::Statistics(format!("cannot parse EXPLAIN JSON: {}", e)))?;
 
     // EXPLAIN output is an array of plans; we care about the first.
     let plan = parsed

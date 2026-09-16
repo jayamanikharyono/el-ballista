@@ -312,7 +312,10 @@ impl JobConfig {
         if bad.is_empty() {
             Ok(())
         } else {
-            Err(AppError::Config(format!("invalid job spec: {}", bad.join("; "))))
+            Err(AppError::Config(format!(
+                "invalid job spec: {}",
+                bad.join("; ")
+            )))
         }
     }
 
@@ -335,15 +338,20 @@ mod tests {
         // The checked-in example spec must always parse: it is what the examples and the
         // runbook invoke. Catches renamed/removed serde fields.
         // Tests run with CWD at the crate root, where examples/ lives.
-        let config =
-            JobConfig::from_file("examples/configs/extract.example.json").unwrap();
+        let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
 
         assert_eq!(config.job_id, "orders_incremental");
         assert_eq!(config.table, "orders");
         assert_eq!(config.resolved_table(), "public.orders");
         assert_eq!(config.source.password_env, "ORDERS_PG_PASSWORD");
         assert_eq!(config.incremental.column, "updated_at");
-        assert!(config.columns.as_ref().unwrap().contains(&"tags".to_string()));
+        assert!(
+            config
+                .columns
+                .as_ref()
+                .unwrap()
+                .contains(&"tags".to_string())
+        );
 
         // Spec blocks absent from older files fall back to defaults.
         assert_eq!(config.pushdown.push, Vec::<String>::new());
@@ -362,8 +370,7 @@ mod tests {
     fn test_from_file_bench_config() {
         // The benchmark job spec must parse too — a missing block here fails inside the
         // container at runtime, where the error is expensive to see.
-        let config =
-            JobConfig::from_file("benchmark/rust/bench-config.json").unwrap();
+        let config = JobConfig::from_file("benchmark/rust/bench-config.json").unwrap();
         assert_eq!(config.table, "orders");
         assert_eq!(config.source.host, "bench-pg");
         assert_eq!(config.execution.batch_size, 64000);

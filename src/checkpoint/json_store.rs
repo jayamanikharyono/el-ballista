@@ -24,14 +24,21 @@ impl JsonCheckpointStore {
         let dir = dir.as_ref().to_path_buf();
 
         fs::create_dir_all(&dir).map_err(|e| {
-            AppError::Checkpoint(format!("cannot create checkpoint dir {}: {e}", dir.display()))
+            AppError::Checkpoint(format!(
+                "cannot create checkpoint dir {}: {e}",
+                dir.display()
+            ))
         })?;
 
         Ok(Self { dir })
     }
 
     fn path_for(&self, key: &JobKey) -> PathBuf {
-        let file_name = format!("{}__{}.json", sanitize(&key.job_id), sanitize(&key.namespace));
+        let file_name = format!(
+            "{}__{}.json",
+            sanitize(&key.job_id),
+            sanitize(&key.namespace)
+        );
         self.dir.join(file_name)
     }
 
@@ -54,17 +61,41 @@ impl JsonCheckpointStore {
 
     fn write_file(&self, key: &JobKey, checkpoint: &Checkpoint) -> Result<(), AppError> {
         let path = self.path_for(key);
-        let tmp_path = path.with_extension("json.tmp");
+        // Unique tmp avoids last-writer-wins collision when concurrent `write_file` calls
+        // race on the same job (last `rename` wins, but no torn JSON). `fsync` + dir `fsync`
+        // makes the rename durable before the caller considers the commit done.
+        let tmp_name = format!(
+            "{}.tmp.{}.{}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("checkpoint.json"),
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let tmp_path = self.dir.join(tmp_name);
 
         let text = serde_json::to_string_pretty(checkpoint)
             .map_err(|e| AppError::Checkpoint(format!("cannot serialize checkpoint: {e}")))?;
 
-        fs::write(&tmp_path, text)
-            .map_err(|e| AppError::Checkpoint(format!("cannot write {}: {e}", tmp_path.display())))?;
+        fs::write(&tmp_path, &text).map_err(|e| {
+            AppError::Checkpoint(format!("cannot write {}: {e}", tmp_path.display()))
+        })?;
+
+        // Durability: sync file contents before rename.
+        if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp_path) {
+            let _ = f.sync_all();
+        }
 
         fs::rename(&tmp_path, &path).map_err(|e| {
+            // Best-effort cleanup of orphaned tmp on cross-device rename failure.
+            let _ = fs::remove_file(&tmp_path);
             AppError::Checkpoint(format!("cannot finalize {}: {e}", path.display()))
         })?;
+
+        // Durability: sync directory entry so rename survives crash on ext4.
+        if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.dir) {
+            let _ = dir.sync_all();
+        }
 
         Ok(())
     }
@@ -72,7 +103,13 @@ impl JsonCheckpointStore {
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -88,24 +125,23 @@ impl CheckpointStore for JsonCheckpointStore {
         let now = Utc::now();
         let existing = self.read_file(key)?;
 
-        if let Some(current) = &existing {
-            if current.state == RunState::Running {
-                if let Some(expires) = current.lease_expires_at {
-                    if expires > now {
-                        return Err(AppError::Checkpoint(format!(
-                            "job '{}' namespace '{}' is already running (run_id={:?}, lease expires {})",
-                            key.job_id, key.namespace, current.run_id, expires
-                        )));
-                    }
-
-                    log::warn!(
-                        "reclaiming expired lease for job '{}' namespace '{}' (previous run_id={:?})",
-                        key.job_id,
-                        key.namespace,
-                        current.run_id
-                    );
-                }
+        if let Some(current) = &existing
+            && current.state == RunState::Running
+            && let Some(expires) = current.lease_expires_at
+        {
+            if expires > now {
+                return Err(AppError::Checkpoint(format!(
+                    "job '{}' namespace '{}' is already running (run_id={:?}, lease expires {})",
+                    key.job_id, key.namespace, current.run_id, expires
+                )));
             }
+
+            log::warn!(
+                "reclaiming expired lease for job '{}' namespace '{}' (previous run_id={:?})",
+                key.job_id,
+                key.namespace,
+                current.run_id
+            );
         }
 
         let checkpoint = Checkpoint {
@@ -131,15 +167,35 @@ impl CheckpointStore for JsonCheckpointStore {
         next: DateTime<Utc>,
         stats: RunStats,
     ) -> Result<(), AppError> {
-        let current = self
-            .read_file(key)?
-            .ok_or_else(|| AppError::Checkpoint(format!("no checkpoint to commit for job '{}'", key.job_id)))?;
+        let current = self.read_file(key)?.ok_or_else(|| {
+            AppError::Checkpoint(format!("no checkpoint to commit for job '{}'", key.job_id))
+        })?;
 
         if current.run_id != Some(run_id) {
             return Err(AppError::Checkpoint(format!(
                 "lost the lease for job '{}' (held by {:?}, tried to commit as {})",
                 key.job_id, current.run_id, run_id
             )));
+        }
+
+        // Monotonicity: a stale or clamped `next` must not rewind the watermark.
+        if let Some(prev) = current.watermark_value
+            && next < prev
+        {
+            return Err(AppError::Checkpoint(format!(
+                "watermark regression for job '{}': current {} -> next {}",
+                key.job_id, prev, next
+            )));
+        }
+
+        // Lease expiry: committing with an expired lease is a split-brain signal.
+        if let Some(expires) = current.lease_expires_at
+            && Utc::now() > expires
+        {
+            log::warn!(
+                "committing watermark for job '{}' with expired lease (expired at {})",
+                key.job_id, expires
+            );
         }
 
         log::info!(
@@ -320,7 +376,10 @@ mod tests {
         let run_id = Uuid::new_v4();
 
         // Abandoning a job that was never acquired is a no-op, not an error.
-        store.abandon(&key, run_id, "nothing to abandon").await.unwrap();
+        store
+            .abandon(&key, run_id, "nothing to abandon")
+            .await
+            .unwrap();
 
         store
             .acquire(&key, run_id, Duration::minutes(30), "updated_at")

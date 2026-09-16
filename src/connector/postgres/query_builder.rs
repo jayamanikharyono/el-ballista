@@ -1,4 +1,4 @@
-use chrono::{DateTime,Utc};
+use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder};
 
 use crate::types::table_metadata::TableMetadata;
@@ -22,24 +22,15 @@ impl PostgresQueryBuilder {
 
         query.push(" FROM ");
 
-        Self::push_identifier(
-            query,
-            &table.schema_name,
-        );
+        Self::push_identifier(query, &table.schema_name);
 
         query.push(".");
 
-        Self::push_identifier(
-            query,
-            &table.table_name,
-        );
+        Self::push_identifier(query, &table.table_name);
 
         query.push(" WHERE ");
 
-        Self::push_identifier(
-            query,
-            timestamp_column,
-        );
+        Self::push_identifier(query, timestamp_column);
 
         query.push(" > ");
 
@@ -47,64 +38,43 @@ impl PostgresQueryBuilder {
 
         query.push(" AND ");
 
-        Self::push_identifier(
-            query,
-            timestamp_column,
-        );
+        Self::push_identifier(query, timestamp_column);
 
         query.push(" <= ");
 
         query.push_bind(hi);
     }
 
-    pub(crate) fn push_columns(
-        query: &mut QueryBuilder<Postgres>,
-        table: &TableMetadata,
-    ) {
+    pub(crate) fn push_columns(query: &mut QueryBuilder<Postgres>, table: &TableMetadata) {
         for (index, column) in table.columns.iter().enumerate() {
             if index > 0 {
                 query.push(", ");
             }
 
-            Self::push_identifier(
-                query,
-                &column.column_name,
-            );
+            Self::push_identifier(query, &column.column_name);
 
             if column.data_type == "USER-DEFINED" {
                 query.push("::text AS ");
 
-                Self::push_identifier(
-                    query,
-                    &column.column_name,
-                );
+                Self::push_identifier(query, &column.column_name);
             }
         }
     }
 
     /// Builds `SELECT <cols> FROM <table>` — extracts all rows without date filtering.
     /// Used for full table extracts where no time window is needed.
-    pub fn build_full_table(
-        query: &mut QueryBuilder<Postgres>,
-        table: &TableMetadata,
-    ) {
+    pub fn build_full_table(query: &mut QueryBuilder<Postgres>, table: &TableMetadata) {
         query.push("SELECT ");
 
         Self::push_columns(query, table);
 
         query.push(" FROM ");
 
-        Self::push_identifier(
-            query,
-            &table.schema_name,
-        );
+        Self::push_identifier(query, &table.schema_name);
 
         query.push(".");
 
-        Self::push_identifier(
-            query,
-            &table.table_name,
-        );
+        Self::push_identifier(query, &table.table_name);
     }
 
     /// Builds `SELECT <cols> FROM <table> WHERE <partition_col> >= :lo AND <partition_col> < :hi`
@@ -122,24 +92,15 @@ impl PostgresQueryBuilder {
 
         query.push(" FROM ");
 
-        Self::push_identifier(
-            query,
-            &table.schema_name,
-        );
+        Self::push_identifier(query, &table.schema_name);
 
         query.push(".");
 
-        Self::push_identifier(
-            query,
-            &table.table_name,
-        );
+        Self::push_identifier(query, &table.table_name);
 
         query.push(" WHERE ");
 
-        Self::push_identifier(
-            query,
-            partition_column,
-        );
+        Self::push_identifier(query, partition_column);
 
         query.push(" >= ");
 
@@ -147,20 +108,14 @@ impl PostgresQueryBuilder {
 
         query.push(" AND ");
 
-        Self::push_identifier(
-            query,
-            partition_column,
-        );
+        Self::push_identifier(query, partition_column);
 
         query.push(" < ");
 
         query.push_bind(hi);
     }
 
-    pub(crate) fn push_identifier(
-        query: &mut QueryBuilder<Postgres>,
-        identifier: &str,
-    ) {
+    pub(crate) fn push_identifier(query: &mut QueryBuilder<Postgres>, identifier: &str) {
         query.push("\"");
         query.push(identifier.replace('"', "\"\""));
         query.push("\"");
@@ -270,7 +225,9 @@ mod tests {
         PostgresQueryBuilder::build_full_table(&mut qb, &table);
 
         assert!(
-            qb.sql().as_str().contains(r#"SELECT "status"::text AS "status""#),
+            qb.sql()
+                .as_str()
+                .contains(r#"SELECT "status"::text AS "status""#),
             "enum column must cast: {}",
             qb.sql().as_str()
         );

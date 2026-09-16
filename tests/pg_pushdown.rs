@@ -8,7 +8,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{TestDb, TEST_PASSWORD_ENV};
+use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,

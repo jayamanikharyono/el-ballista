@@ -1,9 +1,8 @@
 # Incremental Extraction
 
-Extracting *changed* rows instead of all rows is the operational point of this project. It is also
-where the subtle data-loss bugs live. This document specifies the watermark modes, the checkpoint
-store, the commit protocol, and — at length — the failure modes that a naive
-`WHERE updated_at > :last_run` implementation walks straight into.
+This document specifies the incremental extraction modes, the checkpoint store, the commit protocol, and the failure modes for watermark-based extraction.
+
+The extraction layer is source-aware and outputs native Arrow on DataFusion/Ballista; incremental extraction is one of the extraction patterns it supports.
 
 ---
 
@@ -85,10 +84,9 @@ transaction *commits*. These are not the same instant, and the gap is unbounded.
            order 42 is never seen again. Silently lost.
 ```
 
-This is worse in Postgres than it looks, because `now()` / `CURRENT_TIMESTAMP` return the
+This is worse than it looks, because Postgres `now()` / `CURRENT_TIMESTAMP` return the
 *transaction start* time, so a transaction open for ten minutes stamps every row it writes with a
-timestamp ten minutes in the past. MySQL's `CURRENT_TIMESTAMP` is statement-start time, which
-narrows but does not close the gap.
+timestamp ten minutes in the past.
 
 **Mitigation 1 — safety lag (default, always on).** Never advance the watermark to "now". Clamp it:
 
@@ -121,10 +119,6 @@ fallback triggers — because silently downgrading a correctness mechanism is no
 (A `check_pg_read_all_stats_privilege` helper exists for a once-per-startup check, but no caller
 wires it up yet, so today the warning fires per fallback, not once at startup.)
 
-MySQL's closest equivalent is `information_schema.INNODB_TRX.trx_started`, which covers InnoDB
-transactions that have acquired a transaction ID. It is a weaker guarantee than the Postgres query
-— see [the MySQL connector doc](connectors/mysql.md#5-consistency-and-watermark-anchoring).
-
 **Mitigation 3 — clamp to observed data.** After reading, set the committed checkpoint to
 `min(hi, max(updated_at) observed)`. This prevents the watermark from racing ahead of real data
 during idle periods, so a burst of late-committing rows still falls inside the next window.
@@ -141,7 +135,7 @@ and it is why `log` mode is on the roadmap.
 > ties are rare enough that this has not bitten yet; on a coarse-grained source it would.
 > What follows is the spec for when it does.
 
-MySQL `DATETIME` and `TIMESTAMP` default to **zero fractional-second precision**. A busy table can
+A `DATETIME` with **zero fractional-second precision** on some sources can hold thousands of rows within a single second. A busy table can
 write thousands of rows within a single second. If `hi` lands mid-second, then `updated_at <= hi`
 and the next run's `updated_at > hi` split those rows correctly only if the values are truly
 comparable at that granularity — which, at one-second resolution, they are not.
@@ -217,7 +211,7 @@ the checkpoint store.
 > no sequence-gap handling anywhere in the code. What follows is the hazard analysis for when
 > the mode is built.
 
-Postgres sequences and MySQL `AUTO_INCREMENT` allocate values outside transaction scope. A
+Sequences that allocate values outside transaction scope (e.g. Postgres sequences) can cause a gap: a
 transaction can obtain id 105 and commit *after* one that obtained 106. A run that sets
 `hi = 106` then skips 105 forever — the same hazard as §3.1 with the same shape.
 
@@ -371,7 +365,7 @@ A backfill is the same machinery with an explicit `[from, to]` window instead of
 from the watermark, committed under its own checkpoint namespace:
 
 ```bash
-cargo run -- backfill --config <path> --namespace <name> \
+cargo run --bin rust-ballista-extraction-layer -- backfill --config <path> --namespace <name> \
     --from <rfc3339> --to <rfc3339>
 ```
 

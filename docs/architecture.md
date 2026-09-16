@@ -2,11 +2,12 @@
 
 Technical reference for the Rust Extract Layer. This document covers the crate layout, the
 lifecycle of a job from API call to committed checkpoint, the data model, execution and memory
-management, configuration, and observability.
+management, configuration, and observability. The core is a source-aware extraction layer on
+DataFusion/Ballista that outputs native Arrow.
 
 For the reasoning behind the design, start with the [README](../README.md). For the parts that get
 their own documents, see [pushdown](pushdown.md), [incremental extraction](incremental-extraction.md),
-and [connectors](connectors/README.md). (There is no sinks document: sinks are out of scope.)
+and [connectors](connectors/README.md). Sinks are out of scope.
 
 ---
 
@@ -60,15 +61,14 @@ in comments where they map 1:1, but nothing is split yet.
 rust-ballista-extraction-layer/
 ├── Cargo.toml                  # single crate; exact pins, see §1 version policy
 ├── src/
-│   ├── lib.rs / main.rs        # NOTE: main.rs re-declares the modules instead of
-│   │                           # depending on the lib — see docs/testing-plan.md §6
+│   ├── lib.rs / main.rs        # main.rs uses `use rust_ballista_extraction_layer::...`
 │   ├── config/                 # job-spec parsing (JSON), per-layer config structs
 │   ├── types/                  # TableMetadata / ColumnMetadata
 │   ├── connector/
 │   │   ├── mod.rs              # the Source SPI contract (see below)
 │   │   ├── errors.rs           # ExtractorError
-│   │   └── postgres/           # schema_reader, arrow_type_mapper, row_adapter,
-│   │                           # query_builder, parallel, table_provider, execution_plan
+│   │   ├── postgres/           # schema_reader, arrow_type_mapper, row_adapter,
+│   │                           # query_builder, parallel, table_provider, execution_plan, extractor
 │   ├── pushdown/               # Predicate IR, translate/decide, dialect, cost_model,
 │   │                           # stats, explain, optimizer_rule
 │   ├── incremental/            # watermarks, windows, clamp_to_observed
@@ -88,7 +88,7 @@ without the rest of the system knowing which database it is — *what SQL?* (`Pr
 into a `SqlSink`, `SqlDialect` conventions), *what window is safe?* (`WatermarkSource`),
 *what does it cost?* (`TableStatsSource`), *which pool?* (`SourceDescriptor`). The planning SPI
 itself is DataFusion's (`TableProvider` / `ExecutionPlan`). Deliberately backend-concrete:
-`sqlx` pools and `QueryBuilder` binding — a MySQL backend owns an analogous registry over its
+`sqlx` pools and `QueryBuilder` binding — another backend would own an analogous registry over its
 own pool type following the same pattern.
 
 ---
@@ -185,15 +185,14 @@ near-zero-copy handoff to Parquet and to any Arrow consumer.
 before execution begins, because DataFusion plans against it. Runtime schema surprises (a column
 whose type differs from the catalog, a `NUMERIC` that overflows the declared decimal precision)
 are errors, not silent coercions — with one deliberate exception: values that are representable in
-the source but not in Arrow (MySQL's `0000-00-00`, Postgres `timestamp 'infinity'`) map to null and
+the source but not in Arrow (Postgres `timestamp 'infinity'`) map to null and
 increment a counter. Silent nulls without a metric are how data quality bugs hide for months.
 
 **Batch sizing.** The connector produces batches of `batch_size` rows (default 8192, configurable).
 Too small and per-batch overhead dominates; too large and memory spikes, particularly with wide
 string columns. The streaming builders accumulate directly into Arrow builders (one batch at a
 time, bounded memory) — with one caveat: rows arrive through `sqlx` as `PgRow` values first,
-so "no intermediate row struct" holds for the Arrow side, not the driver side. (The unused
-binary-`COPY` path is the only one that decodes straight off the wire.)
+so "no intermediate row struct" holds for the Arrow side, not the driver side.
 
 **Metadata columns.** Deferred: batches currently carry exactly the source columns, no
 `_extracted_at` / `_extracted_date` / `_source` / `_watermark_hi` appended. Likewise, values
@@ -218,10 +217,9 @@ distinct knobs that are easy to conflate:
 
 Backpressure flows naturally on the streaming scan path: `PostgresExecutionPlan` yields a
 `SendableRecordBatchStream`, and if the sink is slow the stream stops being polled, which stops
-reading from the socket, which applies TCP backpressure to the database. Caveat: the legacy
-`PostgresExtractor::{extract_incremental_window, extract_full_table, extract_keyset_partition}`
-methods still `fetch_all()` — they buffer and are kept for compatibility, not for large scans.
-A connector that buffers converts backpressure into an OOM, which is why the plan path streams.
+reading from the socket, which applies TCP backpressure to the database. The `PostgresExtractor`
+cursor-based methods also stream via `FETCH` batches, so backpressure propagates through the
+portal. All scan paths stream; no path buffers the full result set.
 
 DataFusion's `MemoryPool` is not currently configured (no `FairSpillPool`, no `RuntimeEnv`
 tuning) — spills are unbounded by default. Likewise there is no per-connector cap on in-flight
@@ -282,7 +280,7 @@ Notes against the original TOML sketch this replaces:
 
 - `password_env` names the environment variable holding the password (resolved in whichever
   process opens the pool — scheduler, worker, and client each resolve it independently).
-  There is no `dsn_env`, no `[sources.*]` catalog, and no MySQL section yet.
+  There is no `dsn_env` and no `[sources.*]` catalog.
 - Checkpoints are local-directory JSON only (`JsonCheckpointStore`); there is no postgres/gcs
   checkpoint backend.
 - There is no `[sinks.*]` section — sinks are out of scope; examples write Parquet via

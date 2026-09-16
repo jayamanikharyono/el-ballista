@@ -18,9 +18,7 @@ use sqlx::{Postgres, QueryBuilder};
 
 use crate::connector::errors::ExtractorError;
 use crate::connector::postgres::{
-    parallel::ScanPartition,
-    query_builder::PostgresQueryBuilder,
-    row_adapter,
+    parallel::ScanPartition, query_builder::PostgresQueryBuilder, row_adapter,
 };
 use crate::connector::query_tag::QuerySession;
 use crate::distributed::connection::PostgresConnectionDescriptor;
@@ -72,6 +70,7 @@ pub struct PostgresExecutionPlan {
 }
 
 impl PostgresExecutionPlan {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: Option<PostgresConnectionDescriptor>,
         table_metadata: TableMetadata,
@@ -148,9 +147,8 @@ impl PostgresExecutionPlan {
     }
 
     pub fn from_model(model: PostgresExecutionPlanModel) -> DataFusionResult<Self> {
-        let schema =
-            row_adapter::PostgresRowAdapter::build_arrow_schema(&model.table_metadata)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let schema = row_adapter::PostgresRowAdapter::build_arrow_schema(&model.table_metadata)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Self::try_new(
             Some(model.descriptor),
@@ -185,7 +183,10 @@ impl PostgresExecutionPlan {
         // (pg_stat_activity, pg_stat_statements, logs) without cross-referencing anything
         // in this process. `strategy` names the scan shape; `partition` (1-based) is
         // included only when this table is actually split across more than one scan.
-        let strategy = match (self.watermark_column.is_some(), self.pushed_filters.is_empty()) {
+        let strategy = match (
+            self.watermark_column.is_some(),
+            self.pushed_filters.is_empty(),
+        ) {
             (true, true) => "incremental",
             (true, false) => "incremental+pushdown",
             (false, true) => "full",
@@ -235,17 +236,17 @@ impl PostgresExecutionPlan {
                 predicate.render_to(&dialect, sink);
             }
 
-            if let Some(partition) = self.partitions.get(partition_idx) {
-                if let Some(bounds) = &partition.predicate {
-                    if conditions == 0 {
-                        sink.push_sql(" WHERE ");
-                    } else {
-                        sink.push_sql(" AND ");
-                    }
-                    // Partition bounds are integer (or ctid) literals composed in parallel.rs from
-                    // MIN/MAX queries — trusted input, safe to inline, unlike any user-facing text.
-                    sink.push_sql(bounds.as_str());
+            if let Some(partition) = self.partitions.get(partition_idx)
+                && let Some(bounds) = &partition.predicate
+            {
+                if conditions == 0 {
+                    sink.push_sql(" WHERE ");
+                } else {
+                    sink.push_sql(" AND ");
                 }
+                // Partition bounds are integer (or ctid) literals composed in parallel.rs from
+                // MIN/MAX queries — trusted input, safe to inline, unlike any user-facing text.
+                sink.push_sql(bounds.as_str());
             }
 
             if let Some(limit) = self.pushed_limit {
@@ -253,7 +254,8 @@ impl PostgresExecutionPlan {
                 sink.push_param(SqlParam::Int(limit as i64));
             }
         }
-        drop(sink);
+        // `PgParamSink` holds `&mut QueryBuilder`; dropping it only ends the borrow.
+        // No explicit `drop` needed — let the borrow end naturally.
 
         log::debug!(
             "PostgresExecutionPlan partition {partition_idx}: {:?}",
@@ -265,11 +267,7 @@ impl PostgresExecutionPlan {
 }
 
 impl DisplayAs for PostgresExecutionPlan {
-    fn fmt_as(
-        &self,
-        t: DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default
             | DisplayFormatType::Verbose
@@ -330,7 +328,7 @@ impl ExecutionPlan for PostgresExecutionPlan {
                     "a pool-less PostgresExecutionPlan cannot execute; \
                      scan through PostgresTableProvider instead"
                         .to_string(),
-                ))
+                ));
             }
         };
 
@@ -448,7 +446,10 @@ mod tests {
             sql.contains(r#"("status" = $3)"#),
             "filter placeholder third, got: {sql}"
         );
-        assert!(sql.contains("LIMIT $4"), "limit placeholder last, got: {sql}");
+        assert!(
+            sql.contains("LIMIT $4"),
+            "limit placeholder last, got: {sql}"
+        );
     }
 
     #[test]
@@ -484,10 +485,22 @@ mod tests {
         let sql = plan.build_query(0).sql();
         let sql = sql.as_str();
         assert!(sql.starts_with("/* rust-extract query_id=q_"), "got: {sql}");
-        assert!(sql.contains("pipeline=unknown"), "no descriptor -> pipeline defaults to unknown, got: {sql}");
-        assert!(sql.contains("run_id=r_fixedtest"), "must carry the caller-supplied run_id, got: {sql}");
-        assert!(sql.contains("strategy=incremental"), "watermark set, no pushed filters, got: {sql}");
-        assert!(!sql.contains("partition="), "single/unsplit scan must omit partition, got: {sql}");
+        assert!(
+            sql.contains("pipeline=unknown"),
+            "no descriptor -> pipeline defaults to unknown, got: {sql}"
+        );
+        assert!(
+            sql.contains("run_id=r_fixedtest"),
+            "must carry the caller-supplied run_id, got: {sql}"
+        );
+        assert!(
+            sql.contains("strategy=incremental"),
+            "watermark set, no pushed filters, got: {sql}"
+        );
+        assert!(
+            !sql.contains("partition="),
+            "single/unsplit scan must omit partition, got: {sql}"
+        );
     }
 
     #[test]
@@ -499,8 +512,18 @@ mod tests {
             columns: vec![],
         };
         let partitions = vec![
-            ScanPartition { partition_id: 0, lo: Some(0), hi: Some(1), predicate: Some("id >= 0 AND id < 1".to_string()) },
-            ScanPartition { partition_id: 1, lo: Some(1), hi: Some(2), predicate: Some("id >= 1 AND id < 2".to_string()) },
+            ScanPartition {
+                partition_id: 0,
+                lo: Some(0),
+                hi: Some(1),
+                predicate: Some("id >= 0 AND id < 1".to_string()),
+            },
+            ScanPartition {
+                partition_id: 1,
+                lo: Some(1),
+                hi: Some(2),
+                predicate: Some("id >= 1 AND id < 2".to_string()),
+            },
         ];
         let plan = PostgresExecutionPlan::try_new(
             None,

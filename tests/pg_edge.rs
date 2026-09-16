@@ -47,9 +47,9 @@ async fn duplicate_timestamps_all_extracted() -> Result<(), Box<dyn std::error::
         db.schema
     );
     sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-    .execute(&db.pool)
-    .await
-    .map_err(|e| format!("seed dups: {e}"))?;
+        .execute(&db.pool)
+        .await
+        .map_err(|e| format!("seed dups: {e}"))?;
 
     let ex = extractor(&db).await?;
     let lo = Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap();
@@ -99,11 +99,7 @@ async fn projection_returns_requested_columns() -> Result<(), Box<dyn std::error
         .await?;
     assert_eq!(batch.num_rows(), 8);
     let schema = batch.schema();
-    let names: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(names, vec!["id", "amount"]);
     assert_eq!(
         common::decimal_col(&batch, "amount")[0],

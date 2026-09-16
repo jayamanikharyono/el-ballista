@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::connector::errors::ExtractorError;
 
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// Parallel scan strategy: how to partition the table across connections.
 /// Serialized into distributed plans; `None` preserves single-scan behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -75,10 +79,12 @@ pub async fn compute_keyset_partitions(
         return Ok(single_partition());
     }
 
-    // Fetch min and max values from the partition column
     let query = format!(
-        "SELECT MIN(\"{}\"::bigint), MAX(\"{}\"::bigint) FROM {}.\"{}\"",
-        partition_column, partition_column, schema_name, table_name
+        "SELECT MIN({}::bigint), MAX({}::bigint) FROM {}.{}",
+        quote_ident(partition_column),
+        quote_ident(partition_column),
+        quote_ident(schema_name),
+        quote_ident(table_name)
     );
 
     let (min_val, max_val): (Option<i64>, Option<i64>) =
@@ -119,7 +125,10 @@ fn keyset_partitions_from_bounds(
     max_val: i64,
     num_partitions: usize,
 ) -> Vec<ScanPartition> {
-    debug_assert!(num_partitions > 1, "callers must special-case <=1 partitions before this");
+    debug_assert!(
+        num_partitions > 1,
+        "callers must special-case <=1 partitions before this"
+    );
 
     if min_val >= max_val {
         log::warn!(
@@ -143,8 +152,11 @@ fn keyset_partitions_from_bounds(
         };
 
         let predicate = format!(
-            "\"{}\" >= {} AND \"{}\" < {}",
-            partition_column, lo, partition_column, hi
+            "{} >= {} AND {} < {}",
+            quote_ident(partition_column),
+            lo,
+            quote_ident(partition_column),
+            hi
         );
 
         partitions.push(ScanPartition {
@@ -214,7 +226,10 @@ pub async fn compute_ctid_partitions(
 /// access, so this is unit-testable without a live Postgres — the DB round trip in
 /// `compute_ctid_partitions` above is only responsible for producing `relpages`.
 fn ctid_partitions_from_relpages(relpages: i32, num_partitions: usize) -> Vec<ScanPartition> {
-    debug_assert!(num_partitions > 1, "callers must special-case <=1 partitions before this");
+    debug_assert!(
+        num_partitions > 1,
+        "callers must special-case <=1 partitions before this"
+    );
 
     if relpages <= 0 {
         log::warn!("ctid partitioning: no pages, falling back to single partition");
@@ -279,16 +294,18 @@ pub async fn export_snapshot(pool: &PgPool) -> Result<String, ExtractorError> {
 /// Set a connection to use an exported snapshot.
 pub async fn use_snapshot(pool: &PgPool, snapshot_id: &str) -> Result<(), ExtractorError> {
     // Validate snapshot_id format to prevent injection (snapshots are hex-only).
-    if !snapshot_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+    if !snapshot_id
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || c == '-')
+    {
         return Err(ExtractorError::Statistics(
             "invalid snapshot_id format".to_string(),
         ));
     }
 
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SET TRANSACTION SNAPSHOT '{}';",
-        snapshot_id
-    ).as_str()))
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("SET TRANSACTION SNAPSHOT '{}';", snapshot_id).as_str(),
+    ))
     .execute(pool)
     .await
     .map_err(|e| ExtractorError::Statistics(format!("cannot set snapshot: {e}")))?;
@@ -330,14 +347,21 @@ mod tests {
         assert_eq!(partitions[2].lo, Some(500));
         assert_eq!(partitions[2].hi, Some(750));
         assert_eq!(partitions[3].lo, Some(750));
-        assert_eq!(partitions[3].hi, Some(1001), "last partition must include max_val");
+        assert_eq!(
+            partitions[3].hi,
+            Some(1001),
+            "last partition must include max_val"
+        );
         for (i, p) in partitions.iter().enumerate() {
             assert_eq!(p.partition_id, i);
             assert!(p.predicate.as_ref().unwrap().contains("\"id\""));
         }
         // No gaps or overlaps between consecutive partitions.
         for w in partitions.windows(2) {
-            assert_eq!(w[0].hi, w[1].lo, "partitions must be contiguous with no gap/overlap");
+            assert_eq!(
+                w[0].hi, w[1].lo,
+                "partitions must be contiguous with no gap/overlap"
+            );
         }
     }
 
@@ -352,7 +376,10 @@ mod tests {
         assert_eq!(partitions.len(), 4);
         for p in &partitions {
             let (lo, hi) = (p.lo.unwrap(), p.hi.unwrap());
-            assert!(hi >= lo, "partition range must never invert, got [{lo}, {hi})");
+            assert!(
+                hi >= lo,
+                "partition range must never invert, got [{lo}, {hi})"
+            );
         }
         // Pin the actual (harmless) overshoot shape so a change here is a deliberate one.
         assert_eq!((partitions[3].lo, partitions[3].hi), (Some(3), Some(3)));
@@ -387,12 +414,18 @@ mod tests {
         assert_eq!(partitions.len(), 4);
         assert_eq!(partitions[0].lo, Some(0));
         assert_eq!(partitions[0].hi, Some(25));
-        assert_eq!(partitions[0].predicate.as_deref(), Some("ctid >= '(0,1)'::tid AND ctid < '(25,1)'::tid"));
+        assert_eq!(
+            partitions[0].predicate.as_deref(),
+            Some("ctid >= '(0,1)'::tid AND ctid < '(25,1)'::tid")
+        );
         assert_eq!(partitions[3].lo, Some(75));
         assert_eq!(partitions[3].hi, Some(100));
         // Last partition is open-ended (no upper tid bound) so late-arriving pages beyond
         // the relpages estimate are still scanned.
-        assert_eq!(partitions[3].predicate.as_deref(), Some("ctid >= '(75,1)'::tid"));
+        assert_eq!(
+            partitions[3].predicate.as_deref(),
+            Some("ctid >= '(75,1)'::tid")
+        );
         for w in partitions.windows(2) {
             assert_eq!(w[0].hi, w[1].lo, "page ranges must be contiguous");
         }
@@ -413,8 +446,15 @@ mod tests {
         }
         // Pin the actual clamped shape of the last (open-ended, overshooting) partition.
         assert_eq!(partitions[3].lo, Some(3));
-        assert_eq!(partitions[3].hi, Some(3), "clamped to lo, not the smaller relpages value");
-        assert_eq!(partitions[3].predicate.as_deref(), Some("ctid >= '(3,1)'::tid"));
+        assert_eq!(
+            partitions[3].hi,
+            Some(3),
+            "clamped to lo, not the smaller relpages value"
+        );
+        assert_eq!(
+            partitions[3].predicate.as_deref(),
+            Some("ctid >= '(3,1)'::tid")
+        );
     }
 
     #[test]

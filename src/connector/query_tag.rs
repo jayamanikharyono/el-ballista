@@ -154,7 +154,10 @@ mod tests {
         assert!(rendered.contains("run_id=r_9f8e7d6c"));
         assert!(rendered.contains("strategy=incremental"));
         assert!(rendered.trim_end().ends_with("*/"));
-        assert!(!rendered.contains("partition="), "unpartitioned tag must omit partition");
+        assert!(
+            !rendered.contains("partition="),
+            "unpartitioned tag must omit partition"
+        );
     }
 
     #[test]
@@ -169,7 +172,10 @@ mod tests {
         let session = QuerySession::from_parts("p", "r_fixed");
         let a = session.tag("full").render();
         let b = session.tag("full").render();
-        assert_ne!(a, b, "two calls must not render identically (query_id must differ)");
+        assert_ne!(
+            a, b,
+            "two calls must not render identically (query_id must differ)"
+        );
         assert!(a.contains("run_id=r_fixed") && b.contains("run_id=r_fixed"));
     }
 
@@ -188,7 +194,10 @@ mod tests {
         // be able to close the SQL comment early and inject trailing text as live SQL.
         let session = QuerySession::new("evil*/ DROP TABLE users; --");
         let rendered = session.tag("full").render();
-        assert!(!rendered.contains("*/ DROP"), "must not allow early comment close: {rendered}");
+        assert!(
+            !rendered.contains("*/ DROP"),
+            "must not allow early comment close: {rendered}"
+        );
         // The comment must still open and close exactly once, at the start and end.
         assert_eq!(rendered.matches("/*").count(), 1);
         assert_eq!(rendered.matches("*/").count(), 1);

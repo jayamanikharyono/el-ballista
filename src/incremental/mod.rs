@@ -19,7 +19,9 @@ use async_trait::async_trait;
 
 use crate::errors::AppError;
 
-/// Cache for privilege check result to avoid repeated queries
+/// Cache for privilege check result to avoid repeated queries.
+/// 2024 idiom would be `std::sync::LazyLock` but `once_cell` is retained while the crate
+/// graph still depends on it transitively via `ballista`.
 static PRIVILEGE_CHECK: once_cell::sync::Lazy<Arc<RwLock<Option<bool>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
@@ -78,7 +80,9 @@ pub async fn check_pg_read_all_stats_privilege(pool: &PgPool) -> Result<bool, Ap
                      Consider granting: GRANT pg_read_all_stats TO <role>"
                 );
             } else {
-                log::info!("Database role has pg_read_all_stats privilege - safe high watermark protection enabled");
+                log::info!(
+                    "Database role has pg_read_all_stats privilege - safe high watermark protection enabled"
+                );
             }
 
             Ok(has_privilege)
@@ -98,10 +102,7 @@ pub async fn check_pg_read_all_stats_privilege(pool: &PgPool) -> Result<bool, Ap
 pub trait WatermarkSource {
     /// Never advance past the oldest in-flight transaction, so a row written by a
     /// still-open transaction isn't skipped once it commits.
-    async fn safe_high_watermark(
-        &self,
-        safety_lag: Duration,
-    ) -> Result<DateTime<Utc>, AppError>;
+    async fn safe_high_watermark(&self, safety_lag: Duration) -> Result<DateTime<Utc>, AppError>;
 }
 
 /// docs/connectors/postgres.md §5.2 — the exact (not heuristic) safe high watermark: never
@@ -136,20 +137,24 @@ pub trait WatermarkSource {
 ///
 /// **Important:** Check privilege status at startup using `check_pg_read_all_stats_privilege()`
 /// to log the warning once, rather than on every watermark query.
-pub async fn safe_high_watermark(pool: &PgPool, safety_lag: Duration) -> Result<DateTime<Utc>, AppError> {
+pub async fn safe_high_watermark(
+    pool: &PgPool,
+    safety_lag: Duration,
+) -> Result<DateTime<Utc>, AppError> {
     pool.safe_high_watermark(safety_lag).await
 }
 
 #[async_trait]
 impl WatermarkSource for PgPool {
-        async fn safe_high_watermark(
-            &self,
-            safety_lag: Duration,
-        ) -> Result<DateTime<Utc>, AppError> {
+    async fn safe_high_watermark(&self, safety_lag: Duration) -> Result<DateTime<Utc>, AppError> {
+        // Bind safety_lag as an interval so the operator's configured lag is honored
+        // on the success path, not just on the fallback. The extra `1s` subtraction
+        // is retained inside the interval to guard clock skew.
+        let safety_lag_secs = safety_lag.num_seconds().max(1);
         let result = sqlx::query(
             r#"
             SELECT LEAST(
-                     now() - INTERVAL '1 second',
+                     now() - make_interval(secs => $1::double precision),
                      COALESCE(MIN(xact_start), now())
                    ) AS safe_hi
             FROM pg_stat_activity
@@ -158,6 +163,7 @@ impl WatermarkSource for PgPool {
               AND datname = current_database()
             "#,
         )
+        .bind(safety_lag_secs as f64)
         .fetch_one(self)
         .await;
 
@@ -168,12 +174,12 @@ impl WatermarkSource for PgPool {
                         "safe watermark query returned an unexpected shape: {e}"
                     ))
                 })?;
-            
+
                 log::debug!(
                     "Safe high watermark from pg_stat_activity: {} (protects against commit skew)",
                     safe_hi.to_rfc3339()
                 );
-            
+
                 Ok(safe_hi)
             }
             Err(e) => {
@@ -184,14 +190,14 @@ impl WatermarkSource for PgPool {
                      See docs/incremental-extraction.md §3.1 Mitigation 1 vs 2.",
                     safety_lag.num_seconds()
                 );
-            
+
                 let fallback_hi = Utc::now() - safety_lag;
                 log::debug!(
                     "Fallback safe high watermark: {} (now - {} seconds)",
                     fallback_hi.to_rfc3339(),
                     safety_lag.num_seconds()
                 );
-            
+
                 Ok(fallback_hi)
             }
         }

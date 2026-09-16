@@ -32,18 +32,11 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 |---|---|---|
 | Engine | Standalone Ballista or scheduler+workers (see below) | PySpark 3.5.4, `local[*]` |
 | Read fan-out | `--rust-partitions` keyset partitions, derived by default as ceil(table_rows / `--batch-size`) (`parallel_scan.partitions`; `workers` only divides the pool budget and fills in when `partitions <= 1`) | `--spark-partitions` JDBC partitions on `order_id`, same derivation by default |
-| Fetch | Streaming portal, `--batch-size` rows per batch when set, else code default 8192 | JDBC `fetchsize` = `--batch-size` when set, else omitted (Spark default 0 = driver default, which buffers each partition fully) |
+| Fetch | Streaming portal (batch size controlled by DataFusion, not explicit config) | JDBC `fetchsize` = `--batch-size` when set, else omitted (Spark default 0 = driver default, which buffers each partition fully) |
 | Sink | `parquet::arrow::ArrowWriter`, Snappy, single file | `df.write.parquet`, Snappy |
 | Timed | Schema discovery + scan + collect + encode (`scan_ms` + `write_ms` split in JSON) | Bounds query excluded; read + write + read-back count |
 
-Batch size (`--batch-size`) is optional. **Auto run** (flag absent): each tool uses its
-own default — Rust 8192 rows/batch, Spark no `fetchsize` (driver default). **Manual
-run** (`--batch-size 64000`): both engines stream that many rows per batch. Either
-way, partition counts derive from the 64000 reference as ceil(table_rows / 64000) —
-~95 partitions at 6M rows — so an auto run and a manual run differ only in per-batch
-streaming, never in fan-out. Override counts independently (`--rust-partitions`,
-`--spark-partitions`) to test sensitivity, but keep them equal for the headline
-number.
+Batch size (`--batch-size`) is optional and only affects Spark's JDBC `fetchsize`. **Auto run** (flag absent): Spark uses driver default (buffers each partition fully); Rust batch size is controlled by DataFusion's streaming. **Manual run** (`--batch-size 64000`): Spark streams that many rows per batch. Partition counts derive from the 64000 reference as ceil(table_rows / 64000) — ~95 partitions at 6M rows — so an auto run and a manual run differ only in Spark's per-batch streaming, never in fan-out. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
 
 CPU/MEM for distributed runs aggregates the whole cluster (scheduler + workers + client
 summed per tick), comparable to single-container runs. Everything runs sequentially —
@@ -94,17 +87,6 @@ around it:
 1. **Rebuilds are cheap already**: `cargo-chef` layers split dependency compilation (cached
    unless `Cargo.toml`/`Cargo.lock` change) from our crates, so editing sources and
    re-running costs minutes, not a full rebuild.
-2. **Pull instead of build**: `.github/workflows/bench-images.yml` builds multi-arch
-   images on demand (`Actions → bench-images → Run workflow`, or push a `bench-*` tag)
-   and pushes to GHCR. Then:
-   ```bash
-   BENCH_RUST_IMAGE=ghcr.io/<owner>/<repo>/rel-bench-rust:latest \
-   BENCH_SPARK_IMAGE=ghcr.io/<owner>/<repo>/rel-bench-spark:latest \
-   benchmark/run.sh --pull --repeat 3
-   ```
-   (The workflow needs no configuration — image names derive from the repository. First
-   enable GitHub Packages for the repo; `GITHUB_TOKEN` already has push rights via the
-   workflow's `packages: write` permission.)
 
 `PG_PORT` defaults to 5433 so it never clashes with a dev DB on 5432. `BENCH_PG_PASSWORD`
 defaults to `postgres` (matches the seed compose). `BENCH_CONCURRENT_TASKS`, when set,

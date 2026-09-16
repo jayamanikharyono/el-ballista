@@ -1,6 +1,6 @@
-use std::fmt;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::fmt;
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ColumnMetadata {

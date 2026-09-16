@@ -18,8 +18,8 @@ use datafusion::execution::SessionState;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::config::JobConfig;
-use crate::errors::AppError;
 use crate::connector::postgres::PostgresTableProvider;
+use crate::errors::AppError;
 use crate::pushdown::PushdownPolicy;
 
 use super::connection::PostgresConnectionDescriptor;
@@ -63,15 +63,11 @@ impl DistributedContext {
     /// Scheduler + in-proc executor in this process. `workers` has two effects: it divides the
     /// source connection budget (`pool_max / workers`, shared through the process-wide
     /// registry) and it becomes the keyset partition count.
-    pub async fn standalone(
-        config: &JobConfig,
-        workers: usize,
-    ) -> Result<Self, AppError> {
+    pub async fn standalone(config: &JobConfig, workers: usize) -> Result<Self, AppError> {
         log::info!("starting standalone Ballista scheduler + executor in this process");
-        let session = SessionContext::standalone_with_state(Self::session_state(
-            &SessionConfig::new(),
-        ))
-        .await?;
+        let session =
+            SessionContext::standalone_with_state(Self::session_state(&SessionConfig::new()))
+                .await?;
 
         let workers = if workers > 0 {
             workers
@@ -79,9 +75,11 @@ impl DistributedContext {
             config.distributed.workers.max(1)
         };
 
-        Ok(Self::from_session(session, workers, Some(
-            config.parallel_scan.partition_column.clone(),
-        ))
+        Ok(Self::from_session(
+            session,
+            workers,
+            Some(config.parallel_scan.partition_column.clone()),
+        )
         .await)
     }
 
@@ -106,9 +104,11 @@ impl DistributedContext {
             config.distributed.workers.max(1)
         };
 
-        Ok(Self::from_session(session, workers, Some(
-            config.parallel_scan.partition_column.clone(),
-        ))
+        Ok(Self::from_session(
+            session,
+            workers,
+            Some(config.parallel_scan.partition_column.clone()),
+        )
         .await)
     }
 
@@ -125,7 +125,11 @@ impl DistributedContext {
         let configured = config.parallel_scan.partitions;
         // workers doubles as the default count, so existing configs (partitions <= 1)
         // behave exactly as before.
-        let partitions = if configured > 1 { configured } else { self.workers };
+        let partitions = if configured > 1 {
+            configured
+        } else {
+            self.workers
+        };
         log::info!(
             "registering {}.{} with {}-worker budget (pool_max/workers = {}) and {} scan partitions",
             config.source.schema,
@@ -152,9 +156,11 @@ impl DistributedContext {
 
         let provider = provider
             .with_parallel_workers(partitions, self.partition_column.clone())
-            .with_parallel_strategy(crate::connector::postgres::parallel::ParallelStrategy::parse(
-                &config.parallel_scan.strategy,
-            ));
+            .with_parallel_strategy(
+                crate::connector::postgres::parallel::ParallelStrategy::parse(
+                    &config.parallel_scan.strategy,
+                ),
+            );
 
         self.session
             .register_table(&config.table, Arc::new(provider))?;

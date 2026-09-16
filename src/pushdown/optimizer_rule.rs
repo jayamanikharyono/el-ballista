@@ -99,7 +99,9 @@ impl SourceAwarePushdownRule {
     fn postgres_provider(source: &Arc<dyn TableSource>) -> Option<&PostgresTableProvider> {
         let as_any = source.as_ref() as &dyn Any;
         let default = as_any.downcast_ref::<DefaultTableSource>()?;
-        default.table_provider.downcast_ref::<PostgresTableProvider>()
+        default
+            .table_provider
+            .downcast_ref::<PostgresTableProvider>()
     }
 }
 
@@ -243,19 +245,40 @@ mod tests {
 
     #[test]
     fn test_collect_filters_conjunction() {
-        let expr = col("id")
-            .eq(lit(42i64))
-            .and(col("status").eq(lit("PAID")));
+        let expr = col("id").eq(lit(42i64)).and(col("status").eq(lit("PAID")));
         let filters = SourceAwarePushdownRule::collect_filters(&expr);
         assert_eq!(filters.len(), 2);
     }
 
     #[test]
-    fn test_reconstruct_filter_single() {
+    fn test_reconstruct_filter_single_returns_same_expr() {
         let expr = col("id").eq(lit(42i64));
-        let filters = vec![expr];
-        let reconstructed = SourceAwarePushdownRule::reconstruct_filter(&filters);
-        assert!(reconstructed.is_some());
+        let reconstructed =
+            SourceAwarePushdownRule::reconstruct_filter(std::slice::from_ref(&expr));
+        assert_eq!(
+            reconstructed,
+            Some(expr),
+            "a single filter must round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn test_reconstruct_filter_empty_is_none() {
+        // No kept conjuncts: the caller (rewrite) uses this to decide whether to emit a
+        // Filter node at all above the rewritten TableScan.
+        assert_eq!(SourceAwarePushdownRule::reconstruct_filter(&[]), None);
+    }
+
+    #[test]
+    fn test_reconstruct_filter_multiple_ands_left_to_right_in_order() {
+        let a = col("id").eq(lit(1i64));
+        let b = col("status").eq(lit("PAID"));
+        let c = col("amount").gt(lit(0i64));
+        let reconstructed =
+            SourceAwarePushdownRule::reconstruct_filter(&[a.clone(), b.clone(), c.clone()])
+                .expect("three filters must reconstruct to Some");
+        // (a AND b) AND c -- left-associative, in input order.
+        assert_eq!(reconstructed, a.and(b).and(c));
     }
 
     #[test]
@@ -265,9 +288,7 @@ mod tests {
 
         // `id = 42` translates (Exact); `1 = 1`-style tautologies and anything outside the
         // allowlist stays above the scan.
-        let predicate = col("id")
-            .eq(lit(42i64))
-            .and(col("status").eq(lit("PAID")));
+        let predicate = col("id").eq(lit(42i64)).and(col("status").eq(lit("PAID")));
         let plan = scan_plan(test_provider(PushdownPolicy::Always), predicate);
 
         let rewritten = rule.rewrite(plan, &config).expect("rewrite").data;
@@ -314,7 +335,10 @@ mod tests {
         let provider = test_provider(PushdownPolicy::Always);
 
         match provider.decide_cost(&col("status").eq(lit("PAID"))) {
-            crate::pushdown::Decision::Push { fidelity, predicate } => {
+            crate::pushdown::Decision::Push {
+                fidelity,
+                predicate,
+            } => {
                 assert_eq!(fidelity, crate::pushdown::Fidelity::Inexact);
                 assert_eq!(predicate.render_inline(), "(\"status\"::text = 'PAID')");
             }

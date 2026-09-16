@@ -21,10 +21,7 @@ pub enum CostDecision {
         cost_estimate: u64,
     },
     /// Keep the predicate in Arrow.
-    Keep {
-        reason: String,
-        selectivity: f64,
-    },
+    Keep { reason: String, selectivity: f64 },
 }
 
 /// Parameters controlling cost-based decisions.
@@ -54,7 +51,7 @@ impl Default for CostParams {
 /// 3. Otherwise, keep (execute in Arrow).
 pub fn decide_push(
     predicate: &Predicate,
-    fidelity: Fidelity,
+    _fidelity: Fidelity,
     stats: &SourceStatistics,
     params: &CostParams,
     estimated_source_cost: Option<u64>,
@@ -72,7 +69,9 @@ pub fn decide_push(
             !branches.is_empty()
                 && branches.iter().all(|branch| {
                     extract_predicate_columns(branch).iter().any(|col| {
-                        available_indexes.iter().any(|idx| idx.columns.contains(col))
+                        available_indexes
+                            .iter()
+                            .any(|idx| idx.columns.contains(col))
                     })
                 })
         }
@@ -117,10 +116,7 @@ pub fn decide_push(
 
     if cost > params.max_source_cost {
         return CostDecision::Keep {
-            reason: format!(
-                "cost exceeds budget: {} > {}",
-                cost, params.max_source_cost
-            ),
+            reason: format!("cost exceeds budget: {} > {}", cost, params.max_source_cost),
             selectivity,
         };
     }
@@ -185,10 +181,7 @@ fn extract_columns_recursive(predicate: &Predicate, columns: &mut Vec<String>) {
 
 /// Estimate selectivity (0.0 to 1.0) from column statistics.
 /// Uses n_distinct, null_frac from pg_stats where available.
-pub fn estimate_selectivity_from_stats(
-    predicate: &Predicate,
-    stats: &SourceStatistics,
-) -> f64 {
+pub fn estimate_selectivity_from_stats(predicate: &Predicate, stats: &SourceStatistics) -> f64 {
     match predicate {
         Predicate::Column(_) => {
             // A column reference alone is not a predicate; conservative assumption.
@@ -360,8 +353,8 @@ mod tests {
 
     #[test]
     fn test_or_requires_index_on_every_branch() {
-        use super::super::{Fidelity, Predicate};
         use super::super::super::pushdown::stats::IndexInfo;
+        use super::super::{Fidelity, Predicate};
 
         let stats = create_test_stats();
         let params = CostParams::default();
@@ -372,21 +365,20 @@ mod tests {
             is_primary: true,
             index_type: "btree".to_string(),
         }];
-        let cmp = |col: &str, v: i64| {
-            Predicate::Cmp {
-                left: Box::new(Predicate::Column(col.to_string())),
-                op: "=".to_string(),
-                right: Box::new(Predicate::Literal(
-                    super::super::Literal::Int(v),
-                )),
-            }
+        let cmp = |col: &str, v: i64| Predicate::Cmp {
+            left: Box::new(Predicate::Column(col.to_string())),
+            op: "=".to_string(),
+            right: Box::new(Predicate::Literal(super::super::Literal::Int(v))),
         };
 
         // Both branches indexed -> index shortcut.
         let both = Predicate::Or(Box::new(cmp("id", 1)), Box::new(cmp("id", 2)));
         assert!(matches!(
             decide_push(&both, Fidelity::Exact, &stats, &params, None, &indexes),
-            CostDecision::Push { has_index: true, .. }
+            CostDecision::Push {
+                has_index: true,
+                ..
+            }
         ));
 
         // One branch unindexed -> must NOT take the near-free index shortcut.
@@ -395,28 +387,125 @@ mod tests {
         let mixed = Predicate::Or(Box::new(cmp("id", 1)), Box::new(cmp("status", 1)));
         assert!(!matches!(
             decide_push(&mixed, Fidelity::Exact, &stats, &params, None, &indexes),
-            CostDecision::Push { has_index: true, .. }
+            CostDecision::Push {
+                has_index: true,
+                ..
+            }
         ));
     }
 
     #[test]
-    fn test_cost_decision_push() {
-        let decision = CostDecision::Push {
-            reason: "index available".to_string(),
-            has_index: true,
-            selectivity: 0.001,
-            cost_estimate: 10,
+    fn test_decide_push_no_index_low_selectivity_within_budget_pushes() {
+        // Equality on a high-cardinality unindexed column: selectivity ~0.001, well below
+        // the 0.30 keep_threshold, and the tiny stub table's cost estimate is trivially
+        // within the default 50_000 budget. No index -> must go through the cost path,
+        // not the index shortcut, and land on Push with has_index: false.
+        let stats = create_test_stats();
+        let params = CostParams::default();
+        let pred = Predicate::Cmp {
+            left: Box::new(Predicate::Column("id".to_string())),
+            op: "=".to_string(),
+            right: Box::new(Predicate::Literal(super::super::Literal::Int(42))),
         };
-        assert!(matches!(decision, CostDecision::Push { .. }));
+        let decision = decide_push(&pred, Fidelity::Exact, &stats, &params, None, &[]);
+        match decision {
+            CostDecision::Push {
+                has_index,
+                selectivity,
+                ..
+            } => {
+                assert!(!has_index, "no index was supplied, must not claim one");
+                assert!(selectivity < params.keep_threshold);
+            }
+            other => panic!("expected Push, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_cost_decision_keep() {
-        let decision = CostDecision::Keep {
-            reason: "selectivity too high".to_string(),
-            selectivity: 0.9,
+    fn test_decide_push_range_predicate_keeps_by_default() {
+        // Range comparisons estimate a flat 0.33 selectivity, which is >= the default
+        // 0.30 keep_threshold: every unindexed range predicate should Keep out of the box.
+        // A regression here (e.g. the threshold or the 0.33 constant drifting) would
+        // silently start pushing high-selectivity ranges to the source.
+        let stats = create_test_stats();
+        let params = CostParams::default();
+        let pred = Predicate::Cmp {
+            left: Box::new(Predicate::Column("id".to_string())),
+            op: ">".to_string(),
+            right: Box::new(Predicate::Literal(super::super::Literal::Int(0))),
         };
-        assert!(matches!(decision, CostDecision::Keep { .. }));
+        let decision = decide_push(&pred, Fidelity::Exact, &stats, &params, None, &[]);
+        assert!(
+            matches!(decision, CostDecision::Keep { .. }),
+            "expected Keep for a range predicate under the default threshold, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_push_exceeds_cost_budget_keeps() {
+        // Low selectivity (equality on a high-cardinality column) but a source cost
+        // estimate that blows through an intentionally tiny budget must Keep, even
+        // though selectivity alone would have said Push.
+        let stats = create_test_stats();
+        let params = CostParams {
+            max_source_cost: 5,
+            keep_threshold: 0.30,
+        };
+        let pred = Predicate::Cmp {
+            left: Box::new(Predicate::Column("id".to_string())),
+            op: "=".to_string(),
+            right: Box::new(Predicate::Literal(super::super::Literal::Int(42))),
+        };
+        let decision = decide_push(
+            &pred,
+            Fidelity::Exact,
+            &stats,
+            &params,
+            Some(1_000_000),
+            &[],
+        );
+        match decision {
+            CostDecision::Keep { selectivity, .. } => {
+                assert!(
+                    selectivity < params.keep_threshold,
+                    "must have passed the selectivity gate before failing on cost"
+                );
+            }
+            other => panic!("expected Keep (cost over budget), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_push_index_shortcut_ignores_cost_and_selectivity() {
+        // When an applicable index exists, the function must take the shortcut and
+        // report has_index: true with a negligible cost, regardless of what the
+        // selectivity/cost estimate from stats would otherwise say.
+        let stats = create_test_stats();
+        let params = CostParams::default();
+        let indexes = vec![IndexInfo {
+            name: "id_idx".to_string(),
+            columns: vec!["id".to_string()],
+            is_unique: true,
+            is_primary: true,
+            index_type: "btree".to_string(),
+        }];
+        let pred = Predicate::Cmp {
+            left: Box::new(Predicate::Column("id".to_string())),
+            op: "=".to_string(),
+            right: Box::new(Predicate::Literal(super::super::Literal::Int(42))),
+        };
+        let decision = decide_push(&pred, Fidelity::Exact, &stats, &params, None, &indexes);
+        match decision {
+            CostDecision::Push {
+                has_index,
+                cost_estimate,
+                ..
+            } => {
+                assert!(has_index);
+                assert_eq!(cost_estimate, 1);
+            }
+            other => panic!("expected index-shortcut Push, got {other:?}"),
+        }
     }
 
     #[test]
@@ -444,7 +533,9 @@ mod tests {
             Box::new(Predicate::Cmp {
                 left: Box::new(Predicate::Column("status".to_string())),
                 op: "=".to_string(),
-                right: Box::new(Predicate::Literal(super::super::Literal::Text("PAID".to_string()))),
+                right: Box::new(Predicate::Literal(super::super::Literal::Text(
+                    "PAID".to_string(),
+                ))),
             }),
         );
 

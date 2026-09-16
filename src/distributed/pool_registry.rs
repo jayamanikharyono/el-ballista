@@ -14,12 +14,12 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use super::connection::PostgresConnectionDescriptor;
-use crate::connector::errors::ExtractorError;
 use crate::connector::SourceDescriptor;
+use crate::connector::errors::ExtractorError;
 
 pub fn registry() -> &'static SourcePoolRegistry {
     static REGISTRY: OnceLock<SourcePoolRegistry> = OnceLock::new();
@@ -45,7 +45,7 @@ impl SourcePoolRegistry {
         descriptor: &PostgresConnectionDescriptor,
     ) -> Result<PgPool, ExtractorError> {
         let key = descriptor.registry_key();
-        let mut pools = self.pools.lock().unwrap();
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pool) = pools.get(&key) {
             return Ok(pool.clone());
@@ -65,6 +65,7 @@ impl SourcePoolRegistry {
 
         let pool = PgPoolOptions::new()
             .max_connections(descriptor.budgeted_max_connections())
+            .acquire_timeout(std::time::Duration::from_secs(30))
             .after_connect(move |conn, _meta| {
                 let statement_timeout = statement_timeout.clone();
                 Box::pin(async move {
@@ -120,8 +121,8 @@ impl SourcePool {
         match self {
             Self::Connected(pool) => Ok(pool.clone()),
             Self::Deferred { descriptor, pool } => {
-                let result = pool
-                    .get_or_init(|| registry().pool(descriptor).map_err(|e| e.to_string()));
+                let result =
+                    pool.get_or_init(|| registry().pool(descriptor).map_err(|e| e.to_string()));
                 match result {
                     Ok(pool) => Ok(pool.clone()),
                     Err(e) => Err(ExtractorError::Internal(format!(

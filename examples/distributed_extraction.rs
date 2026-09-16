@@ -16,7 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "extract.example.json".to_string());
-    let workers: usize = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(2);
+    let workers: usize = std::env::args()
+        .nth(2)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(2);
 
     let config = JobConfig::from_file(&config_path)?;
 

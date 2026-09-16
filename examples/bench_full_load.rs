@@ -69,9 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match File::create(&output_path) {
                 Ok(file) => break file,
                 Err(e) if attempt < 3 => {
-                    eprintln!(
-                        "create {output_path} attempt {attempt}/3 failed ({e}); retrying..."
-                    );
+                    eprintln!("create {output_path} attempt {attempt}/3 failed ({e}); retrying...");
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 Err(e) => return Err(format!("create output file {output_path}: {e}").into()),
@@ -89,11 +87,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Standalone: scheduler + in-process executor, no external cluster needed. The scan
     // still fans out over `workers` keyset partitions with budgeted pools — the same code
     // path as the remote deployment, minus the network.
-    let scheduler_url =
-        std::env::var("BENCH_SCHEDULER_URL").ok().filter(|s| !s.is_empty());
-    let deployment = if scheduler_url.is_some() { "remote" } else { "standalone" };
+    let scheduler_url = std::env::var("BENCH_SCHEDULER_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let deployment = if scheduler_url.is_some() {
+        "remote"
+    } else {
+        "standalone"
+    };
 
-    let t_scan = Instant::now();
     let ctx = match scheduler_url.as_deref() {
         Some(url) => DistributedContext::remote(&config, url, workers).await?,
         None => DistributedContext::standalone(&config, workers).await?,
@@ -128,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed_ms = t_scan.elapsed().as_millis();
     // scan_ms = everything that is not pure Parquet encode (scan, transport, planning);
     // write_ms = cumulative encode time. They partition elapsed by construction.
-    let write_ms = (write_ns / 1_000_000) as u128;
+    let write_ms = write_ns / 1_000_000;
     let scan_ms = elapsed_ms.saturating_sub(write_ms);
 
     let output_bytes = std::fs::metadata(&output_path)

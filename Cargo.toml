@@ -69,3 +69,10 @@ path = "examples/dataframe_extraction.rs"
 [[example]]
 name = "bench_full_load"
 path = "examples/bench_full_load.rs"
+
+[dev-dependencies]
+# Self-provisioning Postgres for integration/e2e tests: no Docker, no externally
+# running server required. Default features (theseus + tls-native-tls) already
+# give the async API used in tests/common/mod.rs; binaries are cached under
+# ~/.theseus/postgresql after the first download.
+postgresql_embedded = "0.21"

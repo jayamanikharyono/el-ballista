@@ -13,12 +13,15 @@ use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::prelude::*;
 use std::sync::Arc;
 
-use crate::config::{CheckpointConfig, ExecutionConfig, IncrementalConfig, JobConfig, ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig, DistributedConfig};
-use crate::errors::AppError;
-use crate::connector::postgres::PostgresExtractor;
-use crate::pushdown::dialect::{SqlDialect, PostgresDialect};
-use crate::pushdown::stats::StatisticsCollector;
-use crate::types::ColumnMetadata;
+use rust_ballista_extraction_layer::config::{
+    CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
+    ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
+};
+use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+use rust_ballista_extraction_layer::errors::AppError;
+use rust_ballista_extraction_layer::pushdown::dialect::{PostgresDialect, SqlDialect};
+use rust_ballista_extraction_layer::pushdown::stats::StatisticsCollector;
+use rust_ballista_extraction_layer::types::ColumnMetadata;
 
 pub async fn run() -> Result<(), AppError> {
     println!("\n=== Phase 1 & Phase 2 Feature Demonstration ===\n");
@@ -42,7 +45,7 @@ pub async fn run() -> Result<(), AppError> {
 
     let batch = extractor
         .extract_incremental_window(
-            "public.orders",  // Now uses explicit schema
+            "public.orders", // Now uses explicit schema
             Some(vec![
                 "order_id",
                 "user_id",
@@ -58,12 +61,15 @@ pub async fn run() -> Result<(), AppError> {
         .await?;
 
     let num_rows_extracted = batch.num_rows();
-    println!("  ✓ Extracted {} row(s) from public.orders", num_rows_extracted);
+    println!(
+        "  ✓ Extracted {} row(s) from public.orders",
+        num_rows_extracted
+    );
 
     // Phase 2: Demonstrate SqlDialect (collation-aware fidelity)
     println!("\n► Phase 2: SqlDialect and collation-aware fidelity");
     let dialect = PostgresDialect;
-    
+
     let text_col_c = ColumnMetadata {
         column_name: "status".to_string(),
         data_type: "text".to_string(),
@@ -73,7 +79,7 @@ pub async fn run() -> Result<(), AppError> {
         udt_name: None,
         collation_name: Some("C".to_string()),
     };
-    
+
     let text_col_citext = ColumnMetadata {
         column_name: "email".to_string(),
         data_type: "citext".to_string(),
@@ -86,17 +92,26 @@ pub async fn run() -> Result<(), AppError> {
 
     let fidelity_c = dialect.column_literal_fidelity(&text_col_c, true, false);
     let fidelity_citext = dialect.column_literal_fidelity(&text_col_citext, true, false);
-    
-    println!("  ✓ C-collation string comparison: {:?} (Exact)", fidelity_c);
-    println!("  ✓ citext string comparison: {:?} (Inexact)", fidelity_citext);
-    println!("  ✓ Identifier quoting: {}", dialect.quote_ident("my_column"));
+
+    println!(
+        "  ✓ C-collation string comparison: {:?} (Exact)",
+        fidelity_c
+    );
+    println!(
+        "  ✓ citext string comparison: {:?} (Inexact)",
+        fidelity_citext
+    );
+    println!(
+        "  ✓ Identifier quoting: {}",
+        dialect.quote_ident("my_column")
+    );
     println!("  ✓ Placeholder generation: {}", dialect.placeholder(1));
 
     // Phase 2: Statistics collection framework
     println!("\n► Phase 2: Statistics collection (framework)");
     let pool = Arc::new(extractor.pool().clone());
     let stats_collector = StatisticsCollector::new(pool.clone(), 900);
-    
+
     // Attempt to collect statistics (may fail if pg_stats is empty, but demonstrates the framework)
     match stats_collector.get_statistics("public", "orders").await {
         Ok(stats) => {
@@ -152,7 +167,10 @@ pub async fn run() -> Result<(), AppError> {
     }
 
     println!("\n► Phase 1 & 2: Data ready for output");
-    println!("  - {} rows collected via DataFusion", batches.iter().map(|b| b.num_rows()).sum::<usize>());
+    println!(
+        "  - {} rows collected via DataFusion",
+        batches.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
     println!("  - Use DataFusion writers (ParquetWriter, CSVWriter) or Ballista for sink");
     println!("  - This project extracts to Arrow only");
     println!("  - Sink functionality delegated to external libraries");
@@ -196,9 +214,7 @@ pub async fn run() -> Result<(), AppError> {
             partitions: 1,
             partition_column: "order_id".to_string(),
         },
-        execution: ExecutionConfig {
-            batch_size: 8192,
-        },
+        execution: ExecutionConfig { batch_size: 8192 },
         distributed: DistributedConfig::default(),
     };
 
@@ -211,8 +227,14 @@ pub async fn run() -> Result<(), AppError> {
 
     println!("\n=== Demo complete ===\n");
     println!("Output:");
-    println!("  - {} rows extracted from public.orders", num_rows_extracted);
-    println!("  - {} rows after filter+aggregate", batches.iter().map(|b| b.num_rows()).sum::<usize>());
+    println!(
+        "  - {} rows extracted from public.orders",
+        num_rows_extracted
+    );
+    println!(
+        "  - {} rows after filter+aggregate",
+        batches.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
     println!("  - Ready for sink (DataFusion/Ballista/orchestrator)");
 
     Ok(())

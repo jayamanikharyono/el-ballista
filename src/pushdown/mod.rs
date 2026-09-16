@@ -21,11 +21,11 @@
 //! `Inexact` or refuses to translate at all (`None`) — never `Exact`. Getting the conservative
 //! case wrong costs performance; getting the `Exact` case wrong costs correctness.
 
-pub mod dialect;
-pub mod stats;
 pub mod cost_model;
+pub mod dialect;
 pub mod explain;
 pub mod optimizer_rule;
+pub mod stats;
 
 use chrono::{DateTime, Utc};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, QueryBuilder};
 use std::collections::HashMap;
 
-use crate::pushdown::cost_model::{CostParams, decide_push, CostDecision};
+use crate::pushdown::cost_model::{CostDecision, CostParams, decide_push};
 use crate::pushdown::dialect::SqlDialect;
 use crate::pushdown::explain::ExplainEstimate;
 use crate::pushdown::stats::{IndexInfo, SourceStatistics};
@@ -271,7 +271,11 @@ pub struct CollectingSink<'a> {
 
 impl<'a> CollectingSink<'a> {
     pub fn new(dialect: &'a dyn SqlDialect, params: &'a mut Vec<SqlParam>) -> Self {
-        Self { dialect, sql: String::new(), params }
+        Self {
+            dialect,
+            sql: String::new(),
+            params,
+        }
     }
 
     pub fn finish(self) -> String {
@@ -475,7 +479,10 @@ fn translate_literal(value: &ScalarValue) -> Option<Literal> {
 /// `supports_filters_pushdown` and `scan` both call, so the two can never disagree about which
 /// filters are pushable.
 pub enum Decision {
-    Push { fidelity: Fidelity, predicate: Predicate },
+    Push {
+        fidelity: Fidelity,
+        predicate: Predicate,
+    },
     Keep,
 }
 
@@ -535,7 +542,11 @@ pub fn normalize_enum_comparison(
         }
         (left, right) => Some((
             fidelity,
-            Predicate::Cmp { left: Box::new(left), op, right: Box::new(right) },
+            Predicate::Cmp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
         )),
     }
 }
@@ -557,7 +568,11 @@ fn normalize_enum_side(
         };
         return Some((
             fidelity,
-            Predicate::Cmp { left: Box::new(left), op, right: Box::new(right) },
+            Predicate::Cmp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
         ));
     }
     if !matches!(lit, Literal::Text(_)) {
@@ -577,7 +592,11 @@ fn normalize_enum_side(
     };
     Some((
         Fidelity::Inexact,
-        Predicate::Cmp { left: Box::new(left), op, right: Box::new(right) },
+        Predicate::Cmp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        },
     ))
 }
 /// Full decision function: translation correctness × policy × denylist × per-column push hints ×
@@ -623,11 +642,15 @@ pub fn decide_translated(
 
     match policy {
         PushdownPolicy::Never => Decision::Keep, // handled above; kept for exhaustiveness
-        PushdownPolicy::Always => Decision::Push { fidelity, predicate },
+        PushdownPolicy::Always => Decision::Push {
+            fidelity,
+            predicate,
+        },
         PushdownPolicy::Strict => decide_strict(&predicate, cost),
-        PushdownPolicy::Hinted if references_push_column(&predicate, push) => {
-            Decision::Push { fidelity, predicate }
-        }
+        PushdownPolicy::Hinted if references_push_column(&predicate, push) => Decision::Push {
+            fidelity,
+            predicate,
+        },
         PushdownPolicy::Hinted | PushdownPolicy::CostBased => match cost {
             Some(inputs) => {
                 let (effective_indexes, owned_index);
@@ -636,7 +659,10 @@ pub fn decide_translated(
                         // EXPLAIN saw an index the catalog query missed (expression index,
                         // newly created): synthesize an entry so the model treats it as free.
                         owned_index = IndexInfo {
-                            name: est.index_name.clone().unwrap_or_else(|| "explain".to_string()),
+                            name: est
+                                .index_name
+                                .clone()
+                                .unwrap_or_else(|| "explain".to_string()),
                             columns: predicate_columns(&predicate),
                             is_unique: false,
                             is_primary: false,
@@ -664,12 +690,18 @@ pub fn decide_translated(
                     estimated_cost,
                     indexes,
                 ) {
-                    CostDecision::Push { .. } => Decision::Push { fidelity, predicate },
+                    CostDecision::Push { .. } => Decision::Push {
+                        fidelity,
+                        predicate,
+                    },
                     CostDecision::Keep { .. } => Decision::Keep,
                 }
             }
             // No source reachable: optimistically push (legacy behavior).
-            None => Decision::Push { fidelity, predicate },
+            None => Decision::Push {
+                fidelity,
+                predicate,
+            },
         },
     }
 }
@@ -686,21 +718,23 @@ fn references_denied_column(predicate: &Predicate, deny: &[String]) -> bool {
 ///    "fast and wrong" lives.
 /// 3. Selectivity below `keep_threshold` (it must filter the majority) and estimated cost
 ///    within budget, same estimators as the cost model.
-/// Without statistics (`None`) strict keeps everything — paranoid means paranoid, unlike
-/// the legacy optimistic fallback. `push` hints are ignored under strict; `deny` (checked
-/// by the caller) still applies.
+///
+///    Without statistics (`None`) strict keeps everything — paranoid means paranoid, unlike
+///    the legacy optimistic fallback. `push` hints are ignored under strict; `deny` (checked
+///    by the caller) still applies.
 fn decide_strict(predicate: &Predicate, cost: Option<&CostInputs>) -> Decision {
     match strict_gate(predicate, cost) {
         StrictGate::Push => {
             // Fidelity comes from the translated shape; strict already excluded every
             // non-exact form above except plain primitive comparisons.
             let fidelity = match predicate {
-                Predicate::Cmp { left, right, .. } => {
-                    comparison_fidelity_for_strict(left, right)
-                }
+                Predicate::Cmp { left, right, .. } => comparison_fidelity_for_strict(left, right),
                 _ => Fidelity::Exact,
             };
-            Decision::Push { fidelity, predicate: predicate.clone() }
+            Decision::Push {
+                fidelity,
+                predicate: predicate.clone(),
+            }
         }
         _ => Decision::Keep,
     }
@@ -772,7 +806,10 @@ pub fn describe_strict(predicate: &Predicate, cost: Option<&CostInputs>) -> Stri
         StrictGate::NonPrimitive => {
             "strict: non-primitive type (numeric/float/text/cast)".to_string()
         }
-        StrictGate::Unselective { selectivity, threshold } => format!(
+        StrictGate::Unselective {
+            selectivity,
+            threshold,
+        } => format!(
             "strict: selectivity too high ({:.2}% >= {:.2}%)",
             selectivity * 100.0,
             threshold * 100.0
@@ -786,22 +823,21 @@ pub fn describe_strict(predicate: &Predicate, cost: Option<&CostInputs>) -> Stri
 /// Primitive shapes only: bool/int/timestamp literals over smallint/integer/bigint/boolean/
 /// date/timestamp columns. Anything else (numeric, float, text, casts, unknown columns)
 /// fails closed.
-fn is_primitive_predicate(
-    predicate: &Predicate,
-    column_types: &HashMap<String, String>,
-) -> bool {
+fn is_primitive_predicate(predicate: &Predicate, column_types: &HashMap<String, String>) -> bool {
     match predicate {
         Predicate::Column(name) => is_primitive_column(column_types.get(name)),
         Predicate::Literal(lit) => {
-            matches!(lit, Literal::Bool(_) | Literal::Int(_) | Literal::Timestamp(_))
+            matches!(
+                lit,
+                Literal::Bool(_) | Literal::Int(_) | Literal::Timestamp(_)
+            )
         }
         Predicate::Cmp { left, right, .. } => {
             is_primitive_predicate(left, column_types)
                 && is_primitive_predicate(right, column_types)
         }
         Predicate::And(l, r) | Predicate::Or(l, r) => {
-            is_primitive_predicate(l, column_types)
-                && is_primitive_predicate(r, column_types)
+            is_primitive_predicate(l, column_types) && is_primitive_predicate(r, column_types)
         }
         Predicate::Not(p) | Predicate::IsNull(p) | Predicate::IsNotNull(p) => {
             is_primitive_predicate(p, column_types)
@@ -832,15 +868,14 @@ fn comparison_fidelity_for_strict(left: &Predicate, right: &Predicate) -> Fideli
     match (left, right) {
         (Predicate::Literal(_), Predicate::Column(_))
         | (Predicate::Column(_), Predicate::Literal(_)) => Fidelity::Exact,
-        (Predicate::Literal(a), Predicate::Literal(b)) => {
-            a.fidelity().combine(b.fidelity())
-        }
+        (Predicate::Literal(a), Predicate::Literal(b)) => a.fidelity().combine(b.fidelity()),
         _ => Fidelity::Inexact,
     }
 }
 
 /// Whether a predicate touches any denylisted column. Public for `rel plan --explain`.
-pub fn references_denied_column_public(predicate: &Predicate, deny: &[String]) -> bool {    match predicate {
+pub fn references_denied_column_public(predicate: &Predicate, deny: &[String]) -> bool {
+    match predicate {
         Predicate::Column(name) => deny.iter().any(|d| d == name),
         Predicate::Literal(_) => false,
         Predicate::Cmp { left, right, .. } => {
@@ -910,7 +945,10 @@ mod tests {
     fn test_pushdown_policy_parse() {
         assert_eq!(PushdownPolicy::parse("always"), PushdownPolicy::Always);
         assert_eq!(PushdownPolicy::parse("never"), PushdownPolicy::Never);
-        assert_eq!(PushdownPolicy::parse("cost_based"), PushdownPolicy::CostBased);
+        assert_eq!(
+            PushdownPolicy::parse("cost_based"),
+            PushdownPolicy::CostBased
+        );
         assert_eq!(PushdownPolicy::parse("hinted"), PushdownPolicy::Hinted);
         assert_eq!(PushdownPolicy::parse("strict"), PushdownPolicy::Strict);
         assert_eq!(PushdownPolicy::parse("unknown"), PushdownPolicy::CostBased);
@@ -919,9 +957,18 @@ mod tests {
     #[test]
     fn test_fidelity_combine() {
         assert_eq!(Fidelity::Exact.combine(Fidelity::Exact), Fidelity::Exact);
-        assert_eq!(Fidelity::Exact.combine(Fidelity::Inexact), Fidelity::Inexact);
-        assert_eq!(Fidelity::Inexact.combine(Fidelity::Exact), Fidelity::Inexact);
-        assert_eq!(Fidelity::Inexact.combine(Fidelity::Inexact), Fidelity::Inexact);
+        assert_eq!(
+            Fidelity::Exact.combine(Fidelity::Inexact),
+            Fidelity::Inexact
+        );
+        assert_eq!(
+            Fidelity::Inexact.combine(Fidelity::Exact),
+            Fidelity::Inexact
+        );
+        assert_eq!(
+            Fidelity::Inexact.combine(Fidelity::Inexact),
+            Fidelity::Inexact
+        );
     }
 
     #[test]
@@ -935,12 +982,28 @@ mod tests {
         // (expr, fidelity, postgres SQL). Params asserted separately below.
         let cases: Vec<(Expr, Fidelity, &str)> = vec![
             (col("id").eq(lit(42i64)), Fidelity::Exact, "(\"id\" = $1)"),
-            (col("id").not_eq(lit(42i64)), Fidelity::Exact, "(\"id\" <> $1)"),
+            (
+                col("id").not_eq(lit(42i64)),
+                Fidelity::Exact,
+                "(\"id\" <> $1)",
+            ),
             (col("id").lt(lit(42i64)), Fidelity::Exact, "(\"id\" < $1)"),
-            (col("id").lt_eq(lit(42i64)), Fidelity::Exact, "(\"id\" <= $1)"),
+            (
+                col("id").lt_eq(lit(42i64)),
+                Fidelity::Exact,
+                "(\"id\" <= $1)",
+            ),
             (col("id").gt(lit(42i64)), Fidelity::Exact, "(\"id\" > $1)"),
-            (col("id").gt_eq(lit(42i64)), Fidelity::Exact, "(\"id\" >= $1)"),
-            (col("active").eq(lit(true)), Fidelity::Exact, "(\"active\" = $1)"),
+            (
+                col("id").gt_eq(lit(42i64)),
+                Fidelity::Exact,
+                "(\"id\" >= $1)",
+            ),
+            (
+                col("active").eq(lit(true)),
+                Fidelity::Exact,
+                "(\"active\" = $1)",
+            ),
             (
                 col("updated_at").gt(lit(ts.clone())),
                 Fidelity::Exact,
@@ -980,19 +1043,16 @@ mod tests {
         ];
 
         for (expr, fidelity, sql) in &cases {
-            let (f, pred) = translate(expr).unwrap_or_else(|| {
-                panic!("expected translatable expr: {expr:?}")
-            });
+            let (f, pred) =
+                translate(expr).unwrap_or_else(|| panic!("expected translatable expr: {expr:?}"));
             assert_eq!(*fidelity, f, "fidelity for {expr:?}");
             let mut params = Vec::new();
             assert_eq!(*sql, pred.render_sql(&pg, &mut params), "SQL for {expr:?}");
         }
 
         // Params arrive left-to-right: compound case yields [Int(1), Bool(true)].
-        let (_, pred) = translate(
-            &col("id").eq(lit(1i64)).and(col("active").eq(lit(true))),
-        )
-        .unwrap();
+        let (_, pred) =
+            translate(&col("id").eq(lit(1i64)).and(col("active").eq(lit(true)))).unwrap();
         let mut params = Vec::new();
         pred.render_sql(&pg, &mut params);
         assert_eq!(params, vec![SqlParam::Int(1), SqlParam::Bool(true)]);
@@ -1000,7 +1060,12 @@ mod tests {
         // Outside the allowlist: arithmetic, LIKE, and casts stay in Arrow.
         assert!(translate(&(col("a") + col("b"))).is_none());
         assert!(translate(&col("x").like(lit("a%"))).is_none());
-        assert!(translate(&Expr::Not(Box::new(Expr::Not(Box::new(col("x").is_null()))))).is_some());
+        assert!(
+            translate(&Expr::Not(Box::new(Expr::Not(Box::new(
+                col("x").is_null()
+            )))))
+            .is_some()
+        );
     }
 
     #[test]
@@ -1008,14 +1073,23 @@ mod tests {
         let expr = col("secret").eq(lit(100i64));
 
         // Policy::Never -> Keep
-        assert!(matches!(decide(&expr, PushdownPolicy::Never, &[]), Decision::Keep));
+        assert!(matches!(
+            decide(&expr, PushdownPolicy::Never, &[]),
+            Decision::Keep
+        ));
 
         // Policy::Always -> Push
-        assert!(matches!(decide(&expr, PushdownPolicy::Always, &[]), Decision::Push { .. }));
+        assert!(matches!(
+            decide(&expr, PushdownPolicy::Always, &[]),
+            Decision::Push { .. }
+        ));
 
         // Denylist blocks
         let deny = vec!["secret".to_string()];
-        assert!(matches!(decide(&expr, PushdownPolicy::Always, &deny), Decision::Keep));
+        assert!(matches!(
+            decide(&expr, PushdownPolicy::Always, &deny),
+            Decision::Keep
+        ));
     }
 
     #[test]
@@ -1072,23 +1146,48 @@ mod tests {
         let mut columns = HashMap::new();
         columns.insert(
             "id".to_string(),
-            ColumnStats { column_name: "id".to_string(), n_distinct: 100_000.0, null_frac: 0.0, avg_width: 8 },
+            ColumnStats {
+                column_name: "id".to_string(),
+                n_distinct: 100_000.0,
+                null_frac: 0.0,
+                avg_width: 8,
+            },
         );
         columns.insert(
             "status".to_string(),
-            ColumnStats { column_name: "status".to_string(), n_distinct: 2.0, null_frac: 0.0, avg_width: 10 },
+            ColumnStats {
+                column_name: "status".to_string(),
+                n_distinct: 2.0,
+                null_frac: 0.0,
+                avg_width: 10,
+            },
         );
         columns.insert(
             "amount".to_string(),
-            ColumnStats { column_name: "amount".to_string(), n_distinct: 50_000.0, null_frac: 0.0, avg_width: 8 },
+            ColumnStats {
+                column_name: "amount".to_string(),
+                n_distinct: 50_000.0,
+                null_frac: 0.0,
+                avg_width: 8,
+            },
         );
         columns.insert(
             "active".to_string(),
-            ColumnStats { column_name: "active".to_string(), n_distinct: 2.0, null_frac: 0.0, avg_width: 1 },
+            ColumnStats {
+                column_name: "active".to_string(),
+                n_distinct: 2.0,
+                null_frac: 0.0,
+                avg_width: 1,
+            },
         );
         columns.insert(
             "price".to_string(),
-            ColumnStats { column_name: "price".to_string(), n_distinct: 50_000.0, null_frac: 0.0, avg_width: 8 },
+            ColumnStats {
+                column_name: "price".to_string(),
+                n_distinct: 50_000.0,
+                null_frac: 0.0,
+                avg_width: 8,
+            },
         );
         crate::pushdown::stats::SourceStatistics {
             table_name: "orders".to_string(),
@@ -1139,8 +1238,14 @@ mod tests {
     /// Compact snapshot form: "push:exact" / "push:inexact" / "keep".
     fn summarize(decision: &Decision) -> &'static str {
         match decision {
-            Decision::Push { fidelity: Fidelity::Exact, .. } => "push:exact",
-            Decision::Push { fidelity: Fidelity::Inexact, .. } => "push:inexact",
+            Decision::Push {
+                fidelity: Fidelity::Exact,
+                ..
+            } => "push:exact",
+            Decision::Push {
+                fidelity: Fidelity::Inexact,
+                ..
+            } => "push:inexact",
             Decision::Keep => "keep",
         }
     }
@@ -1151,7 +1256,7 @@ mod tests {
         push: &[String],
         cost: Option<&CostInputs>,
     ) -> Vec<&'static str> {
-        let filters = vec![
+        let filters = [
             col("id").eq(lit(42i64)),
             col("status").eq(lit("PAID")),
             col("amount").gt(lit(10.5f64)),
@@ -1170,7 +1275,13 @@ mod tests {
         let indexes = indexed_id();
         let params = CostParams::default();
         let column_types = skewed_column_types();
-        let inputs = CostInputs { stats: &stats, params: &params, indexes: &indexes, explain: None, column_types: &column_types };
+        let inputs = CostInputs {
+            stats: &stats,
+            params: &params,
+            indexes: &indexes,
+            explain: None,
+            column_types: &column_types,
+        };
 
         // `always` pushes everything translatable; `cost_based` keeps the two low-value
         // predicates (status: selectivity 1/2; amount: range estimate 0.33, both >= 0.30)
@@ -1193,7 +1304,13 @@ mod tests {
         let indexes = indexed_id();
         let params = CostParams::default();
         let column_types = skewed_column_types();
-        let inputs = CostInputs { stats: &stats, params: &params, indexes: &indexes, explain: None, column_types: &column_types };
+        let inputs = CostInputs {
+            stats: &stats,
+            params: &params,
+            indexes: &indexes,
+            explain: None,
+            column_types: &column_types,
+        };
         let push = vec!["status".to_string()];
 
         // A hint forces the 50%-selective status predicate to the source even though the
@@ -1220,18 +1337,32 @@ mod tests {
         let indexes = indexed_id_active_price();
         let params = CostParams::default();
         let column_types = skewed_column_types();
-        let inputs = CostInputs { stats: &stats, params: &params, indexes: &indexes, explain: None, column_types: &column_types };
+        let inputs = CostInputs {
+            stats: &stats,
+            params: &params,
+            indexes: &indexes,
+            explain: None,
+            column_types: &column_types,
+        };
 
-        let filters = vec![
-            col("id").eq(lit(42i64)),      // indexed + bigint + selective → push
-            col("active").eq(lit(true)),   // indexed + boolean but 1/2 selectivity → keep
-            col("status").eq(lit("PAID")), // text and unindexed → keep
-            col("amount").gt(lit(10.5f64)),// float → keep
-            col("price").eq(lit(10i64)),   // indexed + selective but numeric → keep
+        let filters = [
+            col("id").eq(lit(42i64)),       // indexed + bigint + selective → push
+            col("active").eq(lit(true)),    // indexed + boolean but 1/2 selectivity → keep
+            col("status").eq(lit("PAID")),  // text and unindexed → keep
+            col("amount").gt(lit(10.5f64)), // float → keep
+            col("price").eq(lit(10i64)),    // indexed + selective but numeric → keep
         ];
         let got: Vec<&str> = filters
             .iter()
-            .map(|f| summarize(&decide_with(f, PushdownPolicy::Strict, &[], &[], Some(&inputs))))
+            .map(|f| {
+                summarize(&decide_with(
+                    f,
+                    PushdownPolicy::Strict,
+                    &[],
+                    &[],
+                    Some(&inputs),
+                ))
+            })
             .collect();
         assert_eq!(got, vec!["push:exact", "keep", "keep", "keep", "keep"]);
 
@@ -1262,8 +1393,7 @@ mod tests {
         // Arrow still re-checks. Without this Postgres fails the pushed query with 42883
         // (no `order_status = text` operator).
         let (fidelity, pred) = translate(&col("status").eq(lit("PAID"))).unwrap();
-        let (fidelity, pred) =
-            normalize_enum_comparison(fidelity, pred, &enum_set()).unwrap();
+        let (fidelity, pred) = normalize_enum_comparison(fidelity, pred, &enum_set()).unwrap();
         assert_eq!(fidelity, Fidelity::Inexact);
         assert_eq!(pred.render_inline(), "(\"status\"::text = 'PAID')");
     }
@@ -1283,8 +1413,7 @@ mod tests {
         // Same shapes, no enum membership: predicates pass through byte-identical.
         let (fidelity, pred) = translate(&col("status").eq(lit("PAID"))).unwrap();
         let (fidelity2, pred2) =
-            normalize_enum_comparison(fidelity, pred, &std::collections::HashSet::new())
-                .unwrap();
+            normalize_enum_comparison(fidelity, pred, &std::collections::HashSet::new()).unwrap();
         assert_eq!(fidelity2, Fidelity::Inexact);
         assert_eq!(pred2.render_inline(), "(\"status\" = 'PAID')");
 
@@ -1293,8 +1422,9 @@ mod tests {
         assert!(normalize_enum_comparison(fidelity, pred, &enum_set()).is_some());
     }
 
-        #[test]
-    fn test_render_inline_is_quoted_and_never_executed() {        let pred = Predicate::Cmp {
+    #[test]
+    fn test_render_inline_is_quoted_and_never_executed() {
+        let pred = Predicate::Cmp {
             left: Box::new(Predicate::Column("status".to_string())),
             op: "=".to_string(),
             right: Box::new(Predicate::Literal(Literal::Text("PA'D".to_string()))),
@@ -1366,10 +1496,7 @@ mod tests {
         assert_eq!(pg_sql, "((\"status\" = $1) AND (\"id\" > $2))");
         assert_eq!(
             pg_params,
-            vec![
-                SqlParam::Text("PAID".to_string()),
-                SqlParam::Int(42),
-            ],
+            vec![SqlParam::Text("PAID".to_string()), SqlParam::Int(42),],
         );
 
         let qmark = QmarkDialect;

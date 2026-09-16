@@ -1,49 +1,47 @@
-# Rust Extract Layer
+# Rust Ballista Extraction Layer
 
-A Rust-native, Arrow-based **incremental extraction engine** designed to intelligently push operations into source databases when beneficial, execute analytical transformations locally through DataFusion, and distribute scans across a Ballista cluster. The system produces columnar results (Arrow `RecordBatch` streams) for consumption by DataFusion writers, Ballista, or an orchestrator.
+A Rust-native, source-aware **extraction layer that builds on DataFusion and Ballista and outputs native Arrow**.
 
-> **Status (September 2026):** Phases 1–4 implemented and exercised against a live Postgres: single-node extraction with checkpointing, cost-based pushdown (`always`/`never`/`cost_based`/`strict`/`hinted`), true streaming with bounded memory, and distributed execution with budgeted source pools. 83 lib + 81 bin unit tests green; integration tests planned in [`docs/testing-plan.md`](docs/testing-plan.md) (Phase A done). See the [roadmap](docs/roadmap.md) for phased delivery.
+The layer handles source-aware pushdown, extraction planning, checkpointing, and streaming data as Arrow `RecordBatch`es. Operations can run in the source database or in DataFusion based on connector capabilities, statistics, and policy. Incremental extraction is one of the supported patterns. Ballista is used when distributed execution is configured.
 
+> **Status (September 2026):** Phases 1–4 implemented and tested against live PostgreSQL. See [`docs/roadmap.md`](docs/roadmap.md) for the roadmap and [`docs/testing-plan.md`](docs/testing-plan.md) for test coverage.
 ---
 
-## Experimental — Not Production Ready
-
-This project is experimental and under active development. It is intended for learning, experimentation, and exploring the design of a distributed database extraction layer for Apache DataFusion.
-Do not use this project in production blindly. The implementation has not yet been sufficiently validated for production workloads, and important concerns such as failure recovery, source-database consistency, concurrency, backpressure, performance, and operational behavior may still require further testing and hardening.
-If you are evaluating this project for production use, review and validate the implementation thoroughly against your specific workload and source database before relying on it.
-
----
 
 ## The one-paragraph pitch
 
-The interesting part of this project is *not* "Rust is faster than PySpark". The interesting part
-is **source-aware query optimization + incremental extraction + Arrow-native execution**. A normal
-JDBC-style extractor asks a database for rows and then filters them in the client. A normal
-federated query engine pushes everything it can into the source. Both are wrong some of the time.
-The Rust Extract Layer treats the *boundary between the database and the compute engine as a
-planning decision*, made per-operator, using source capabilities, table statistics, and an explicit
-cost policy.
+
+The project combines **source-aware query optimization, incremental extraction, and Arrow-native execution**.
+
+
+A typical JDBC-style extractor retrieves rows from a database and performs filtering in the client. A federated query engine can instead push operations into the source database. The Rust Extract Layer treats this boundary as part of the extraction plan.
+
+
+For each operation, the layer can determine whether it should run in the source database or in DataFusion. The decision uses the source's capabilities, table statistics, and an explicit pushdown policy. The resulting data is exposed as an Arrow `SendableRecordBatchStream` for downstream DataFusion or Ballista execution.
+
 
 ---
 
+
 ## Architecture
 
-```
+
+```text
               ┌─────────────────────────┐
               │     User / Pipeline     │
               │                         │
-              │  Rust API  │  SQL API   │
-              │  DataFrame │  job JSON  │
+              │  DataFrame API          │
+              │  Job JSON               │
               └────────────┬────────────┘
                            │
                            ▼
               ┌──────────────────────────┐
               │    Rust Extract Layer    │
               │                          │
-              │  Logical Plan            │
-              │  Source-Aware Optimizer  │
-              │  Connector (Postgres)    │
-              │  Incremental Extractor   │
+              │  Extraction Planning     │
+              │  Source-Aware Pushdown   │
+              │  PostgreSQL Connector    │
+              │  Incremental Extraction  │
               │  Checkpoint Store        │
               └────────────┬─────────────┘
                            │
@@ -51,319 +49,459 @@ cost policy.
                        PostgreSQL
                            │
                            ▼
-                  Arrow RecordBatch stream
+             SendableRecordBatchStream
                            │
                            ▼
               ┌──────────────────────────┐
-              │   DataFusion execution   │
-              │  (Ballista distributed   │
-              │   when configured)       │
+              │        DataFusion        │
+              │                          │
+              │  DataFrame / Execution   │
+              │  Transformations         │
+              │                          │
+              │  Ballista when configured│
               └────────────┬─────────────┘
                            │
                            ▼
                  local Parquet (examples)
 ```
 
-(MySQL appears in early sketches as the second connector; only Postgres exists. There is no
-GCS/BigQuery sink — sinks are out of scope; examples write local Parquet via DataFusion
-writers or `parquet::arrow::ArrowWriter`.)
 
-### What we build vs. what we borrow
+The extraction layer reads from PostgreSQL and exposes the result as a
+`SendableRecordBatchStream`. Data stays in Arrow's columnar format throughout — no copying or conversion as it flows into DataFusion.
 
-Building a Spark clone means owning a scheduler, shuffle, fault tolerance, resource management,
-catalog, optimizer, planner, connectors, metrics, and a UI. We are not doing that. DataFusion is
-explicitly designed as an *embeddable* query engine, so we borrow the engine and build the parts
-that are actually specific to extraction.
 
-| Concern | Owner |
-| --- | --- |
-| Logical/physical planning, expression eval, joins, aggregation | Apache DataFusion |
-| Columnar memory model, compute kernels, IPC | Apache Arrow |
-| Distributed scheduling and shuffle | Apache Ballista |
-| Parquet encoding | `parquet` crate |
-| **Source connectors and capability declaration** | **This project (Postgres only)** |
-| **Source-aware pushdown policy and cost model** | **This project** |
-| **Incremental extraction, watermarks, checkpointing** | **This project** |
-| **Job specification, CLI** | **This project** |
-| Sinks, partition layout, warehouse load orchestration | Delegated (DataFusion writers, Ballista, orchestrator) |
+Ballista can provide distributed execution when configured. The project does not implement its own sink layer; examples that need to materialize results locally use DataFusion writers or `parquet::arrow::ArrowWriter`.
 
-The dependency floor is DataFusion/Ballista `54.1.0` and Arrow `58.4` (the Arrow version DataFusion 54 pins).
-See [`docs/architecture.md`](docs/architecture.md) for the module layout and version policy.
+
+PostgreSQL is the implemented connector.
+
+
+### What We Implement vs. What We Reuse
+
+
+This project builds on existing query-engine infrastructure rather than implementing a query engine from scratch.
+
+
+DataFusion provides query planning and execution, Arrow provides the columnar data model, and Ballista provides distributed scheduling and execution.
+
+
+The extraction-specific parts are implemented here:
+
+
+| Part                                      | Project           |
+| ----------------------------------------- | ----------------- |
+| Query planning and execution              | Apache DataFusion |
+| Expression evaluation, joins, aggregation | Apache DataFusion |
+| Columnar data and memory format           | Apache Arrow      |
+| Distributed scheduling and shuffle        | Apache Ballista   |
+| PostgreSQL connector                      | This project      |
+| Source capability handling                | This project      |
+| Source-aware pushdown                     | This project      |
+| Incremental extraction and watermarks     | This project      |
+| Checkpointing                             | This project      |
+| Extraction job configuration and CLI      | This project      |
+
+
+The project currently uses DataFusion/Ballista `54.1.0` and Arrow `58.4`, the Arrow version pinned by DataFusion 54.
+
+
+See [`docs/architecture.md`](docs/architecture.md) for the module layout and execution flow.
+
 
 ---
 
-## The three ideas that matter
 
-### 1. Extract ≠ Transform
+## Three Ideas Behind the Project
 
-A pipeline like this is the failure mode we are designing against:
 
+### 1. Extraction and transformation are separate concerns
+
+
+The extraction layer decides which operations should run in the source database and which should run in the compute engine.
+
+
+For example:
+
+
+```text
+PostgreSQL
+    │
+    │  indexed predicates
+    │  partition pruning
+    │  simple projections
+    ▼
+SendableRecordBatchStream
+    │
+    │  Arrow
+    ▼
+DataFusion
+    │
+    │  CPU-heavy transformations
+    │  vectorized operations
+    │  complex expressions
+    │  cross-source processing
+    ▼
+Result
 ```
-Postgres  ──►  10 TB over the wire  ──►  Rust  ──►  filter  ──►  select  ──►  100 MB
-```
 
-The database is very good at index lookups, partition pruning, and projections. The Arrow engine is
-very good at vectorized CPU-heavy work. The planner's job is to place each operator on the side
-that will do it well:
 
-```
-DB                                   Rust / Arrow
-──                                   ────────────
-indexed predicates                   CPU-heavy transformations
-partition pruning                    UDFs and custom logic
-simple projections                   complex JSON manipulation
-joins with good indexes/stats        vectorized analytics
-aggregations that reduce data a lot  cross-source joins
-transactional consistency            anything the DB does badly
-                                     anything that steals prod CPU
-```
+The source database can handle operations such as indexed predicates, partition pruning, projections, and aggregations that significantly reduce the amount of data returned.
 
-### 2. Pushdown is a cost decision, not a capability check
 
-The naive rule is "if the source can execute it, push it down." That rule is wrong whenever the
-source *can* run the operator but will run it badly — an unindexed predicate that forces a
-sequential scan on a production primary, a regex the DB evaluates row-at-a-time, a JSON extraction
-that is 40× cheaper in Arrow, or a filter that removes 2% of rows and therefore saves almost no
-network bytes while burning CPU that a live application needs.
+DataFusion can handle vectorized transformations, custom logic, and operations that are better suited to the compute engine.
 
-So the decision is:
 
-```
+The extraction plan determines where each operation is executed.
+
+
+### 2. Pushdown is based on capabilities and cost
+
+
+The extraction layer does not treat source support as the only condition for pushdown.
+
+
+First, it checks whether the connector can express an operation while preserving its semantics. It then uses statistics and the configured policy to determine whether pushing the operation into the source is appropriate.
+
+
+```text
                 Operator
                    │
                    ▼
         ┌──────────────────────┐
-        │  Capability check    │   can the connector express it *with identical semantics*?
+        │  Capability check    │
+        │                      │
+        │ Can the connector    │
+        │ express it with      │
+        │ identical semantics? │
         └──────────┬───────────┘
+                   │
                    ▼
         ┌──────────────────────┐
-        │  Cost / policy model │   selectivity, index availability, source CPU budget,
-        └──────────┬───────────┘   expression cost, bytes saved
-          ┌────────┴────────┐
-          ▼                 ▼
-     push to source    keep in Arrow
+        │  Cost / policy model │
+        │                      │
+        │ Selectivity          │
+        │ Index availability   │
+        │ Source cost          │
+        │ Expression cost     │
+        │ Bytes saved          │
+        └──────────┬───────────┘
+                   │
+             ┌─────┴─────┐
+             ▼           ▼
+       Push to source  Keep in Arrow
 ```
 
-DataFusion gives us exactly the right hook for the "identical semantics" half of this:
-`TableProvider::supports_filters_pushdown` returns `Exact`, `Inexact`, or `Unsupported` per filter.
-`Exact` means the engine drops its own `FilterExec`; `Inexact` means the source pre-filters but
-DataFusion re-checks. That distinction is a correctness feature, and we use it aggressively —
-for example, MySQL's default case-insensitive collation means `status = 'PAID'` matches `'paid'`
-in the database but not in Arrow, so that predicate is pushed as **`Inexact`**, never `Exact`.
 
-Details, including the cost model and the full semantic-divergence catalogue, are in
-[`docs/pushdown.md`](docs/pushdown.md).
+DataFusion's `TableProvider::supports_filters_pushdown` provides the semantic part of this decision through `Exact`, `Inexact`, and `Unsupported`.
 
-### 3. Incremental extraction is the actual use case
 
-The real workload is not `SELECT * FROM orders`. It is:
+`Exact` means the source can apply the filter with equivalent semantics, allowing DataFusion to omit its own `FilterExec`.
+
+
+`Inexact` means the source can pre-filter the data, but DataFusion must evaluate the filter again to preserve correctness.
+
+
+For example, database collation can affect string comparison semantics. A case-insensitive source comparison such as `status = 'PAID'` may also match `'paid'`, while Arrow's comparison does not necessarily behave the same way. Such a predicate must therefore remain `Inexact`.
+
+
+See [`docs/pushdown.md`](docs/pushdown.md) for the cost model, policy engine, and semantic compatibility rules.
+
+
+### 3. Incremental extraction
+
+
+The primary extraction pattern is incremental rather than repeatedly scanning an entire table.
+
+
+For example:
+
 
 ```sql
 SELECT order_id, user_id, amount, updated_at
-FROM   orders
-WHERE  updated_at >  :last_checkpoint
-  AND  updated_at <= :new_checkpoint
+FROM orders
+WHERE updated_at > :last_checkpoint
+  AND updated_at <= :new_checkpoint
 ```
 
-run every N minutes, landing Parquet in GCS, loaded into BigQuery on a slower cadence:
 
-```
+A pipeline can run this query repeatedly using a checkpoint:
+
+
+```text
 00:00 ─┐
 01:00 ─┤
-02:00 ─┼──►  GCS Parquet  ──►  periodic BigQuery load / MERGE
+02:00 ─┼──► extracted data
 03:00 ─┤
 04:00 ─┘
 ```
 
-This is dramatically cheaper than streaming every mutation into BigQuery, and it is where the
-project earns its keep operationally. It is also full of correctness traps — commit-time vs.
-`updated_at` skew, boundary ties at coarse timestamp precision, invisible hard deletes — which
-are enumerated with mitigations in [`docs/incremental-extraction.md`](docs/incremental-extraction.md).
+
+The checkpoint store tracks the extraction boundary between runs. The implementation includes safety lag and bounded watermark windows to handle timestamp precision and late-arriving updates.
+
+
+Incremental extraction also has correctness considerations such as commit-time versus `updated_at` ordering, boundary ties, and hard deletes.
+
+
+See [`docs/incremental-extraction.md`](docs/incremental-extraction.md) for the extraction protocol and these edge cases.
+
 
 ---
 
+
 ## Intended API
 
-Two front ends over one logical plan. The DataFrame API is deliberately close to DataFusion's own,
-which is in turn close to Spark/Pandas:
+
+The DataFrame API provides a Rust interface over the extraction and DataFusion execution layers:
+
 
 ```rust
 let ctx = ExtractContext::from_config(config).await?;
 
+
 let batches = ctx
     .source("postgres", "public.orders").await?
-    .incremental(Watermark::timestamp("updated_at")).await?   // resolves from the checkpoint store
+    .incremental(Watermark::timestamp("updated_at")).await?
     .filter(col("status").eq(lit("PAID")))?
     .select(vec![col("order_id"), col("user_id"), col("amount")])?
     .with_column("amount_usd", col("amount") * lit(2.0))?
     .limit(0, Some(1_000_000))?
-    .collect().await?;   // Arrow RecordBatches — hand to a DataFusion writer or orchestrator
+    .collect().await?;
 ```
 
-Declarative jobs, for orchestrator-driven runs, describe the same plan in JSON
-(see `examples/configs/extract.example.json`):
+
+The result is a stream of Arrow `RecordBatch`es that can be consumed by DataFusion or another downstream component.
+
+
+Declarative jobs use the same extraction model through JSON configuration:
+
 
 ```json
 {
   "job_id": "orders_incremental",
   "table": "orders",
+  "columns": ["order_id", "user_id", "status", "amount", "currency", "item_count", "tags", "metadata", "shipped_on", "ext_ref", "created_at", "updated_at"],
   "source": {
-    "host": "localhost", "port": 5432,
-    "user": "postgres", "password_env": "ORDERS_PG_PASSWORD",
-    "database": "app", "pool_max": 8,
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password_env": "ORDERS_PG_PASSWORD",
+    "database": "app",
+    "pool_max": 8,
     "statement_timeout_ms": 300000,
-    "application_name": "rust-extract-layer", "schema": "public"
+    "application_name": "rust-extract-layer",
+    "schema": "public"
   },
-  "incremental": { "column": "updated_at", "safety_lag_secs": 300, "max_window_secs": 21600 },
-  "checkpoint": { "dir": "./.checkpoints" },
+  "incremental": {
+    "column": "updated_at",
+    "safety_lag_secs": 300,
+    "max_window_secs": 21600
+  },
+  "checkpoint": {
+    "dir": "./.checkpoints"
+  },
   "pushdown": {
     "policy": "cost_based",
-    "deny": [], "push": [],
-    "max_source_cost": 50000, "keep_threshold": 0.30, "statistics_ttl_secs": 900
+    "deny": [],
+    "push": [],
+    "max_source_cost": 50000,
+    "keep_threshold": 0.30,
+    "statistics_ttl_secs": 900
   },
-  "parallel_scan": { "strategy": "none", "partitions": 1, "partition_column": "order_id" },
-  "execution": { "batch_size": 8192 },
-  "distributed": { "scheduler_url": "", "workers": 2 }
+  "parallel_scan": {
+    "strategy": "none",
+    "partitions": 1,
+    "partition_column": "order_id"
+  },
+  "execution": {
+    "batch_size": 8192
+  },
+  "distributed": {
+    "scheduler_url": "",
+    "workers": 2
+  }
 }
 ```
 
-```bash
-cargo run -- run --config examples/configs/extract.example.json
-cargo run -- distribute --config examples/configs/extract.example.json --workers 2
-```
 
 ---
 
-## Examples
 
-The `examples/` directory contains runnable pipelines against a real PostgreSQL. They are
-executable documentation and smoke tests — not production entry points, and not a replacement
-for the test suite ([`docs/testing-plan.md`](docs/testing-plan.md)).
+## Getting Started
 
-| Example | What it runs |
-| --- | --- |
-| `full_extraction` | Whole-table load: schema discovery, type mapping, Arrow batches |
-| `incremental_extraction` | Watermark windows (`updated_at > lo AND <= hi`), safety lag, checkpoints |
-| `hourly_incremental` / `daily_incremental` | Scheduled-pipeline shape with checkpoint persistence and resume |
-| `parallel_extraction` | Partition-aware extraction across multiple scans |
-| `distributed_extraction` | Incremental job on the Ballista cluster (`<config> [workers] [scheduler-url]`) |
-| `dataframe_extraction` | Phase 2 DataFrame front end (`ExtractContext`) against a job spec |
-| `end_to_end` | Distributed **full load** → SQL transform → local Parquet file |
 
-All of them need a live Postgres (connection details in `examples/configs/extract.example.json`,
-password via the `password_env` variable) and, for the distributed ones, a running scheduler
-plus `rel worker`s — or omit the scheduler URL for in-process standalone mode:
+See [`QUICKSTART.md`](QUICKSTART.md) for complete setup, configuration, distributed execution, benchmarks, and testing.
+
+
+**TL;DR — single-node extraction:**
+
 
 ```bash
-# Incremental job through the CLI (single-node DataFusion)
-cargo run -- run --config examples/configs/extract.example.json
+docker run -d --name pg \
+  -e POSTGRES_PASSWORD=postgres \
+  -p 5433:5432 \
+  postgres:17
 
-# Same job, distributed, in-process scheduler+executor
-cargo run -- distribute --config examples/configs/extract.example.json --workers 2
 
-# Same job, remote cluster
-cargo run -- scheduler --scheduler-url localhost:50050   # terminal 1
-cargo run -- worker --scheduler-url localhost:50050      # terminal 2 (+ more)
-cargo run -- distribute --config examples/configs/extract.example.json --workers 2 \
-    --scheduler-url http://localhost:50050
+export ORDERS_PG_PASSWORD=postgres
 
-# Explain pushdown decisions for a filter
-cargo run -- plan --config examples/configs/extract.example.json \
-    --policy cost_based --filter 'status=PAID'
+
+cargo run --bin rust-ballista-extraction-layer -- run \
+  --config examples/configs/extract.example.json
 ```
 
+
+### Runnable Examples
+
+
+The `examples/` directory contains runnable pipelines against a real PostgreSQL database. They are also useful as executable documentation and smoke tests.
+
+
+| Example                                    | What it runs                                                          |
+| ------------------------------------------ | --------------------------------------------------------------------- |
+| `full_extraction`                          | Whole-table extraction, schema discovery, type mapping, Arrow batches |
+| `incremental_extraction`                   | Watermark windows, safety lag, and checkpoints                        |
+| `hourly_incremental` / `daily_incremental` | Scheduled extraction with checkpoint persistence and resume           |
+| `parallel_extraction`                      | Partition-aware extraction across multiple scans                      |
+| `distributed_extraction`                   | Incremental extraction using Ballista                                 |
+| `dataframe_extraction`                     | DataFrame API against a job specification                             |
+| `end_to_end`                               | Distributed full load → SQL transformation → local Parquet            |
+
+
+For example:
+
+
+```bash
+# Single-node
+cargo run --bin rust-ballista-extraction-layer -- run \
+  --config examples/configs/extract.example.json
+
+
+# In-process distributed execution
+cargo run --bin rust-ballista-extraction-layer -- distribute \
+  --config examples/configs/extract.example.json --workers 2
+
+
+# Explain pushdown decisions
+cargo run --bin rust-ballista-extraction-layer -- plan \
+  --config examples/configs/extract.example.json \
+  --policy cost_based \
+  --filter 'status=PAID'
+```
+
+
 ---
 
-## Scope: Completed and Current
 
-**Phase 1 (Completed):** PostgreSQL connector with schema resolution, cursor-based streaming scans, type mapping (incl. `text[]`, enums-as-text, tz-aware timestamps), timestamp watermark mode with safe-high-watermark, checkpoint store with leases (local JSON, atomic rename), projection/filter/limit pushdown with fidelity rules, Arrow output, `run`/`plan`/`checkpoint` CLI, logging. (The binary-`COPY` bulk path was removed in a dependency slimming pass — zero callers, zero tests; restorable from git, spec retained in `docs/connectors/postgres.md` §2.1.)
+## Current Scope
 
-**Phase 2 (Completed):** DataFrame API over DataFusion's `DataFrame`. Cost-based pushdown with real statistics (`pg_stats`/`pg_class`), index metadata, EXPLAIN estimates, and policy engine (`always`/`never`/`cost_based`/`strict`/`hinted`). Real `SourceAwarePushdown` optimizer rule. Enum-vs-text normalization. Keyset + ctid partition strategies (exported snapshots deferred). Backfill with per-chunk commits under a separate namespace.
 
-**Phase 3 (Completed):** True streaming execution with bounded memory (`RowBatchBuilder`, O(`batch_size`)), configurable `batch_size` (default 8192).
+**Phases 1–4 implemented** — PostgreSQL connector (cursor streaming, type mapping), timestamp watermarks and checkpointing, cost-based pushdown (`always`/`never`/`cost_based`/`strict`/`hinted`) with keyset/`ctid` partitioning, bounded-memory streaming (`RowBatchBuilder`, `batch_size` 8192), and distributed execution (Ballista scheduler/workers, serializable plans, budgeted pools). Connector SPI (`SourceDescriptor`, `WatermarkSource`, `TableStatsSource`, `SqlDialect`/`Predicate::render_to`) is ready for additional backends; PostgreSQL is the implemented connector.
 
-**Phase 4 (Completed):** Distributed execution via `rel scheduler`/`rel worker` (Ballista 54.1.0, codecs compiled in — stock binaries can't decode our plans). Serializable plans with magic-prefixed JSON payloads, per-process budgeted pools (`pool_max / workers`, passwords never serialized).
+See [`docs/architecture.md`](docs/architecture.md), [`docs/pushdown.md`](docs/pushdown.md), [`docs/incremental-extraction.md`](docs/incremental-extraction.md), and [`docs/connectors/postgres.md`](docs/connectors/postgres.md) for details.
 
-**Connector SPI (ready for Phase 5):** `SourceDescriptor`, `WatermarkSource`, `TableStatsSource` traits; backend-neutral SQL rendering (`Predicate::render_to` + `SqlSink` + `SqlParam` IR, `SqlDialect` conventions). Pools and `QueryBuilder` binding stay backend-concrete by design — see `src/connector/mod.rs`.
 
-**Phase 5 (Planned):** MySQL connector to prove the SPI. Needs the `mysql` sqlx feature plus a live MySQL.
+**Testing**
 
-**Testing:** 83 lib + 81 bin unit tests green (see [`docs/testing-plan.md`](docs/testing-plan.md), Phase A done; integration suites planned).
+109 library unit tests cover pushdown, type mapping, partitioning, watermarks and codecs. Integration and e2e tests use a self-provisioned PostgreSQL (via `postgresql_embedded`, no Docker required) with a deterministic hostile fixture (NULLs, distinct types, enum, arrays, edge timestamps) and verify extraction, pushdown, and distributed execution. See [`docs/testing-plan.md`](docs/testing-plan.md) for the full matrix and how to run (`cargo test --test pg_*`, `cargo test --test e2e`).
 
-**Explicitly deferred:** Python wrapper (placeholder design in [`docs/python-bindings.md`](docs/python-bindings.md)), log-based CDC, connectors beyond Postgres/MySQL, metrics/tracing, sink implementations.
+
+**Deferred**
+
+
+* Python/PyO3 wrapper
+* Log-based CDC
+* Additional connectors beyond PostgreSQL
+* Metrics and tracing
+* Sink implementations
+
 
 ---
+
 
 ## Benchmark Summary
 
-Benchmarked against PySpark 3.5.4 using PostgreSQL 17.11 across 4 GB and 8 GB memory configurations and multiple batch sizes. Full benchmark results are available in [`benchmark/README.md`](benchmark/README.md).
 
-| Workload  | Engine                   |   Elapsed Range |   Max RSS Range | Summary                                            |
-| --------- | ------------------------ | --------------: | --------------: | -------------------------------------------------- |
-| Full      | PySpark                  |     17.3–19.7 s |     1.9–3.8 GiB | Baseline                                           |
-| Full      | Rust Ballista Standalone |     18.8–21.3 s | **127–303 MiB** | Comparable latency with substantially lower memory |
-| Full      | Rust Ballista Remote     | **15.5–19.3 s** |     294–584 MiB | **Fastest full extraction**                        |
-| Selective | PySpark                  |     4.16–4.44 s |     593–767 MiB | Baseline                                           |
-| Selective | Rust Ballista Standalone |     6.16–6.28 s |   **16–17 MiB** | Lower resource usage, but slower                   |
-| Selective | Rust Ballista Remote     | **0.60–0.70 s** |     219–491 MiB | **Fastest selective extraction**                   |
+The current benchmark compares the experimental implementation with PySpark 3.5.4 using PostgreSQL 17.11.
 
-### Key Findings
 
-* **Full extraction:** Rust Ballista Remote achieved the best observed latency at **15.5 s**, while Rust Standalone remained broadly comparable to PySpark.
-* **Selective extraction:** Rust Ballista Remote completed the workload in **0.60–0.70 s**, approximately **6–7× faster than PySpark** and **9–10× faster than Rust Standalone**.
-* **Resource efficiency:** Rust Standalone used dramatically less memory: **127–303 MiB** for full extraction (roughly **6–30× less** than PySpark's 1.9–3.8 GiB) and only **16–17 MiB** for selective extraction.
-* **Rust Standalone trade-off:** The standalone engine prioritizes low resource consumption but does not currently match the latency of PySpark for selective workloads.
-* **Distributed execution:** The benchmark shows that Ballista's distributed execution can be beneficial even for the selective workload in this setup, with the remote configuration outperforming both PySpark and standalone execution.
-* **Worker utilization:** The remote full-extraction workload is distributed relatively evenly across the four workers, demonstrating effective parallel execution.
-* **Memory limits:** Moving from 8 GB to 4 GB did not fundamentally change the relative performance characteristics.
-* **Batch size:** A 64k batch size produced competitive or improved full-extraction latency in several configurations, while selective workloads remained dominated by the execution mode rather than batch size.
+| Workload  | Engine                   |     Elapsed |     Max RSS |
+| --------- | ------------------------ | ----------: | ----------: |
+| Full      | PySpark                  | 17.3–19.7 s | 1.9–3.8 GiB |
+| Full      | Rust Ballista Standalone | 18.8–21.3 s | 127–303 MiB |
+| Full      | Rust Ballista Remote     | 15.5–19.3 s | 294–584 MiB |
+| Selective | PySpark                  | 4.16–4.44 s | 593–767 MiB |
+| Selective | Rust Ballista Standalone | 6.16–6.28 s |   16–17 MiB |
+| Selective | Rust Ballista Remote     | 0.60–0.70 s | 219–491 MiB |
 
-> **Note:** These are engineering benchmarks for the current experimental implementation, not a general-purpose PySpark vs. Rust performance comparison. Results depend on workload, hardware, memory limits, batch size, execution plan, and distributed topology. Ranges above span all four run configurations (4 GB / 8 GB × tool-default / 64k batching); see [`benchmark/README.md`](benchmark/README.md) for the per-run tables.
+
+**Key Findings:**
+
+- **Full extraction:** Rust Ballista Remote achieved the best latency at **15.5 s**; Rust Standalone was broadly comparable to PySpark (18.8–21.3 s vs 17.3–19.7 s).
+- **Selective extraction:** Rust Ballista Remote was **6–7× faster than PySpark** and **9–10× faster than Standalone** at **0.60–0.70 s** vs 4.16–4.44 s / 6.16–6.28 s.
+- **Resource efficiency:** Rust Standalone used **127–303 MiB** for full (6–30× less than PySpark's 1.9–3.8 GiB) and **16–17 MiB** for selective.
+- **Distributed execution:** Remote outperformed both PySpark and Standalone even for the small selective result set; workers were evenly utilized across 4 workers.
+- **Memory & batch size:** 4 GB vs 8 GB did not change relative ordering; 64k batching was competitive or better for full, while selective was dominated by execution mode.
+
+> These are measurements of the current implementation on this workload/hardware — not a general Rust-vs-PySpark claim.
+
+See [`benchmark/README.md`](benchmark/README.md) for the complete per-run tables and methodology.
+
+
+---
+
+
+## AI-Assisted Development
+
+
+AI tools were used throughout the project for implementation, code exploration, debugging, and iteration.
+
+
+The overall architecture, requirements, design decisions, technical trade-offs, and implementation direction were under my technical direction. AI-generated output was reviewed and tested rather than treated as automatically correct.
+
 
 ---
 
-### AI-Assisted Development
-
-This project was developed with the assistance of AI tools for implementation, code exploration, debugging, and iteration.
-The **overall system was architected and implemented under my technical direction**, including the requirements, architecture, design decisions, technical trade-offs, and implementation approach.
-AI assistance does not imply that the resulting design or implementation has been automatically validated for correctness or production readiness. The code remains subject to my own review, testing, and engineering judgment.
-
----
 
 ## Documentation
 
-| Document | What it covers |
-| --- | --- |
-| [`docs/roadmap.md`](docs/roadmap.md) | Phased delivery plan with exit criteria for Phases 1–5 |
-| [`docs/phase-two-implementation-plan.md`](docs/phase-two-implementation-plan.md) | Phase 2 record: cost model, statistics, optimizer rule, front end (incl. second-pass amendment) |
-| [`docs/phase-three-implementation-plan.md`](docs/phase-three-implementation-plan.md) | Phase 3 record: true streaming, RowBatchBuilder, configurable batch_size |
-| [`docs/phase-four-implementation-plan.md`](docs/phase-four-implementation-plan.md) | Phase 4 record: codecs, pool registry, scheduler/worker commands |
-| [`docs/testing-plan.md`](docs/testing-plan.md) | Unit + integration test strategy (Phase A done) |
-| [`docs/architecture.md`](docs/architecture.md) | Module layout, plan lifecycle, Arrow data model, execution and memory management, config, observability |
-| [`docs/connectors/README.md`](docs/connectors/README.md) | The connector SPI: capability declaration, scan planning, partitioning, type mapping rules |
-| [`docs/connectors/postgres.md`](docs/connectors/postgres.md) | PostgreSQL specifics: session hygiene, watermark query, type mapping, statistics |
-| [`docs/connectors/mysql.md`](docs/connectors/mysql.md) | MySQL **design** (no implementation): streaming protocol, collation hazards, zero-dates, GTID anchoring |
-| [`docs/pushdown.md`](docs/pushdown.md) | Expression translation, `Exact`/`Inexact` rules, cost model, policy engine |
-| [`docs/incremental-extraction.md`](docs/incremental-extraction.md) | Watermark modes (timestamp implemented), checkpoint protocol, correctness hazards, backfills |
-| [`docs/python-bindings.md`](docs/python-bindings.md) | Deferred — placeholder design for the future PyO3 wrapper |
+
+| Document                                                           | What it covers                                                                   |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| [`docs/roadmap.md`](docs/roadmap.md)                               | Phased delivery plan                                                             |
+| [`docs/quickstart.md`](docs/quickstart.md)                         | Setup, configuration, distributed execution, benchmarks, and testing             |
+| [`docs/architecture.md`](docs/architecture.md)                     | Module layout, plan lifecycle, Arrow data model, execution and memory management |
+| [`docs/connectors/README.md`](docs/connectors/README.md)           | Connector SPI, capabilities, scan planning, partitioning, and type mapping       |
+| [`docs/connectors/postgres.md`](docs/connectors/postgres.md)       | PostgreSQL-specific implementation details                                       |
+| [`docs/connectors/mysql.md`](docs/connectors/mysql.md)             | MySQL connector design (planned)                                                   |
+| [`docs/pushdown.md`](docs/pushdown.md)                             | Pushdown rules, semantic compatibility, cost model, and policy engine            |
+| [`docs/incremental-extraction.md`](docs/incremental-extraction.md) | Watermarks, checkpoints, backfills, and correctness considerations               |
+| [`docs/testing-plan.md`](docs/testing-plan.md)                     | Unit and integration testing                                                     |
+| [`docs/python-bindings.md`](docs/python-bindings.md)               | Future PyO3 wrapper design                                                       |
+
 
 ---
 
-## Non-goals
 
-- **Not a Spark replacement.** No cluster manager, no general-purpose RDD-style API, no notebook UI.
-- **Not a database.** No storage layer, no transactions, no serving path.
-- **Not a CDC platform** (at least initially). Log-based capture is a documented future path for
-  Postgres and MySQL, not a Phase 1 deliverable; see the connector docs.
-- **Not a benchmark-driven claim of "N× faster than Spark".** Removing the JVM, GC pauses, and the
-  Python serialization boundary is a real structural advantage, and Arrow's columnar layout enables
-  SIMD and cache-efficient execution — but the actual win is workload-dependent and we will publish
-  measurements rather than multipliers.
+## What This Project Does Not Try to Be
+
+
+* A Spark replacement or general-purpose cluster platform.
+* A database or storage engine.
+* A log-based CDC platform.
+* A benchmark claiming a fixed performance multiplier over PySpark.
+* A sink implementation for every downstream storage system.
+
+
+The focus is the extraction layer between operational databases and analytical execution.
+
 
 ---
+
 
 ## License
 
+
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for details.
+
 
 The project builds on [Apache DataFusion](https://github.com/apache/datafusion) and [Apache Arrow](https://github.com/apache/arrow-rs), both Apache 2.0 licensed.

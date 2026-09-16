@@ -35,7 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    println!("dataframe extraction: {rows} row(s) in {} batch(es)", batches.len());
+    println!(
+        "dataframe extraction: {rows} row(s) in {} batch(es)",
+        batches.len()
+    );
 
     // SQL entry point against the same registered sources.
     let sql_rows = ctx

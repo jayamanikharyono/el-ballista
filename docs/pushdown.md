@@ -1,9 +1,8 @@
 # Source-Aware Pushdown
 
-This is the part of the project that makes it more than a fast JDBC extractor. This document
-specifies how an operator is translated to source SQL, how we decide whether pushing it down is
-actually a good idea, and — most importantly — how we avoid the correctness bugs that pushdown
-invites.
+This document specifies how an operator is translated to source SQL, how the planner decides whether pushing it down is appropriate, and how semantic correctness is preserved.
+
+The extraction layer is source-aware: operations run in the source database or in DataFusion based on connector capabilities, statistics, and policy. Results are exposed as Arrow `RecordBatch`es.
 
 ---
 
@@ -66,7 +65,7 @@ pub trait SqlDialect {
     fn fidelity(&self, expr: &Expr, col_meta: &ColumnMeta) -> Fidelity; // Exact | Inexact
 
     fn quote_ident(&self, ident: &str) -> String;
-    fn placeholder(&self, index: usize) -> String;   // "$1" for pg, "?" for mysql
+    fn placeholder(&self, index: usize) -> String;   // "$1" for Postgres
 }
 ```
 
@@ -101,13 +100,12 @@ for extraction workloads, which are dominated by selective scans. See [roadmap](
 This section is the reason gate 2 exists. Each item is a real way to get wrong data, along with
 the rule we apply.
 
-### 3.1 String collation — the big one
+### 3.1 String collation
 
-MySQL's default collation for `utf8mb4` in 8.0 is `utf8mb4_0900_ai_ci`: **accent-insensitive and
-case-insensitive**. So:
+A case-insensitive or accent-insensitive collation makes `status = 'PAID'` also match `'paid'`:
 
 ```sql
--- MySQL, default collation
+-- case-insensitive collation
 SELECT * FROM orders WHERE status = 'PAID';   -- also matches 'paid', 'Paid', 'PÁID'
 ```
 
@@ -122,8 +120,6 @@ own filter — you have just silently loosened the query and included rows the u
 | Postgres, any other deterministic collation, `=` only | `Exact` (equality under deterministic collations is byte equality) |
 | Postgres, non-`C` collation, ordering comparison (`< >`) | `Inexact` |
 | Postgres, `citext` column or non-deterministic collation | `Inexact` |
-| MySQL, `_bin` or `utf8mb4_0900_as_cs` collation | `Exact` |
-| MySQL, any `_ci` or `_ai` collation | **`Inexact`** |
 | Unknown / unresolvable collation | `Inexact` |
 
 `Inexact` here is not a performance loss worth worrying about: the database still does the work of
@@ -151,9 +147,6 @@ translation unless the equivalence holds under three-valued logic. Specifically,
 
 ### 3.3 Numeric type width and precision
 
-- MySQL `BIGINT UNSIGNED` exceeds `i64`. If it maps to Arrow `UInt64`, a literal comparison against
-  a value above `i64::MAX` must be bound as an unsigned parameter, or the source sees a wrapped
-  value. If it maps to `Decimal128`, comparison fidelity depends on the decimal scale matching.
 - Postgres `NUMERIC` has effectively unbounded precision. If we map it to `Decimal128(38, s)` and a
   row exceeds that, the *scan* fails — but a *pushed comparison* against a literal that exceeds
   our declared precision would be evaluated at full precision in the database and at truncated
@@ -166,16 +159,14 @@ translation unless the equivalence holds under three-valued logic. Specifically,
 ### 3.4 Arithmetic and overflow
 
 `amount * 100` overflows into an error in Postgres (`integer out of range`) but may wrap or produce
-a different result in Arrow depending on the kernel. Division by zero errors in both Postgres and
-MySQL's strict mode, but MySQL in non-strict mode returns `NULL`. **Rule:** arithmetic inside a
-pushed predicate is `Inexact`, and arithmetic in a *projection* is not pushed at all — computing
-`amount * rate` in Arrow is cheap and keeps semantics under our control.
+a different result in Arrow depending on the kernel. **Rule:** arithmetic inside a
+pushed predicate is **not pushed** — `translate` returns `None` for arithmetic operators, so they
+stay in Arrow where semantics are under our control. Arithmetic in a *projection* is also not pushed.
 
 ### 3.5 Timestamps and time zones
 
 Postgres `timestamptz` is stored as UTC and rendered per the session `TimeZone` setting; `timestamp`
-has no zone at all. MySQL `TIMESTAMP` converts to/from the session `time_zone` on read and write,
-while `DATETIME` does not.
+has no zone at all.
 
 **Rule:** every connection sets its session time zone to UTC explicitly at connect time
 (`SET TIME ZONE 'UTC'` / `SET time_zone = '+00:00'`), and timestamp literals are always bound as
@@ -200,13 +191,13 @@ The model estimates two quantities and compares them against a policy budget.
 
 Statistics come from the source, cheaply, and are cached with a TTL (default 15 minutes):
 
-| Input | Postgres | MySQL |
-| --- | --- | --- |
-| Row count estimate | `pg_class.reltuples` | `information_schema.TABLES.TABLE_ROWS` (approximate for InnoDB) |
-| Column selectivity | `pg_stats` — `n_distinct`, `most_common_vals`/`most_common_freqs`, `histogram_bounds` | `information_schema.COLUMN_STATISTICS` histograms (require `ANALYZE TABLE … UPDATE HISTOGRAM`), else `STATISTICS.CARDINALITY` |
-| Index availability | `pg_index` + `pg_class` | `information_schema.STATISTICS` |
-| Plan cost / access method | `EXPLAIN (FORMAT JSON)` — plans without executing | `EXPLAIN FORMAT=JSON` |
-| Table size | `pg_total_relation_size()` | `DATA_LENGTH + INDEX_LENGTH` |
+| Input | Postgres |
+| --- | --- |
+| Row count estimate | `pg_class.reltuples` |
+| Column selectivity | `pg_stats` — `n_distinct`, `most_common_vals`/`most_common_freqs`, `histogram_bounds` |
+| Index availability | `pg_index` + `pg_class` |
+| Plan cost / access method | `EXPLAIN (FORMAT JSON)` — plans without executing |
+| Table size | `pg_total_relation_size()` |
 
 `EXPLAIN` is the highest-fidelity signal and the one we lean on for the decisive cases: it tells us
 whether the candidate predicate produces an index scan or a sequential scan, and at what estimated
@@ -258,14 +249,19 @@ Two guardrails override the arithmetic:
 | `strict` | Push a filter only if every referenced column is indexed, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp); never push `LIMIT`; `push` hints ignored, `deny` still applies | Source under pressure but the watermark must flow |
 | `hinted` | Per-column and per-predicate overrides in the job spec | When you know something the stats do not |
 
-Configured per source, overridable per job:
+Configured per source, overridable per job (JSON job spec):
 
-```toml
-[sources.orders_pg.pushdown]
-policy = "cost_based"
-max_source_cost = 50000
-keep_threshold  = 0.30       # predicates removing <70% of rows are candidates for Arrow
-deny = ["regexp_match", "json_get"]
+```json
+{
+  "pushdown": {
+    "policy": "cost_based",
+    "max_source_cost": 50000,
+    "keep_threshold": 0.30,
+    "statistics_ttl_secs": 900,
+    "deny": ["status", "nick"],
+    "push": ["id"]
+  }
+}
 ```
 
 The watermark predicate from [incremental extraction](incremental-extraction.md) is a special case:

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use arrow::datatypes::Schema;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion::catalog::Session;
 use datafusion::{
@@ -15,17 +15,14 @@ use crate::connector::errors::ExtractorError;
 use crate::connector::postgres::execution_plan::PostgresExecutionPlan;
 use crate::connector::postgres::parallel::ParallelStrategy;
 use crate::distributed::connection::PostgresConnectionDescriptor;
-use crate::distributed::pool_registry::{registry, SourcePool};
+use crate::distributed::pool_registry::{SourcePool, registry};
 use crate::pushdown::cost_model::CostParams;
 use crate::pushdown::explain::ExplainEstimator;
 use crate::pushdown::stats::{IndexInfo, SourceStatistics, StatisticsCollector, TableStatsSource};
 use crate::pushdown::{self, CostInputs, Decision, PushdownPolicy};
 use crate::types::TableMetadata;
 
-use super::{
-    row_adapter::PostgresRowAdapter,
-    schema_reader::PostgresSchemaReader,
-};
+use super::{row_adapter::PostgresRowAdapter, schema_reader::PostgresSchemaReader};
 
 /// The serializable form of a `PostgresTableProvider` — what the codec embeds in the logical
 /// plan the `rel distribute` client sends to the scheduler (see `distributed::table_codec`).
@@ -95,6 +92,7 @@ impl PostgresTableProvider {
     /// Discovers the table schema (through the process-shared, budgeted pool), fetches cost
     /// statistics and index metadata (best-effort: missing stats only make `cost_based`
     /// conservative, never wrong), and builds a provider ready for local or distributed use.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         descriptor: PostgresConnectionDescriptor,
         table_name: &str,
@@ -113,11 +111,9 @@ impl PostgresTableProvider {
             .get_table_metadata(table_name)
             .await?;
 
-        let table_schema =
-            PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
+        let table_schema = PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
 
-        let collector =
-            StatisticsCollector::new(Arc::new(pool.clone()), statistics_ttl_secs);
+        let collector = StatisticsCollector::new(Arc::new(pool.clone()), statistics_ttl_secs);
         let stats = collector
             .get_statistics(&table_metadata.schema_name, &table_metadata.table_name)
             .await
@@ -243,7 +239,11 @@ impl PostgresTableProvider {
     /// Phase 4: paper over `bytesize`... this sets how many Ballista scan tasks (one per key
     /// range) this provider's `scan()` produces, and therefore how many executor processes share
     /// the source connection budget.
-    pub fn with_parallel_workers(mut self, workers: usize, partition_column: Option<String>) -> Self {
+    pub fn with_parallel_workers(
+        mut self,
+        workers: usize,
+        partition_column: Option<String>,
+    ) -> Self {
         self.parallel_workers = workers.max(1);
         self.partition_column = partition_column;
         self
@@ -270,10 +270,7 @@ impl PostgresTableProvider {
         self
     }
 
-    fn cost_inputs_with_explain(
-        &self,
-        predicate_sql: &str,
-    ) -> Option<CostInputs<'_>> {
+    fn cost_inputs_with_explain(&self, predicate_sql: &str) -> Option<CostInputs<'_>> {
         if !self.cost_enabled {
             return None;
         }
@@ -305,11 +302,9 @@ impl PostgresTableProvider {
         };
         // Enum normalization first: without it an enum-vs-text predicate would report Exact
         // (or push unresolvable SQL) and fail at execution with 42883.
-        let Some((fidelity, predicate)) = pushdown::normalize_enum_comparison(
-            fidelity,
-            predicate,
-            &self.enum_columns,
-        ) else {
+        let Some((fidelity, predicate)) =
+            pushdown::normalize_enum_comparison(fidelity, predicate, &self.enum_columns)
+        else {
             return Decision::Keep;
         };
         let predicate_sql = predicate.render_inline();
@@ -338,7 +333,10 @@ impl PostgresTableProvider {
     /// different decision than the one taken.
     pub fn explain_decision(&self, expr: &Expr) -> String {
         match self.decide_cost(expr) {
-            Decision::Push { fidelity, predicate } => {
+            Decision::Push {
+                fidelity,
+                predicate,
+            } => {
                 format!(
                     "PUSH ({fidelity:?}; {}; {})",
                     self.push_reason(fidelity, &predicate),
@@ -353,10 +351,12 @@ impl PostgresTableProvider {
         match self.policy {
             PushdownPolicy::Never => "unreachable: never keeps everything".to_string(),
             PushdownPolicy::Always => "policy=always".to_string(),
-            PushdownPolicy::Strict => match self.cost_inputs_with_explain(&predicate.render_inline()) {
-                Some(inputs) => pushdown::describe_strict(predicate, Some(&inputs)),
-                None => pushdown::describe_strict(predicate, None),
-            },
+            PushdownPolicy::Strict => {
+                match self.cost_inputs_with_explain(&predicate.render_inline()) {
+                    Some(inputs) => pushdown::describe_strict(predicate, Some(&inputs)),
+                    None => pushdown::describe_strict(predicate, None),
+                }
+            }
             PushdownPolicy::Hinted
                 if pushdown::references_push_column_public(predicate, &self.push) =>
             {
@@ -451,11 +451,9 @@ impl PostgresTableProvider {
             };
             // Warm the normalized shape — the cache is keyed by SQL text, and lookups use
             // the normalized form, so warming the raw form would never hit.
-            let Some((_, predicate)) = pushdown::normalize_enum_comparison(
-                fidelity,
-                predicate,
-                &self.enum_columns,
-            ) else {
+            let Some((_, predicate)) =
+                pushdown::normalize_enum_comparison(fidelity, predicate, &self.enum_columns)
+            else {
                 continue;
             };
             let inline = predicate.render_inline();
@@ -493,12 +491,14 @@ impl TableProvider for PostgresTableProvider {
         Ok(filters
             .iter()
             .map(|f| match self.decide_cost(f) {
-                Decision::Push { fidelity: pushdown::Fidelity::Exact, .. } => {
-                    TableProviderFilterPushDown::Exact
-                }
-                Decision::Push { fidelity: pushdown::Fidelity::Inexact, .. } => {
-                    TableProviderFilterPushDown::Inexact
-                }
+                Decision::Push {
+                    fidelity: pushdown::Fidelity::Exact,
+                    ..
+                } => TableProviderFilterPushDown::Exact,
+                Decision::Push {
+                    fidelity: pushdown::Fidelity::Inexact,
+                    ..
+                } => TableProviderFilterPushDown::Inexact,
                 Decision::Keep => TableProviderFilterPushDown::Unsupported,
             })
             .collect())
@@ -531,7 +531,10 @@ impl TableProvider for PostgresTableProvider {
 
         for f in filters {
             match self.decide_cost(f) {
-                Decision::Push { fidelity, predicate } => {
+                Decision::Push {
+                    fidelity,
+                    predicate,
+                } => {
                     if fidelity == pushdown::Fidelity::Inexact {
                         any_inexact = true;
                     }
@@ -548,9 +551,7 @@ impl TableProvider for PostgresTableProvider {
         // docs/pushdown.md §5 — never push LIMIT alongside an Inexact filter: a source-side
         // LIMIT could leave fewer than `limit` valid rows once DataFusion re-checks the filter.
         // Under `strict`, LIMIT is never pushed at all (filters only).
-        let pushed_limit = if self.policy == PushdownPolicy::Strict {
-            None
-        } else if any_inexact {
+        let pushed_limit = if self.policy == PushdownPolicy::Strict || any_inexact {
             None
         } else {
             limit
@@ -568,15 +569,18 @@ impl TableProvider for PostgresTableProvider {
             match self.strategy {
                 ParallelStrategy::Keyset => match &self.partition_column {
                     Some(partition_column) => {
-                        let bounds = crate::connector::postgres::parallel::compute_keyset_partitions(
-                            &pool,
-                            &self.table_metadata.schema_name,
-                            &self.table_metadata.table_name,
-                            partition_column,
-                            self.parallel_workers,
-                        )
-                        .await
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                        let bounds =
+                            crate::connector::postgres::parallel::compute_keyset_partitions(
+                                &pool,
+                                &self.table_metadata.schema_name,
+                                &self.table_metadata.table_name,
+                                partition_column,
+                                self.parallel_workers,
+                            )
+                            .await
+                            .map_err(|e| {
+                                datafusion::error::DataFusionError::External(Box::new(e))
+                            })?;
 
                         // A single, bound-less partition (empty table, or min >= max) means
                         // "scan everything" — collapse it to one unsplit task so rows are
@@ -620,6 +624,7 @@ impl TableProvider for PostgresTableProvider {
             self.window,
             self.batch_size,
             partitions,
+            crate::connector::query_tag::fresh_run_id(),
         )?;
 
         Ok(Arc::new(plan))
@@ -630,7 +635,7 @@ impl TableProvider for PostgresTableProvider {
 mod tests {
     use super::*;
     use crate::connector::postgres::parallel::ParallelStrategy;
-    use datafusion::prelude::{col, lit, SessionContext};
+    use datafusion::prelude::{SessionContext, col, lit};
 
     /// A decode-side provider (no pool): `scan()` resolves the pool lazily, so with a
     /// dummy password env var this exercises the full filter→SQL path with zero network.

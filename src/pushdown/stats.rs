@@ -145,17 +145,19 @@ impl TableStatsSource for PgPool {
         schema_name: &str,
         table_name: &str,
     ) -> Result<SourceStatistics, ExtractorError> {
-        // Fetch table-level stats from pg_class.
+        // Fetch table-level stats from pg_class/nspname — the old
+        // `pg_class JOIN information_schema.tables ON relname=table_name` cross-matched
+        // same-named tables in other schemas and included toast/index rels.
         let (row_count, table_size_bytes) = sqlx::query_as::<_, (f64, i64)>(
             r#"
             SELECT
-                COALESCE(reltuples, 0)::float8 AS row_count,
-                COALESCE(pg_total_relation_size(pg_class.oid), 0)::int8 AS table_size
-            FROM pg_class
-            JOIN information_schema.tables ON
-                pg_class.relname = information_schema.tables.table_name
-            WHERE information_schema.tables.table_schema = $1
-              AND information_schema.tables.table_name = $2
+                COALESCE(c.reltuples, 0)::float8 AS row_count,
+                COALESCE(pg_total_relation_size(c.oid), 0)::int8 AS table_size
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1
+              AND c.relname = $2
+              AND c.relkind IN ('r', 'p')
             "#,
         )
         .bind(schema_name)
@@ -304,29 +306,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_column_stats_creation() {
-        let stats = ColumnStats {
-            column_name: "id".to_string(),
-            n_distinct: 1000.0,
-            null_frac: 0.0,
-            avg_width: 8,
-        };
-
-        assert_eq!(stats.column_name, "id");
-        assert_eq!(stats.n_distinct, 1000.0);
+    fn test_empty_statistics_has_no_column_entries() {
+        // `SourceStatistics::empty` is used whenever the source is unreachable (e.g. a
+        // provider rebuilt from a serialized plan on a scheduler, per its doc comment).
+        // Its whole contract is "the cost model must fall back to conservative defaults,
+        // never push blindly" — which only holds if there really is no column data to
+        // look up. A regression that started populating `columns` here would silently
+        // make the cost model behave as if it had real statistics.
+        let stats = SourceStatistics::empty("orders");
+        assert_eq!(stats.table_name, "orders");
+        assert_eq!(stats.row_count_estimate, 0.0);
+        assert_eq!(stats.table_size_bytes, 0);
+        assert!(stats.columns.is_empty());
+        assert!(!stats.columns.contains_key("any_column"));
     }
 
     #[test]
-    fn test_source_statistics_creation() {
-        let stats = SourceStatistics {
-            table_name: "orders".to_string(),
-            row_count_estimate: 10000.0,
-            table_size_bytes: 1024 * 1024,
-            columns: HashMap::new(),
-            fetched_at: Utc::now(),
-        };
-
-        assert_eq!(stats.table_name, "orders");
-        assert_eq!(stats.row_count_estimate, 10000.0);
+    fn test_empty_statistics_distinct_tables_are_independent() {
+        // Two `empty()` calls for different tables must not alias any shared state
+        // (e.g. a `HashMap::new()` refactored into a shared static by mistake).
+        let a = SourceStatistics::empty("orders");
+        let b = SourceStatistics::empty("customers");
+        assert_ne!(a.table_name, b.table_name);
+        assert!(a.columns.is_empty() && b.columns.is_empty());
     }
 }

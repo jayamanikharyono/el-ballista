@@ -28,11 +28,11 @@
 //! The password comes from the config's `password_env` variable — export it first,
 //! e.g. `export ORDERS_PG_PASSWORD=...`.
 
-use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::distributed::DistributedContext;
 use arrow::datatypes::SchemaRef;
 use chrono::Utc;
 use parquet::arrow::ArrowWriter;
+use rust_ballista_extraction_layer::config::JobConfig;
+use rust_ballista_extraction_layer::distributed::DistributedContext;
 use std::fs;
 use std::fs::File;
 
@@ -51,7 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "examples/configs/extract.example.json".to_string());
-    let workers: usize = std::env::args().nth(2).map(|s| s.parse().unwrap()).unwrap_or(2);
+    let workers: usize = std::env::args()
+        .nth(2)
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(2);
     let scheduler_url = std::env::args().nth(3);
 
     let config = JobConfig::from_file(&config_path)?;
@@ -67,7 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     ctx.register_source(&config).await?;
 
-    println!("  ✓ Scheduler: {}", scheduler_url.as_deref().unwrap_or("in-process (standalone)"));
+    println!(
+        "  ✓ Scheduler: {}",
+        scheduler_url
+            .as_deref()
+            .unwrap_or("in-process (standalone)")
+    );
     println!("  ✓ Table registered: {}", config.resolved_table());
     println!("  ✓ Scan splits into {workers} keyset partition(s)");
 
@@ -176,7 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Verification
     println!("\n► Step 9: Verification");
-    println!("  ✓ Full table scanned across {} executor partition(s)", workers);
+    println!(
+        "  ✓ Full table scanned across {} executor partition(s)",
+        workers
+    );
     println!("  ✓ DataFusion used for SQL transformations");
     println!("  ✓ Results written to Parquet");
     println!("  ✓ Checkpoint created for pipeline state");

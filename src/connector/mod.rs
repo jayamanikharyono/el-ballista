@@ -39,6 +39,7 @@
 
 pub mod errors;
 pub mod postgres;
+pub mod query_tag;
 
 /// Identifies one budgeted source pool within a process, without carrying anything that can
 /// open a connection by itself (no pool handle) or leak a secret (no password — only the

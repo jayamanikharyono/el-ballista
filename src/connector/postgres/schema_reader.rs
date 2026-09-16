@@ -61,10 +61,7 @@ impl<'a> PostgresSchemaReader<'a> {
         Ok(columns)
     }
 
-    pub async fn get_table_metadata(
-        &self,
-        table_name: &str,
-    ) -> Result<TableMetadata, sqlx::Error> {
+    pub async fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, sqlx::Error> {
         let (schema, table) = match table_name.split_once('.') {
             Some((s, t)) => (s, t),
             None => (self.schema_name.as_str(), table_name),

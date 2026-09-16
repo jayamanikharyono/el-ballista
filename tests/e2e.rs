@@ -20,6 +20,9 @@ use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::checkpoint::{
     CheckpointStore, JobKey, RunStats, json_store::JsonCheckpointStore,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
@@ -39,8 +42,17 @@ impl E2E {
     }
 
     fn job(&self, partitions: usize) -> JobConfig {
+        // Unique pool per test invocation to avoid cross-test pool sharing when
+        // 4 tests run sequentially in the same binary (global registry is per-process).
+        // Budget = pool_max / workers, so step by workers*2 to guarantee unique budget.
+        let n = JOB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pool_max = 32 + (n * 4) as u32;
+        self.job_with_pool(partitions, pool_max)
+    }
+
+    fn job_with_pool(&self, partitions: usize, pool_max: u32) -> JobConfig {
         JobConfig {
-            job_id: "e2e".to_string(),
+            job_id: format!("e2e-{}", pool_max),
             table: "hostile".to_string(),
             columns: None,
             source: SourceConfig {
@@ -49,9 +61,9 @@ impl E2E {
                 user: self.db.user.clone(),
                 password_env: TEST_PASSWORD_ENV.to_string(),
                 database: self.db.database.clone(),
-                pool_max: 16,
+                pool_max,
                 statement_timeout_ms: 300_000,
-                application_name: "relex-e2e".to_string(),
+                application_name: format!("relex-e2e-{}", pool_max),
                 schema: self.db.schema.clone(),
             },
             incremental: IncrementalConfig {

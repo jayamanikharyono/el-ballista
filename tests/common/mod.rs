@@ -92,8 +92,8 @@ impl TestDb {
             .unwrap_or_else(|e| panic!("TestDb::connect_with: invalid URL {url:?}: {e}"));
 
         let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(Duration::from_secs(10))
+            .max_connections(16)
+            .acquire_timeout(Duration::from_secs(30))
             .connect_with(options)
             .await
             .unwrap_or_else(|e| {

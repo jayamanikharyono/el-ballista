@@ -14,7 +14,7 @@ use datafusion::prelude::*;
 use std::sync::Arc;
 
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
@@ -192,6 +192,7 @@ pub async fn run() -> Result<(), AppError> {
             application_name: "rust-extract-layer".to_string(),
             schema: "public".to_string(),
         },
+        mode: ExtractionMode::Incremental,
         incremental: IncrementalConfig {
             column: "updated_at".to_string(),
             safety_lag_secs: 300,

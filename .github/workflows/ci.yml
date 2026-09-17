@@ -5,16 +5,30 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Deterministic port checks etc. aside, nothing here needs a live Postgres pre-provisioned:
-  # every integration/e2e test self-provisions one (see tests/common/mod.rs), so this
-  # workflow needs no `services:` container and no manual setup step.
   RUST_LOG: warn
   CARGO_BUILD_JOBS: 2
   RUSTFLAGS: "-C debuginfo=0"
+  # On CI we use a containerized Postgres; locally tests self-provision via
+  # postgresql_embedded when DATABASE_URL is unset (see tests/common/mod.rs).
+  DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/test
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
 
@@ -34,14 +48,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Cache embedded Postgres binaries
-        uses: actions/cache@v4
-        with:
-          # postgresql_embedded downloads a Postgres binary archive on first use and
-          # caches it here; without this cache every job re-downloads it.
-          path: ~/.theseus
-          key: ${{ runner.os }}-theseus-postgres-v1
-
       # Style/lint checks are informational for now (the codebase predates a formatting/lint
       # pass) — they must not block CI on cosmetic issues, only tests and the build are
       # allowed to fail the job. Flip `continue-on-error` off once the codebase is clean.
@@ -59,11 +65,12 @@ jobs:
       - name: cargo test — unit tests (no DB)
         run: cargo test --lib --bins
 
-      - name: cargo test — integration + e2e (self-provisioned Postgres, no container)
-        timeout-minutes: 25
+      - name: cargo test — integration + e2e (containerized Postgres)
+        timeout-minutes: 20
         env:
           CARGO_BUILD_JOBS: 1
         run: |
+          pg_isready -h 127.0.0.1 -p 5432 -U postgres -d test
           for t in pg_catalog pg_distributed pg_edge pg_numeric pg_pushdown e2e; do
             echo "=== cargo test --test $t ==="
             cargo test --test $t -- --test-threads=1 --nocapture

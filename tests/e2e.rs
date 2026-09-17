@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::distributed::DistributedContext;
@@ -66,6 +66,7 @@ impl E2E {
                 application_name: format!("relex-e2e-{}", pool_max),
                 schema: self.db.schema.clone(),
             },
+            mode: ExtractionMode::Incremental,
             incremental: IncrementalConfig {
                 column: "updated_at".to_string(),
                 safety_lag_secs: 0,

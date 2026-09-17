@@ -142,6 +142,7 @@ impl PostgresExtractor {
         // every FETCH: DECLARE embeds the real SELECT, but FETCH is what's actually
         // running (and visible in pg_stat_activity) for the bulk of a long extraction.
         let tag = self.tag("incremental_cursor");
+        log::debug!("generated query [incremental_cursor]: {select_sql} (bind $1={lo}, $2={hi})");
         let declare_sql = format!(
             "{tag}DECLARE {} CURSOR WITH HOLD FOR {}",
             cursor_name, select_sql
@@ -234,6 +235,7 @@ impl PostgresExtractor {
 
         let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
         let tag = self.tag("keyset_cursor");
+        log::debug!("generated query [keyset_cursor]: {select_sql} (bind $1={lo}, $2={hi})");
         let declare_sql = format!(
             "{tag}DECLARE {} CURSOR WITH HOLD FOR {}",
             cursor_name, select_sql
@@ -413,6 +415,7 @@ impl PostgresExtractor {
 
         let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
         let tag = self.tag("full");
+        log::debug!("generated query [full]: {select_sql}");
         let declare_sql = format!(
             "{tag}DECLARE {} CURSOR WITH HOLD FOR {}",
             cursor_name, select_sql

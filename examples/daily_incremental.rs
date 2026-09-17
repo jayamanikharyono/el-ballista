@@ -19,6 +19,10 @@ use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
+    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+
     println!("═══════════════════════════════════════════════════════════");
     println!("  Daily Incremental Example");
     println!("  Last 24 Hours Data Extraction");

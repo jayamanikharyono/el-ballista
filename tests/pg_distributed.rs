@@ -10,7 +10,7 @@ mod common;
 
 use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::distributed::DistributedContext;
@@ -41,6 +41,7 @@ async fn standalone_collects_hostile_table() -> Result<(), Box<dyn std::error::E
             application_name: "relex-test".to_string(),
             schema: db.schema.clone(),
         },
+        mode: ExtractionMode::Incremental,
         incremental: IncrementalConfig {
             column: "updated_at".to_string(),
             safety_lag_secs: 300,

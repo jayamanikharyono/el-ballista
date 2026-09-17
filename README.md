@@ -386,8 +386,52 @@ cargo run --bin rust-ballista-extraction-layer -- plan \
   --config examples/configs/extract.example.json \
   --policy cost_based \
   --filter 'status=PAID'
+
+
+# Full extraction (initial load / periodic full refresh)
+cargo run --bin rust-ballista-extraction-layer -- run \
+  --config examples/configs/full_extract.example.json
 ```
 
+`rel run` chooses its extraction mode from the config's `mode` field: `incremental` (default) runs the checkpoint-driven watermark windows, while `mode: "full"` (see [`examples/configs/full_extract.example.json`](examples/configs/full_extract.example.json)) does a stateless full-table scan — every row, no watermark filter and no checkpoint. In full mode the `incremental` block is optional and ignored, and at `--log-level debug` the generated `SELECT ... FROM <table>` is logged with strategy `full`. Both modes read the rest of the config too: `execution.batch_size` sets the server-side cursor FETCH size, and in full mode `parallel_scan` with `strategy: "keyset"` and `partitions > 1` splits the table into non-overlapping `partition_column` ranges and extracts each — sequentially on single-node `rel run`, and across workers on `rel distribute`.
+
+Both the CLI and library callers go through one path: a `Pipeline` built from a `JobConfig`. `Pipeline::from_config_file(path)` (or `from_config(cfg)`) parses the config into a runnable job; `extract()` returns the Arrow `RecordBatch`es with no checkpoint side effects, while `run()` performs the operational job (checkpoint protocol in incremental mode) and returns a `RunOutcome`. The connector is the single entry point: `PostgresConnector::from_config(cfg).extract()` then `.standalone()` or `.distributed()`, finishing with `.collect()` (Arrow batches) or `.run()` (operational job). `.distributed()` defaults to the standard scheduler URL (`http://localhost:50050`) unless the config or `.scheduler(url)` sets one, and `.in_process()` runs a local Ballista cluster. `rel run` and `rel distribute` are thin wrappers over this builder. All Postgres code lives under `src/connector/postgres/` (see AGENTS.md — Postgres connector modularization). See [`examples/pipeline_extraction.rs`](examples/pipeline_extraction.rs).
+
+
+---
+
+
+## Logging
+
+The crate logs through the standard [`log`](https://docs.rs/log) facade. The `rust-ballista-extraction-layer` binary and every example install a `fern` backend at startup (`logging::init_from_env_and_args`) that writes to **stderr** and, optionally, to a **file**. Configuration is read from the command line and the environment (never the job JSON):
+
+| Setting | CLI flag | Env var | Default |
+| ------- | -------- | ------- | ------- |
+| Level   | `--log-level <off\|error\|warn\|info\|debug\|trace>` | `RUST_LOG` | `info` |
+| File    | `--log-file <path>` | `REL_LOG_FILE` | none (stderr only) |
+
+CLI flags take precedence over environment variables. When a file is given, its parent directories are created and logs are **appended**.
+
+At **`debug`** level, every generated SQL query is logged as it is produced — the query builders, the cursor extractor paths, and the DataFusion execution plan all emit the final SQL text through `log::debug!`. So pointing a log file at a path with debug level captures each query:
+
+```bash
+# Every generated query goes to queries.log (place flags after the subcommand)
+cargo run --bin rust-ballista-extraction-layer -- run \
+  --config examples/configs/extract.example.json \
+  --log-level debug --log-file logs/run.log
+
+# Equivalent via environment (also works for the no-arg demo pipeline)
+RUST_LOG=debug REL_LOG_FILE=logs/run.log \
+  cargo run --bin rust-ballista-extraction-layer
+```
+
+A debug line looks like:
+
+```
+2026-09-16T08:12:04.531Z [DEBUG] rust_ballista_extraction_layer::connector::postgres::extractor: generated query [incremental_cursor]: SELECT "order_id", ... FROM "public"."orders" WHERE "updated_at" > $1 AND "updated_at" <= $2 (bind $1=..., $2=...)
+```
+
+> Note: with the no-argument **demo** pipeline, pass level and file via the `RUST_LOG` / `REL_LOG_FILE` environment variables (a leading `--log-file` would be treated as a subcommand).
 
 ---
 

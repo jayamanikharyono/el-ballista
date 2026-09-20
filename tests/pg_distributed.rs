@@ -2,20 +2,20 @@
 //!
 //! Exercises codecs, keyset partitioning, and budgeted pools with zero external
 //! processes (in-process scheduler + executor = same code path as remote, minus
-//! the network). Run: `cargo test --test pg_distributed` (self-provisions Postgres;
-//! set `DATABASE_URL` to point at a specific server instead).
+//! the network). Run: `cargo test --test pg_distributed` (requires the compose stack
+//! up; `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::distributed::DistributedContext;
 
-/// Always provisions a real database (embedded, unless `DATABASE_URL` is set) — never
+/// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
 macro_rules! live {
     () => {
@@ -41,6 +41,7 @@ async fn standalone_collects_hostile_table() -> Result<(), Box<dyn std::error::E
             application_name: "relex-test".to_string(),
             schema: db.schema.clone(),
         },
+        mode: ExtractionMode::Incremental,
         incremental: IncrementalConfig {
             column: "updated_at".to_string(),
             safety_lag_secs: 300,

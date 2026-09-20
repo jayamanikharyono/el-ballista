@@ -1,0 +1,195 @@
+//! PostgreSQL SQL dialect — the Postgres implementation of the shared [`SqlDialect`] trait.
+//! Lives with its connector (dialects are backend-specific); the generic trait is in
+//! [`crate::pushdown::dialect`].
+//!
+//! [`SqlDialect`]: crate::pushdown::dialect::SqlDialect
+
+use crate::pushdown::Fidelity;
+use crate::pushdown::dialect::SqlDialect;
+use crate::types::ColumnMetadata;
+
+/// PostgreSQL SQL dialect.
+pub struct PostgresDialect;
+
+impl SqlDialect for PostgresDialect {
+    fn quote_ident(&self, name: &str) -> String {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+
+    fn placeholder(&self, param_index: usize) -> String {
+        format!("${}", param_index)
+    }
+
+    fn column_literal_fidelity(
+        &self,
+        column: &ColumnMetadata,
+        literal_is_text: bool,
+        literal_is_float: bool,
+    ) -> Fidelity {
+        if literal_is_float {
+            // NaN and infinity ordering differs between Postgres and IEEE-754.
+            return Fidelity::Inexact;
+        }
+
+        if literal_is_text {
+            // Text comparisons depend on collation. Check if column has a known-safe collation.
+            if let Some(collation) = &column.collation_name {
+                // "C" and "POSIX" collations are deterministic and Unicode-safe.
+                // Binary-safe equality is OK, but ordering might diverge on non-ASCII.
+                // Conservative: only equality on deterministic ASCII-safe collations is Exact.
+                if collation == "C" || collation == "POSIX" {
+                    return Fidelity::Exact;
+                }
+
+                // Non-deterministic collations (citext, others) are always Inexact.
+                if !is_deterministic_collation(collation) {
+                    return Fidelity::Inexact;
+                }
+            }
+
+            // No collation metadata: conservative assumption is Inexact.
+            Fidelity::Inexact
+        } else {
+            // Integer and boolean comparisons are Exact.
+            Fidelity::Exact
+        }
+    }
+
+    fn column_column_fidelity(
+        &self,
+        left_column: &ColumnMetadata,
+        right_column: &ColumnMetadata,
+    ) -> Fidelity {
+        // If types differ significantly, be conservative.
+        if left_column.data_type != right_column.data_type {
+            return Fidelity::Inexact;
+        }
+
+        // String types: check collation consistency.
+        if is_text_type(&left_column.data_type) {
+            let left_collation = left_column.collation_name.as_deref();
+            let right_collation = right_column.collation_name.as_deref();
+
+            match (left_collation, right_collation) {
+                (Some(l), Some(r)) if l == r && (l == "C" || l == "POSIX") => Fidelity::Exact,
+                (Some(l), Some(r)) if l == r && is_deterministic_collation(l) => Fidelity::Exact,
+                _ => Fidelity::Inexact,
+            }
+        } else if is_float_type(&left_column.data_type) {
+            // Float comparisons always have NaN/infinity hazards.
+            Fidelity::Inexact
+        } else {
+            // Numeric and boolean columns: Exact.
+            Fidelity::Exact
+        }
+    }
+}
+
+fn is_text_type(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "text" | "character varying" | "character" | "citext"
+    )
+}
+
+fn is_float_type(data_type: &str) -> bool {
+    matches!(data_type, "real" | "double precision")
+}
+
+fn is_deterministic_collation(collation: &str) -> bool {
+    !collation.contains("_") || collation == "C" || collation == "POSIX"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(
+        data_type: &str,
+        collation: Option<&str>,
+        _numeric_precision: Option<i32>,
+        _numeric_scale: Option<i32>,
+    ) -> ColumnMetadata {
+        ColumnMetadata {
+            column_name: "test_col".to_string(),
+            data_type: data_type.to_string(),
+            is_nullable: true,
+            numeric_precision: None,
+            numeric_scale: None,
+            udt_name: None,
+            collation_name: collation.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_quote_ident() {
+        let dialect = PostgresDialect;
+        assert_eq!(dialect.quote_ident("simple"), r#""simple""#);
+        assert_eq!(dialect.quote_ident(r#"with"quote"#), r#""with""quote""#);
+    }
+
+    #[test]
+    fn test_placeholder() {
+        let dialect = PostgresDialect;
+        assert_eq!(dialect.placeholder(1), "$1");
+        assert_eq!(dialect.placeholder(42), "$42");
+    }
+
+    #[test]
+    fn test_column_literal_fidelity() {
+        let dialect = PostgresDialect;
+
+        let int_col = col("integer", None, None, None);
+        assert_eq!(
+            dialect.column_literal_fidelity(&int_col, false, true),
+            Fidelity::Inexact
+        );
+        assert_eq!(
+            dialect.column_literal_fidelity(&int_col, false, false),
+            Fidelity::Exact
+        );
+
+        let c_text_col = col("text", Some("C"), None, None);
+        assert_eq!(
+            dialect.column_literal_fidelity(&c_text_col, true, false),
+            Fidelity::Exact
+        );
+
+        let unknown_text_col = col("text", None, None, None);
+        assert_eq!(
+            dialect.column_literal_fidelity(&unknown_text_col, true, false),
+            Fidelity::Inexact
+        );
+    }
+
+    #[test]
+    fn test_column_column_fidelity() {
+        let dialect = PostgresDialect;
+
+        let col1 = col("text", Some("C"), None, None);
+        let col2 = col("text", Some("C"), None, None);
+        assert_eq!(
+            dialect.column_column_fidelity(&col1, &col2),
+            Fidelity::Exact
+        );
+
+        let col3 = col("text", Some("de_DE"), None, None);
+        assert_eq!(
+            dialect.column_column_fidelity(&col1, &col3),
+            Fidelity::Inexact
+        );
+
+        let int_col = col("integer", None, None, None);
+        assert_eq!(
+            dialect.column_column_fidelity(&col1, &int_col),
+            Fidelity::Inexact
+        );
+
+        let float_col1 = col("real", None, None, None);
+        let float_col2 = col("real", None, None, None);
+        assert_eq!(
+            dialect.column_column_fidelity(&float_col1, &float_col2),
+            Fidelity::Inexact
+        );
+    }
+}

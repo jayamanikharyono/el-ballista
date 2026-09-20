@@ -175,6 +175,13 @@ Failed extraction **must not** advance checkpoint (no data loss on retry). Never
 
 **Change discipline:** smallest fix that solves problem → preserve behavior unless intentional → add/update tests → update docs if observable → no unrelated refactors.
 
+**Postgres connector modularization (MANDATORY):** all PostgreSQL-specific code lives under `src/connector/postgres/` — nothing Postgres-specific outside it. This keeps the connector self-contained and the rest of the crate connector-agnostic.
+- New Postgres code (SQL building, cursors, type mapping, pushdown dialect/EXPLAIN, Ballista distributed execution, the extraction pipeline, incremental watermark queries) goes under `src/connector/postgres/` — never at the crate root or in a sibling top-level module.
+- Callers use the connector entry point, not its internals: `connector::postgres::PostgresConnector::from_config(cfg).extract()`, then `.standalone()` or `.distributed()`, finishing with `.collect()` (Arrow batches) or `.run()` (operational job). Do not reach into `pipeline`, `distributed`, `engine`, or `extractor` from outside the connector.
+- Standalone vs distributed is one builder-selected path, not two parallel APIs. `.distributed()` defaults to the config's `distributed.scheduler_url`, or `DEFAULT_SCHEDULER_URL` (`http://localhost:50050`) when empty; `.scheduler(url)` / `.in_process()` / `.workers(n)` override it.
+- `src/lib.rs` re-exports `distributed`, `engine`, `incremental`, `pipeline`, `pushdown` from `connector::postgres` as TRANSITIONAL shims so older paths still resolve. Do not write new code against these crate-root aliases; prefer `connector::postgres::*`. Remove the shims once all callers use `PostgresConnector`.
+- The generic infrastructure now under `connector/postgres/pushdown` (the `SqlDialect` trait, `Predicate`, cost model) is connector-agnostic by design; when a second backend is added, lift it back out to a shared module and keep only the Postgres dialect + EXPLAIN under the connector.
+
 ## 7. Testing & Live DB
 
 Run when applicable:

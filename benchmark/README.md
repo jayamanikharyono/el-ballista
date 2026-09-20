@@ -62,7 +62,7 @@ benchmark/
 
 ## Quickstart
 
-Needs `docker` or `podman` CLI. ~5M-row default takes a few minutes plus a one-time Rust
+Needs the `docker` CLI. ~5M-row default takes a few minutes plus a one-time Rust
 release build (Ballista + DataFusion — go make coffee).
 
 ```bash
@@ -277,10 +277,9 @@ different bytes, always:
 
 ## Troubleshooting
 
-- `Cannot connect to Podman ... dial tcp 127.0.0.1:53801: connect: connection refused`:
-  the CLI is pointed at a machine SSH endpoint that isn't up, while the engine may be
-  reachable on the unix socket. Either start the machine (`podman machine start`) or
-  bypass it: `export CONTAINER_HOST=unix:///var/run/docker.sock`. (`run.sh` preflights
+- `Cannot connect to the Docker daemon ... connect: connection refused`:
+  the Docker engine isn't reachable. Either start Docker Desktop or check
+  `docker info`. (`run.sh` preflights
   the connection and prints this itself.)
 - `Address already in use` on 5433: `PG_PORT=5434 benchmark/run.sh ...`.
 - Slow first Rust build: expected (cold cargo registry + release Ballista). Later builds reuse
@@ -299,8 +298,8 @@ different bytes, always:
 - `rustc ... (signal: 9, SIGKILL)` mid-build: the *compiler* OOM'd on a big crate (release
   codegen parallelizes per crate). The Dockerfile already pins
   `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` for this; same remedy — more builder RAM.
-- Before blaming the build, check what else is eating the host: `docker ps` /
-  `podman ps` — a running Postgres plus scheduler plus workers can leave under 1GB free,
+- Before blaming the build, check what else is eating the host: `docker ps` —
+  a running Postgres plus scheduler plus workers can leave under 1GB free,
   and then even serialized `rustc` dies. Stop everything non-essential before building,
   or build where RAM is plentiful and `--pull` the result. The GHCR workflow
   (`.github/workflows/bench-images.yml`) exists precisely so the small host never has

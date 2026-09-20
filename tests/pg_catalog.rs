@@ -5,8 +5,8 @@
 //! were tested. Since `TestDb::connect()` now always provisions a real database, there is
 //! no reason for these to stay untested.
 //!
-//! Run: `cargo test --test pg_catalog` (self-provisions Postgres; set `DATABASE_URL` to
-//! point at a specific server instead).
+//! Run: `cargo test --test pg_catalog` (requires the compose stack up;
+//! `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -19,7 +19,7 @@ use rust_ballista_extraction_layer::pushdown::explain::ExplainEstimator;
 use rust_ballista_extraction_layer::pushdown::stats::TableStatsSource;
 use std::sync::Arc;
 
-/// Always provisions a real database (embedded, unless `DATABASE_URL` is set) — never skips.
+/// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never skips.
 macro_rules! live {
     () => {
         TestDb::connect().await

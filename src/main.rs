@@ -7,37 +7,16 @@ mod cli;
 mod demo;
 
 use rust_ballista_extraction_layer::errors::AppError;
-
-struct SimpleLogger;
-
-impl log::Log for SimpleLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::max_level()
-    }
-
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}", record.level(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-static LOGGER: SimpleLogger = SimpleLogger;
-
-fn init_logger() {
-    let _ = log::set_logger(&LOGGER);
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(log::LevelFilter::Info);
-    log::set_max_level(level);
-}
+use rust_ballista_extraction_layer::logging;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    init_logger();
+    // Wire the `log` facade to a real backend: always stderr, plus a file when
+    // `--log-file <path>` (or the REL_LOG_FILE env var) is set. Level comes from
+    // `--log-level` / RUST_LOG (default info). At debug level every generated SQL
+    // query is logged, so pointing `--log-file` at a path with debug captures each
+    // query as it is produced. See src/logging.rs.
+    logging::init_from_env_and_args();
 
     // No args: run the demo pipeline (extract -> filter -> transform -> drop/rename ->
     // aggregate -> write). Any args: hand off to the checkpoint-driven CLI (`rel run`,

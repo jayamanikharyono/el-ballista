@@ -1,15 +1,16 @@
 //! End-to-end suite: Postgres → extractor → Arrow → Ballista → validation.
 //!
-//! The four core E2E tests from the testing strategy, run entirely in-process: Postgres
-//! is self-provisioned (embedded, unless `DATABASE_URL` is set — see `tests/common`) and
-//! the Ballista scheduler + executor run standalone in this same process
+//! The four core E2E tests from the testing strategy, run entirely in-process for the
+//! compute side: the Ballista scheduler + executor run standalone in this same process
 //! (`DistributedContext::standalone`, the same in-proc path `tests/pg_distributed.rs`
-//! exercises). No external scheduler, workers, or container are required or supported
-//! here — that was the old design's whole failure mode (`E2E_SCHEDULER_URL` unset meant
-//! a silent skip, so a real regression in the distributed path could pass CI unnoticed).
+//! exercises). Postgres always comes from the Docker compose stack
+//! (`tests/docker/compose.yaml` — `DATABASE_URL` overrides the default endpoint); no
+//! embedded server, no external scheduler/workers, no silent skips.
 //!
 //! ```bash
+//! docker compose -f tests/docker/compose.yaml up -d --wait
 //! cargo test --test e2e
+//! # or: scripts/e2e.sh  (brings the stack up and down automatically)
 //! ```
 
 #[path = "common/mod.rs"]
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::distributed::DistributedContext;
@@ -66,6 +67,7 @@ impl E2E {
                 application_name: format!("relex-e2e-{}", pool_max),
                 schema: self.db.schema.clone(),
             },
+            mode: ExtractionMode::Incremental,
             incremental: IncrementalConfig {
                 column: "updated_at".to_string(),
                 safety_lag_secs: 0,

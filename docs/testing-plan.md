@@ -18,11 +18,17 @@ in `pushdown::explain`) — both fixed, both now regression-tested.
 ## 0. Running the tests
 
 ```bash
-# Everything — unit, integration, e2e. No setup required.
+# Bring up the databases first (integration/e2e tests never self-provision).
+docker compose -f tests/docker/compose.yaml up -d --wait
+
+# Everything — unit, integration, e2e.
 cargo test
 
+# Or: scripts/e2e.sh brings the stack up, runs the suite, and tears it down.
+scripts/e2e.sh
+
 # Optional: point every integration/e2e test at a specific server instead of the
-# embedded one (still self-contained either way; this just changes which Postgres).
+# compose default (still Docker either way; this just changes which Postgres).
 DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/app cargo test
 
 # Unit tests only (no database touched at all, milliseconds).
@@ -34,16 +40,12 @@ cargo test --test pg_catalog
 cargo test --test e2e
 ```
 
-First run downloads a Postgres binary archive into `~/.theseus/postgresql` (needs network
-access once); every run after that starts the embedded server in milliseconds from the
-cached binary. CI caches this directory too (see §5).
-
 ## 1. Two layers, different jobs
 
 | | Unit (`src/**/tests`) | Integration + e2e (`tests/*.rs`) |
 |---|---|---|
-| Needs a database | Never | Always — self-provisioned, see §3 |
-| Speed | Milliseconds | Seconds (embedded Postgres startup + queries); e2e is ~15-75s per file because it also spins up an in-process Ballista scheduler+executor |
+| Needs a database | Never | Always — the Docker compose stack, see §3 |
+| Speed | Milliseconds | Seconds (compose Postgres + queries); e2e is ~15-75s per file because it also spins up an in-process Ballista scheduler+executor |
 | Job | Pure logic: predicate translation, cost/policy decisions, window math, state machines, schema/type maps, SQL-string shapes | Everything that actually touches Postgres or a cluster: decode fidelity, catalog reads, checkpoint durability, pushdown correctness, distributed execution |
 | Rule | If it needs a pool, it doesn't belong here | If it can be a fixture, it doesn't belong here |
 | Skip behavior | N/A | **None.** Every test gets a real database or fails |
@@ -87,15 +89,12 @@ it could be unit-tested at all (it previously required a live pool).
 
 `TestDb::connect() -> TestDb` (no `Option`, never skips):
 
-- Uses `DATABASE_URL` if set; otherwise lazily starts one embedded Postgres instance
-  (`postgresql_embedded`, default features — no Docker) shared by every test in that
-  binary via a process-wide `tokio::sync::OnceCell`. Documented trade-off: the embedded
-  server is never explicitly stopped (Rust doesn't run destructors on statics at normal
-  process exit), so it keeps listening on a random localhost port until the OS reaps it —
-  a non-issue on ephemeral CI runners; on a long-lived dev box, `pkill -f postgresql_embedded`
-  if it ever matters.
-- Any failure to connect or provision — bad URL, connection refused, download/start
-  failure, fixture setup failure — is a `panic!` with a specific message. A broken harness
+- Uses `DATABASE_URL` if set; otherwise connects to the compose stack's default endpoint
+  (`postgres://postgres:postgres@127.0.0.1:5432/test`). The stack must be up
+  (`docker compose -f tests/docker/compose.yaml up -d --wait`, or `scripts/e2e.sh`
+  which handles it automatically) — there is no embedded fallback and no silent skip.
+- Any failure to connect or provision — bad URL, connection refused (is the stack up?),
+  fixture setup failure — is a `panic!` with a specific message. A broken harness
   is a **test failure**, not a silent skip.
 - Per test: `CREATE SCHEMA test_<pid>_<counter>`, builds the hostile fixture inside it,
   hands out the schema name; `Drop` runs `DROP SCHEMA ... CASCADE` (best-effort, via a
@@ -109,8 +108,8 @@ it could be unit-tested at all (it previously required a live pool).
   **enum** type (`mood`), `bpchar`. `updated_at` is spread over 2024-01-01..08 so window
   queries can slice it. This fixture is the shared input to every integration/e2e suite.
 
-Dev-dependency: `postgresql_embedded = "0.21"` (the only one; `tokio`/`sqlx`/`serde_json`
-are already regular dependencies).
+No test-only dev-dependencies: integration/e2e tests run against the Docker compose
+stack (`tests/docker/compose.yaml`).
 
 ## 4. Integration + e2e suites — 24 tests across 7 files
 
@@ -135,8 +134,9 @@ caught it.
 
 ## 5. CI — `.github/workflows/ci.yml`
 
-Runs on every push and PR, `ubuntu-latest`, no `services:` container (nothing needs one —
-every test self-provisions its own Postgres):
+Runs on every push and PR, `ubuntu-latest`, with a `services:` Postgres container
+(`DATABASE_URL` points the suites at it; locally the same role is played by
+`tests/docker/compose.yaml`):
 
 1. `cargo fmt --check` — informational (`continue-on-error: true`); the codebase predates
    a formatting pass.
@@ -144,10 +144,11 @@ every test self-provisions its own Postgres):
 3. `cargo clippy --workspace --all-targets -- -D warnings` — also informational for now,
    same reason.
 4. `cargo test --lib --bins` — unit tests.
-5. `cargo test --tests` — integration + e2e (self-provisioned Postgres).
+5. `cargo test --tests` — integration + e2e against the compose Postgres/MySQL stack
+   (the CI job provides them as service containers; locally bring up
+   `tests/docker/compose.yaml` or run `scripts/e2e.sh`).
 
-Two caches: the usual `~/.cargo` + `target`, and `~/.theseus` (the embedded-Postgres
-binary cache) so CI doesn't re-download it on every run.
+Two caches: the usual `~/.cargo` + `target`.
 
 ## 6. Related: debug SQL comment tags
 

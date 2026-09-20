@@ -51,11 +51,27 @@ fn default_schema() -> String {
 pub struct IncrementalConfig {
     /// The watermark column, e.g. `updated_at`. Only `timestamp` mode is implemented —
     /// `append_id` / `snapshot` / `log` from docs/incremental-extraction.md §1 are follow-ups.
+    /// Ignored when the job's `mode` is `full`.
+    #[serde(default = "default_ts_column")]
     pub column: String,
     #[serde(default = "default_safety_lag_secs")]
     pub safety_lag_secs: i64,
     #[serde(default = "default_max_window_secs")]
     pub max_window_secs: i64,
+}
+
+impl Default for IncrementalConfig {
+    fn default() -> Self {
+        Self {
+            column: default_ts_column(),
+            safety_lag_secs: default_safety_lag_secs(),
+            max_window_secs: default_max_window_secs(),
+        }
+    }
+}
+
+fn default_ts_column() -> String {
+    "updated_at".to_string()
 }
 
 fn default_safety_lag_secs() -> i64 {
@@ -223,13 +239,31 @@ impl Default for ParallelScanConfig {
     }
 }
 
+/// How `rel run` extracts the table.
+///
+/// * `incremental` (default): checkpoint-driven watermark windows (docs/incremental-extraction.md).
+/// * `full`: a stateless full-table scan — every row, no watermark filter and no checkpoint.
+///   Used for initial data loads and periodic full refreshes. The `incremental` block is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionMode {
+    #[default]
+    Incremental,
+    Full,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobConfig {
     pub job_id: String,
     pub table: String,
     /// `None` means "all columns" (still resolved against the catalog schema).
     pub columns: Option<Vec<String>>,
+    /// Extraction mode: incremental watermark windows (default) or a full table scan.
+    #[serde(default)]
+    pub mode: ExtractionMode,
     pub source: SourceConfig,
+    /// Watermark settings. Used only in incremental mode; defaulted (and ignored) in full mode.
+    #[serde(default)]
     pub incremental: IncrementalConfig,
     pub sink: SinkConfig,
     #[serde(default)]
@@ -377,6 +411,23 @@ mod tests {
     }
 
     #[test]
+    fn test_from_file_full_config() {
+        // The full-extraction spec must parse, select full mode, and validate even though it
+        // carries no `incremental` block (defaults fill it and are ignored in full mode).
+        let config = JobConfig::from_file("examples/configs/full_extract.example.json").unwrap();
+        assert_eq!(config.job_id, "orders_full");
+        assert_eq!(config.mode, ExtractionMode::Full);
+        assert_eq!(config.incremental.column, "updated_at");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_mode_defaults_to_incremental() {
+        let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
+        assert_eq!(config.mode, ExtractionMode::Incremental);
+    }
+
+    #[test]
     fn test_validate_rejects_degenerate_values() {
         // A zero max_window_secs freezes backfill chunking in an infinite loop;
         // zero batch/partitions/workers/pool silently scan nothing or divide by zero.
@@ -424,6 +475,7 @@ mod tests {
                 application_name: "test".to_string(),
                 schema: "public".to_string(),
             },
+            mode: ExtractionMode::Incremental,
             incremental: IncrementalConfig {
                 column: "updated_at".to_string(),
                 safety_lag_secs: 60,
@@ -462,6 +514,7 @@ mod tests {
                 application_name: "test".to_string(),
                 schema: "public".to_string(),
             },
+            mode: ExtractionMode::Incremental,
             incremental: IncrementalConfig {
                 column: "updated_at".to_string(),
                 safety_lag_secs: 60,

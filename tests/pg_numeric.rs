@@ -2,8 +2,8 @@
 //!
 //! The old code stored `with_scale(s).to_i128()` (truncation: 123.45 → 123);
 //! the fix rescales to the unscaled integer (123.45 scale 2 → 12345).
-//! Run: `cargo test --test pg_numeric` (self-provisions Postgres; set `DATABASE_URL` to
-//! point at a specific server instead).
+//! Run: `cargo test --test pg_numeric` (requires the compose stack up;
+//! `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -11,7 +11,7 @@ mod common;
 use common::TestDb;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 
-/// Always provisions a real database (embedded, unless `DATABASE_URL` is set) — never
+/// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
 macro_rules! live {
     () => {

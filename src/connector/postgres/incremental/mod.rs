@@ -204,6 +204,51 @@ impl WatermarkSource for PgPool {
     }
 }
 
+/// The earliest value of the watermark column in `resolved_table` (schema-qualified), or `None`
+/// when the table is empty.
+///
+/// docs/incremental-extraction.md §4 — a job's *first* run has no checkpoint, so the caller would
+/// otherwise resolve `lo` to the beginning of time (1970). With a bounded `max_window`, that makes
+/// the first window `(epoch, epoch + max_window]`, which is empty, and the job then needs one run
+/// per window just to walk from 1970 to the present before it sees a single row. Seeding `lo` from
+/// the earliest row instead lets a fresh job start against real data on its first run.
+///
+/// Identifiers are taken from configuration (not runtime user input) and quoted by doubling `"`,
+/// matching `query_builder::push_identifier`.
+pub async fn min_watermark(
+    pool: &PgPool,
+    resolved_table: &str,
+    column: &str,
+) -> Result<Option<DateTime<Utc>>, AppError> {
+    fn quote_ident(ident: &str) -> String {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+
+    let (schema, table) = match resolved_table.split_once('.') {
+        Some((s, t)) => (s, t),
+        None => ("public", resolved_table),
+    };
+
+    let sql = format!(
+        "SELECT MIN({}) AS min_wm FROM {}.{}",
+        quote_ident(column),
+        quote_ident(schema),
+        quote_ident(table),
+    );
+
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .fetch_one(pool)
+        .await?;
+
+    let min_wm: Option<DateTime<Utc>> = row.try_get("min_wm").map_err(|e| {
+        AppError::Incremental(format!(
+            "min-watermark query returned an unexpected shape: {e}"
+        ))
+    })?;
+
+    Ok(min_wm)
+}
+
 /// docs/incremental-extraction.md §4 — window sizing and catch-up. Resolves `lo` from the
 /// checkpoint (or the beginning of time on a job's first run) and caps the window width at
 /// `max_window`, so a job that has been down for days processes bounded chunks instead of one

@@ -18,7 +18,6 @@ use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::start_server;
 use chrono::{DateTime, Duration, Utc};
-use datafusion::common::ScalarValue;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
@@ -29,19 +28,15 @@ use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
 use rust_ballista_extraction_layer::checkpoint::{CheckpointStore, JobKey, RunStats};
 use rust_ballista_extraction_layer::config::JobConfig;
 use rust_ballista_extraction_layer::connector::postgres::{
-    PostgresExtractor, PostgresTableProvider,
+    PostgresConnector, PostgresExtractor, PostgresTableProvider,
 };
-use rust_ballista_extraction_layer::distributed::pool_registry::registry;
 use rust_ballista_extraction_layer::distributed::{
-    DistributedContext, PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec,
+    PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec,
 };
 use rust_ballista_extraction_layer::errors::AppError;
-use rust_ballista_extraction_layer::incremental::{
-    build_window, clamp_to_observed, max_timestamp_column, safe_high_watermark,
-};
 use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
 
-const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]";
+const USAGE: &str = "usage:\n  rel run --config <path>\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel backfill --config <path> --namespace <name> --from <rfc3339> --to <rfc3339>\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also REL_LOG_FILE)\n  note: at debug level every generated SQL query is logged\n  note: `rel run` extraction mode (incremental default, or full) is set by the config\'s \"mode\" field";
 
 pub async fn dispatch() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -150,126 +145,32 @@ fn repeated_flag(args: &[String], flag: &str) -> Vec<String> {
         .collect()
 }
 
-/// Runs the commit protocol from docs/incremental-extraction.md §5: acquire the checkpoint
-/// lease, extract the resolved window, write it to the sink, *then* advance the checkpoint —
-/// in that order, so a crash between the sink write and the commit just means the next run
-/// recomputes the same window and overwrites the same (deterministically named) objects.
+/// Runs the checkpoint protocol from docs/incremental-extraction.md §5: acquire the checkpoint
+/// lease, extract the resolved window as Arrow, and advance the committed watermark. The project
+/// ships no sink layer by design — the extraction output is the Arrow batch, and materialization is
+/// the downstream consumer's responsibility (README / AGENTS.md). The checkpoint file is the
+/// progress-of-record, so a crash before the commit just means the next run recomputes the same
+/// window; a resumed backfill picks up from the committed watermark rather than re-walking the
+/// range.
 async fn run_job(config_path: &str) -> Result<(), AppError> {
-    let config = JobConfig::from_file(config_path)?;
-    let password = config.resolve_password()?;
-
-    let extractor = PostgresExtractor::connect(
-        &config.source.host,
-        config.source.port,
-        &config.source.user,
-        &password,
-        &config.source.database,
-        config.source.pool_max,
-        config.source.statement_timeout_ms,
-        &config.source.application_name,
-    )
-    .await?;
-
-    let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
-    let key = JobKey::new(config.job_id.clone());
-    let run_id = Uuid::new_v4();
-    // Generous relative to expected run time; not yet configurable per job.
-    let lease = Duration::minutes(30);
-
-    let checkpoint = store
-        .acquire(&key, run_id, lease, &config.incremental.column)
-        .await?;
-
-    match run_once(&config, &extractor, checkpoint.watermark_value).await {
-        Ok((hi, rows_extracted, window_lo)) => {
-            store
-                .commit(
-                    &key,
-                    run_id,
-                    hi,
-                    RunStats {
-                        rows_extracted,
-                        window_lo,
-                        window_hi: Some(hi),
-                    },
-                )
-                .await?;
-
-            println!(
-                "job '{}': extracted {} row(s), watermark now {}",
-                config.job_id, rows_extracted, hi
-            );
-
-            Ok(())
-        }
-        Err(e) => {
-            // Best-effort: if releasing the lease also fails, the original error is still what
-            // gets returned/reported — an operator can `rel checkpoint reset` to clear a stuck
-            // lease.
-            let _ = store.abandon(&key, run_id, &e.to_string()).await;
-            Err(e)
-        }
+    let connector = PostgresConnector::from_config_file(config_path)?;
+    let outcome = connector.extract().standalone().run().await?;
+    match outcome.window {
+        Some(_) => println!(
+            "job '{}': extracted {} row(s), watermark now {}",
+            connector.config().job_id,
+            outcome.rows_extracted,
+            outcome
+                .committed_watermark
+                .expect("incremental run always sets a watermark")
+        ),
+        None => println!(
+            "job '{}' (full): extracted {} row(s)",
+            connector.config().job_id,
+            outcome.rows_extracted
+        ),
     }
-}
-
-async fn run_once(
-    config: &JobConfig,
-    extractor: &PostgresExtractor,
-    lo: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<
-    (
-        chrono::DateTime<chrono::Utc>,
-        u64,
-        Option<chrono::DateTime<chrono::Utc>>,
-    ),
-    AppError,
-> {
-    let safety_lag = Duration::seconds(config.incremental.safety_lag_secs);
-    let max_window = Duration::seconds(config.incremental.max_window_secs);
-
-    let hi_candidate = safe_high_watermark(extractor.pool(), safety_lag).await?;
-    let window = build_window(lo, hi_candidate, max_window);
-
-    log::info!(
-        "job '{}': window ({}, {}]",
-        config.job_id,
-        window.lo,
-        window.hi
-    );
-
-    let columns = config
-        .columns
-        .as_ref()
-        .map(|c| c.iter().map(String::as_str).collect::<Vec<_>>());
-
-    let batch = extractor
-        .extract_incremental_window(
-            &config.resolved_table(),
-            columns,
-            &config.incremental.column,
-            window.lo,
-            window.hi,
-        )
-        .await?;
-
-    let rows_extracted = batch.num_rows() as u64;
-
-    // docs/incremental-extraction.md §3.1 Mitigation 3 — don't let the committed watermark race
-    // ahead of what was actually observed this run.
-    let max_observed = max_timestamp_column(&batch, &config.incremental.column);
-    let committed_hi = clamp_to_observed(window.hi, max_observed);
-
-    // Sink handling is out of scope - use DataFusion writers, Ballista, or orchestrator
-    log::debug!(
-        "Extracted {} rows from {}.{} ({}—{})",
-        rows_extracted,
-        config.source.schema,
-        config.table,
-        window.lo,
-        committed_hi
-    );
-
-    Ok((committed_hi, rows_extracted, Some(window.lo)))
+    Ok(())
 }
 
 async fn checkpoint_show(config_path: &str) -> Result<(), AppError> {
@@ -494,7 +395,24 @@ async fn run_backfill(
     // Walk [from, to] in max_window-bounded chunks, acquiring and committing each chunk
     // separately: the watermark advances progressively, so a crash resumes from the last
     // committed chunk instead of restarting the whole range.
-    let mut chunk_lo = from_ts;
+    // Resume from the last committed chunk instead of restarting at `--from`. Without this, a
+    // re-run (crash recovery, or an accidental repeat of the same command) re-extracts chunks that
+    // were already persisted and then trips the checkpoint's monotonicity guard on the first commit
+    // (next watermark < current), aborting the whole backfill. Reading the namespace's committed
+    // watermark makes the walk pick up where it left off.
+    let resume_from = store.read(&key).await?.and_then(|c| c.watermark_value);
+    let mut chunk_lo = match resume_from {
+        Some(w) if w > from_ts => {
+            log::info!(
+                "backfill '{}' namespace '{namespace}': resuming from committed watermark {} (--from was {})",
+                config.job_id,
+                w,
+                from_ts
+            );
+            w
+        }
+        _ => from_ts,
+    };
     let mut rows_extracted = 0u64;
 
     while chunk_lo < to_ts {
@@ -515,15 +433,19 @@ async fn run_backfill(
                 )
                 .await?;
 
-            // Sink handling is out of scope - use DataFusion writers, Ballista, or orchestrator
+            // Same Arrow-native contract as `run_once`: the batch is the output, no sink is
+            // written. The chunk's watermark is committed below so a resumed run picks up from the
+            // checkpoint file rather than re-walking the whole range.
+            let rows = batch.num_rows() as u64;
             log::debug!(
-                "Backfill chunk extracted {} rows for window ({}, {}]",
-                batch.num_rows(),
+                "backfill '{}' namespace '{namespace}': extracted {} row(s) for window ({}, {}]",
+                config.job_id,
+                rows,
                 chunk_lo,
                 chunk_hi
             );
 
-            Ok(batch.num_rows() as u64)
+            Ok(rows)
         }
         .await;
 
@@ -576,91 +498,28 @@ async fn run_distributed(
     workers: Option<usize>,
     scheduler_url: Option<&str>,
 ) -> Result<(), AppError> {
-    let config = JobConfig::from_file(config_path)?;
-    let workers = workers.unwrap_or(config.distributed.workers);
-
-    let ctx = match scheduler_url {
-        Some(url) => DistributedContext::remote(&config, url, workers).await?,
-        None => DistributedContext::standalone(&config, workers).await?,
+    let connector = PostgresConnector::from_config_file(config_path)?;
+    // No --scheduler-url keeps `rel distribute`'s zero-config behavior: an in-process cluster.
+    let mut extraction = connector.extract().distributed();
+    extraction = match scheduler_url {
+        Some(url) => extraction.scheduler(url),
+        None => extraction.in_process(),
     };
-    ctx.register_source(&config).await?;
-
-    let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
-    let key = JobKey::new(config.job_id.clone());
-    let run_id = Uuid::new_v4();
-    // Generous relative to expected run time; not yet configurable per job.
-    let lease = Duration::minutes(30);
-
-    let checkpoint = store
-        .acquire(&key, run_id, lease, &config.incremental.column)
-        .await?;
-
-    let safety_lag = Duration::seconds(config.incremental.safety_lag_secs);
-    let max_window = Duration::seconds(config.incremental.max_window_secs);
-
-    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, ctx.workers);
-    let pool = registry().pool(&descriptor).map_err(AppError::Extractor)?;
-    let hi_candidate = safe_high_watermark(&pool, safety_lag).await?;
-    let window = build_window(checkpoint.watermark_value, hi_candidate, max_window);
-
-    log::info!(
-        "job '{}': window ({}, {}]",
-        config.job_id,
-        window.lo,
-        window.hi
-    );
-
-    // The window is expressed as a pushed filter so it exercises the same translate/decide/
-    // render path as `rel plan`'s filters, ANDed with the keyset partition bounds the provider
-    // adds in `scan()`. Postgres timestamptz columns arrive as TimestampMicrosecond, so fold the
-    // (exclusive lo, inclusive hi] window into matching ScalarValues.
-    let column = &config.incremental.column;
-    let window_lo = ScalarValue::TimestampMicrosecond(Some(window.lo.timestamp_micros()), None);
-    let window_hi = ScalarValue::TimestampMicrosecond(Some(window.hi.timestamp_micros()), None);
-    let window_expr = col(column)
-        .gt(lit(window_lo))
-        .and(col(column).lt_eq(lit(window_hi)));
-
-    let df = ctx
-        .session
-        .table(&config.table)
-        .await?
-        .filter(window_expr)?;
-    let batches = match df.collect().await {
-        Ok(batches) => batches,
-        Err(e) => {
-            // Release the lease so the next run isn't wedged behind it for 30 minutes.
-            let _ = store.abandon(&key, run_id, &e.to_string()).await;
-            return Err(AppError::DataFusion(e));
-        }
+    if let Some(n) = workers {
+        extraction = extraction.workers(n);
+    }
+    let outcome = extraction.run().await?;
+    let watermark = match outcome.committed_watermark {
+        Some(w) => format!(", watermark now {w}"),
+        None => String::new(),
     };
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-
-    // docs/incremental-extraction.md §3.1 Mitigation 3 — never commit past what was observed.
-    let max_observed = batches
-        .iter()
-        .filter_map(|b| max_timestamp_column(b, column))
-        .max();
-    let committed_hi = clamp_to_observed(window.hi, max_observed);
-
-    store
-        .commit(
-            &key,
-            run_id,
-            committed_hi,
-            RunStats {
-                rows_extracted: rows as u64,
-                window_lo: Some(window.lo),
-                window_hi: Some(committed_hi),
-            },
-        )
-        .await?;
-
     println!(
-        "job '{}' (distributed, workers={}): extracted {} row(s), watermark now {}",
-        config.job_id, ctx.workers, rows, committed_hi
+        "job '{}' (distributed, workers={}): extracted {} row(s){}",
+        connector.config().job_id,
+        outcome.workers.unwrap_or(0),
+        outcome.rows_extracted,
+        watermark
     );
-
     Ok(())
 }
 

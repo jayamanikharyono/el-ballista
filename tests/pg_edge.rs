@@ -2,8 +2,8 @@
 //!
 //! Duplicate timestamps, empty results, batch boundaries, projection, and
 //! date/timestamp fidelity — the "key scenarios" half of the testing strategy.
-//! Run: `cargo test --test pg_edge` (self-provisions Postgres; set `DATABASE_URL` to
-//! point at a specific server instead).
+//! Run: `cargo test --test pg_edge` (requires the compose stack up;
+//! `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -12,7 +12,7 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use common::TestDb;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 
-/// Always provisions a real database (embedded, unless `DATABASE_URL` is set) — never
+/// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
 macro_rules! live {
     () => {

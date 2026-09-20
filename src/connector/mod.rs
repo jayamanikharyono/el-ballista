@@ -38,6 +38,7 @@
 //! [`distributed::pool_registry`]: crate::distributed::pool_registry
 
 pub mod errors;
+pub mod mysql;
 pub mod postgres;
 pub mod query_tag;
 
@@ -54,4 +55,24 @@ pub trait SourceDescriptor: Clone + Send + Sync {
     /// Opaque registry key: two descriptors map to the same pool if and only if their keys
     /// match. Must include the connection budget.
     fn registry_key(&self) -> String;
+}
+
+/// SKETCH — not yet wired into `engine`/`distributed`.
+///
+/// A source backend the generic engine and distributed layers could depend on instead of
+/// `PostgresTableProvider` directly, so those layers can move out of `connector::postgres` and be
+/// shared with `connector::mysql`. Kept intentionally small; flesh it out (a `table_provider`
+/// method returning `Arc<dyn TableProvider>`, Ballista codec accessors) as part of the
+/// engine/distributed lift, when it is actually required — see `docs/connector-abstraction.md`.
+#[async_trait::async_trait]
+pub trait SourceConnector: Send + Sync {
+    /// The backend's SQL dialect (rendering, placeholders, quoting, fidelity).
+    fn dialect(&self) -> &dyn crate::pushdown::dialect::SqlDialect;
+
+    /// Read a table's schema into the shared catalog contract
+    /// ([`TableMetadata`](crate::types::TableMetadata)).
+    async fn table_metadata(
+        &self,
+        table: &str,
+    ) -> Result<crate::types::TableMetadata, crate::errors::AppError>;
 }

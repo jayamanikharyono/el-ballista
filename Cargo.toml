@@ -22,10 +22,11 @@ chrono = { version = "0.4.45", features = ["serde"] }
 datafusion = "54.1.0"
 datafusion-proto = "54.1.0"
 log = "0.4.34"
+fern = "0.7"
 once_cell = "1.20"
 parquet = "58.4"
 serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "bigdecimal", "json", "uuid"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "chrono", "bigdecimal", "json", "uuid"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 async-trait = "0.1.92"
@@ -70,9 +71,10 @@ path = "examples/dataframe_extraction.rs"
 name = "bench_full_load"
 path = "examples/bench_full_load.rs"
 
+[[example]]
+name = "pipeline_extraction"
+path = "examples/pipeline_extraction.rs"
+
 [dev-dependencies]
-# Self-provisioning Postgres for integration/e2e tests: no Docker, no externally
-# running server required. Default features (theseus + tls-native-tls) already
-# give the async API used in tests/common/mod.rs; binaries are cached under
-# ~/.theseus/postgresql after the first download.
-postgresql_embedded = "0.21"
+# Integration/e2e tests run against the Docker compose stack
+# (tests/docker/compose.yaml); no test-only dependencies.

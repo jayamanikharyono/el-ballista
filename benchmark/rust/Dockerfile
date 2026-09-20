@@ -43,7 +43,7 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Dependencies only — cached unless Cargo.toml/lock change. Cache mounts persist the
 # registry and incremental artifacts across builds (requires BuildKit or recent buildah;
-# plain `docker build`/`podman build` both qualify — no compose needed).
+# plain `docker build` — no compose needed).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo chef cook --locked --release --bins --examples --recipe-path recipe.json

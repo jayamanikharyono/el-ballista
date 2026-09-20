@@ -10,7 +10,7 @@
 //! harness as "skipped" is exactly what produced false-green CI in the past).
 //!
 //! ```bash
-//! docker compose -f tests/docker/compose.yaml up -d --wait   # or: podman compose ...
+//! docker compose -f tests/docker/compose.yaml up -d --wait
 //! cargo test --test mysql -- --test-threads=1
 //! docker compose -f tests/docker/compose.yaml down -v
 //! ```
@@ -167,12 +167,12 @@ impl MySqlTestDb {
             (name, nick, code, amount, precise, tiny, small, `count`, big, ratio, f, flag, is_bool, day, dt, ts, feeling, colors, meta, uid, payload, updated_at) VALUES
             ('Zürich', 'MÜNCHEN', 'ab', 123.45, 3.141592653589793, 127, 32767, 2147483647, 9223372036854775807, 1.5, 1.5, b'1', true, '2024-02-29', '2024-03-01 12:00:00.123456', '2024-03-01 12:00:00.123456', 'ecstatic', 'red,green', '{"a":1,"b":[true,null]}', '123e4567-e89b-12d3-a456-426614174000', X'000102FF', '2024-01-01 00:00:00'),
             ('', '', '', -7.50, 0, -128, -32768, -2147483648, -9223372036854775808, -1.5, -1.5, b'0', false, NULL, NULL, NULL, 'sad', '', '[]', '123e4567-e89b-12d3-a456-426614174001', NULL, '2024-01-02 00:00:00'),
-            ('plain', 'plain', 'wxyz', 0.00, -0.5, 0, 0, 0, 0, 0.0, 0.0, NULL, NULL, '1970-01-01', '1970-01-01 00:00:00.000000', '1970-01-01 00:00:00.000000', 'ok', 'blue', '[]', '123e4567-e89b-12d3-a456-426614174002', X'', '2024-01-03 00:00:00'),
+            ('plain', 'plain', 'wxyz', 0.00, -0.5, 0, 0, 0, 0, 0.0, 0.0, NULL, NULL, '1970-01-01', '1970-01-01 00:00:00.000000', '1970-01-01 00:00:01.000000', 'ok', 'blue', '[]', '123e4567-e89b-12d3-a456-426614174002', X'', '2024-01-03 00:00:00'),
             ('MiXeD', 'MiXeD', 'q', 99999999.99, 100.25, 42, 42, 42, 42, 2.5, -3.25, b'1', true, '1999-12-31', '1999-12-31 23:59:59.999999', '1999-12-31 23:59:59.999999', 'ok', 'red', NULL, '123e4567-e89b-12d3-a456-426614174003', X'FF', '2024-01-04 00:00:00'),
             ('nulls', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2024-01-05 00:00:00'),
             ('six', 'six', 'six6', 1.00, 1.5, 6, 6, 6, 6, 6.0, 6.0, b'1', true, '2024-06-15', '2024-06-15 06:30:00.000000', '2024-06-15 06:30:00.000000', 'sad', 'green', '{"n":6}', '123e4567-e89b-12d3-a456-426614174005', X'AA', '2024-01-06 00:00:00'),
             ('seven', 'seven', 'svn7', 42.42, -2.75, 7, 7, 7, 7, 7.0, 7.0, b'0', false, '2024-07-07', '2024-07-07 07:07:07.000000', '2024-07-07 07:07:07.000000', 'ecstatic', 'red,blue', '{"n":7}', '123e4567-e89b-12d3-a456-426614174006', X'BB', '2024-01-07 00:00:00'),
-            ('eight', 'eight', 'eght', NULL, NULL, 8, 8, 8, 8, 8.0, 8.0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2024-01-08 00:00:00')
+            ('eight', 'eight', 'eght', NULL, NULL, 8, 8, 8, 8, 8.0, 8.0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2024-01-08 00:00:00')
             "#,
         ))
         .execute(&self.pool)

@@ -446,7 +446,7 @@ See [`docs/architecture.md`](docs/architecture.md), [`docs/pushdown.md`](docs/pu
 
 **Testing**
 
-109 library unit tests cover pushdown, type mapping, partitioning, watermarks and codecs. Integration and e2e tests use a self-provisioned PostgreSQL (via `postgresql_embedded`, no Docker required) with a deterministic hostile fixture (NULLs, distinct types, enum, arrays, edge timestamps) and verify extraction, pushdown, and distributed execution. See [`docs/testing-plan.md`](docs/testing-plan.md) for the full matrix and how to run (`cargo test --test pg_*`, `cargo test --test e2e`).
+109 library unit tests cover pushdown, type mapping, partitioning, watermarks and codecs. Integration and e2e tests run against the Docker compose stack (`tests/docker/compose.yaml`; `scripts/e2e.sh` handles up/down automatically) with a deterministic hostile fixture (NULLs, distinct types, enum, arrays, edge timestamps) and verify extraction, pushdown, and distributed execution. See [`docs/testing-plan.md`](docs/testing-plan.md) for the full matrix and how to run (`cargo test --test pg_*`, `cargo test --test e2e`).
 
 
 **Deferred**

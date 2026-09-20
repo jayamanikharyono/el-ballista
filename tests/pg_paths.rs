@@ -3,8 +3,8 @@
 //! `extract_incremental_window` and the `*_via_cursor` methods used to inline
 //! `$1/$2` placeholders into `DECLARE … FOR` with zero binds (every call failed
 //! with "there is no parameter $1"). All three paths must return identical data.
-//! Run: `cargo test --test pg_paths` (self-provisions Postgres; set `DATABASE_URL` to
-//! point at a specific server instead).
+//! Run: `cargo test --test pg_paths` (requires the compose stack up;
+//! `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -13,7 +13,7 @@ use chrono::{TimeZone, Utc};
 use common::TestDb;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 
-/// Always provisions a real database (embedded, unless `DATABASE_URL` is set) — never
+/// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
 macro_rules! live {
     () => {

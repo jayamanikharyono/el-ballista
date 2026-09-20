@@ -1,20 +1,19 @@
 //! MySQL extractor (prototype). Connect + full-table extract to Arrow.
 //!
-//! PROTOTYPE SIMPLIFICATION: every column is materialized as Arrow `Utf8` via `CAST(col AS CHAR)`,
-//! keeping decoding to `Option<String>` (robust across MySQL types) so the walking skeleton runs
-//! end-to-end without a full per-type decode path. The intended typed mapping lives in
-//! [`super::type_mapper`]; wiring typed Arrow builders is the next step. Uses `fetch_all` (not a
-//! bounded-memory cursor) — prototype only.
+//! Columns decode to typed Arrow arrays via [`super::row_adapter`] (width-preserving integers,
+//! `Decimal128`, `Boolean`, dates/timestamps, `Binary` for binary/blob, `Utf8` otherwise), from a
+//! plain `SELECT` of the raw columns — no `CAST(... AS CHAR)`, which would lossily null out binary
+//! values that are invalid in the connection charset. Uses `fetch_all` (not a bounded-memory
+//! cursor) — prototype only.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use sqlx::MySqlPool;
 use sqlx::mysql::MySqlPoolOptions;
-use sqlx::{MySqlPool, Row};
 
 use super::dialect::MysqlDialect;
+use super::row_adapter::MysqlRowAdapter;
 use super::schema_reader::MysqlSchemaReader;
 use crate::connector::errors::ExtractorError;
 use crate::pushdown::dialect::SqlDialect;
@@ -51,7 +50,7 @@ impl MysqlExtractor {
         &self.pool
     }
 
-    /// Full-table extract to a single Arrow `RecordBatch` (all columns `Utf8` — see module docs).
+    /// Full-table extract to a single Arrow `RecordBatch` with typed columns (see module docs).
     pub async fn extract_full_table(
         &self,
         table_name: &str,
@@ -63,54 +62,33 @@ impl MysqlExtractor {
             .await?
             .select_columns(columns.as_deref());
 
-        let sql = Self::build_string_projection(&metadata);
-        // `build_string_projection` composes only quoted identifiers via `MysqlDialect::quote_ident`
+        let sql = Self::build_projection(&metadata);
+        // `build_projection` composes only quoted identifiers via `MysqlDialect::quote_ident`
         // (no user-supplied literals), so the assembled SELECT is safe to execute.
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(&self.pool)
             .await?;
 
-        let mut builders: Vec<StringBuilder> = metadata
+        let schema = MysqlRowAdapter::build_arrow_schema(&metadata)?;
+        let arrays = metadata
             .columns
             .iter()
-            .map(|_| StringBuilder::new())
-            .collect();
+            .enumerate()
+            .map(|(i, col)| MysqlRowAdapter::decode_column(&rows, i, col))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        for row in &rows {
-            for (i, builder) in builders.iter_mut().enumerate() {
-                let value: Option<String> = row.try_get(i)?;
-                match value {
-                    Some(v) => builder.append_value(v),
-                    None => builder.append_null(),
-                }
-            }
-        }
-
-        let fields: Vec<Field> = metadata
-            .columns
-            .iter()
-            .map(|c| Field::new(c.column_name.clone(), DataType::Utf8, c.is_nullable))
-            .collect();
-        let arrays: Vec<ArrayRef> = builders
-            .into_iter()
-            .map(|mut b| Arc::new(b.finish()) as ArrayRef)
-            .collect();
-
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
+        let batch = RecordBatch::try_new(Arc::new(schema), arrays)?;
         Ok(batch)
     }
 
-    /// `SELECT CAST(`col` AS CHAR) AS `col`, ... FROM `schema`.`table`` — prototype string
-    /// materialization so every value decodes as `Option<String>`.
-    fn build_string_projection(table: &TableMetadata) -> String {
+    /// `SELECT `col`, ... FROM `schema`.`table`` over the raw columns — typed decode happens in
+    /// [`MysqlRowAdapter`], so the SQL carries no casts.
+    fn build_projection(table: &TableMetadata) -> String {
         let dialect = MysqlDialect;
         let cols = table
             .columns
             .iter()
-            .map(|c| {
-                let ident = dialect.quote_ident(&c.column_name);
-                format!("CAST({ident} AS CHAR) AS {ident}")
-            })
+            .map(|c| dialect.quote_ident(&c.column_name))
             .collect::<Vec<_>>()
             .join(", ");
         format!(

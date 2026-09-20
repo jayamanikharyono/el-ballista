@@ -7,9 +7,9 @@
 //!
 //! Scope (prototype): connect, read schema from `information_schema`, and full-table extract to
 //! Arrow. NOT included yet: pushdown, incremental watermarks, parallel/distributed execution,
-//! bounded-memory cursor streaming, or rich per-type Arrow decoding (the prototype materializes
-//! every column as `Utf8` via `CAST(... AS CHAR)` — see [`extractor`]). [`type_mapper`] documents
-//! the intended Arrow types for the next step.
+//! or bounded-memory cursor streaming. Columns decode to typed Arrow arrays via [`row_adapter`]
+//! (width-preserving integers, `Decimal128`, `Boolean`, dates/timestamps, `Binary`, `Utf8`
+//! otherwise); `fetch_all` still materializes the whole result in memory — prototype only.
 //!
 //! Abstraction findings this prototype surfaces (act on these when promoting MySQL past prototype):
 //! - [`SqlDialect`] and `Fidelity` live under `connector::postgres::pushdown`; a second dialect
@@ -26,6 +26,7 @@
 pub mod dialect;
 pub mod extractor;
 pub mod query_builder;
+pub mod row_adapter;
 pub mod schema_reader;
 pub mod type_mapper;
 

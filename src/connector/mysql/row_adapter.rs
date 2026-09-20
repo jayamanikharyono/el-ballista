@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, StringBuilder,
+    Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
     TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -61,7 +61,11 @@ impl MysqlRowAdapter {
     pub fn build_arrow_schema(table: &TableMetadata) -> Result<Schema, ExtractorError> {
         let mut fields: Vec<Field> = Vec::with_capacity(table.columns.len());
         for c in &table.columns {
-            fields.push(Field::new(&c.column_name, arrow_type_for(c)?, c.is_nullable));
+            fields.push(Field::new(
+                &c.column_name,
+                arrow_type_for(c)?,
+                c.is_nullable,
+            ));
         }
         Ok(Schema::new(fields))
     }
@@ -158,12 +162,16 @@ impl MysqlRowAdapter {
                 Ok(Arc::new(arr))
             }
             DataType::Boolean => {
-                // `bit`: decode the raw bytes; any non-zero byte is `true`.
+                // `BIT(1)` decodes as `bool`; wider `BIT(N)` arrives as raw bytes —
+                // any non-zero byte is `true`.
                 let mut b = BooleanBuilder::with_capacity(rows.len());
                 for r in rows {
-                    let v: Option<Vec<u8>> = r.try_get(idx)?;
+                    let v: Option<bool> = r.try_get(idx).or_else(|_| {
+                        r.try_get::<Option<Vec<u8>>, _>(idx)
+                            .map(|o| o.map(|bytes| bytes.iter().any(|&x| x != 0)))
+                    })?;
                     match v {
-                        Some(bytes) => b.append_value(bytes.iter().any(|&x| x != 0)),
+                        Some(x) => b.append_value(x),
                         None => b.append_null(),
                     }
                 }
@@ -181,9 +189,13 @@ impl MysqlRowAdapter {
                 Ok(Arc::new(b.finish()))
             }
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                // `DATETIME` decodes naive; `TIMESTAMP` (TZ-converting) decodes TZ-aware.
                 let mut b = TimestampMicrosecondBuilder::with_capacity(rows.len());
                 for r in rows {
-                    let v: Option<NaiveDateTime> = r.try_get(idx)?;
+                    let v: Option<NaiveDateTime> = r.try_get(idx).or_else(|_| {
+                        r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(idx)
+                            .map(|o| o.map(|ts| ts.naive_utc()))
+                    })?;
                     match v {
                         Some(ts) => b.append_value(ts.and_utc().timestamp_micros()),
                         None => b.append_null(),

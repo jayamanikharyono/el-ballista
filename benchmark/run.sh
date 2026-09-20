@@ -41,7 +41,7 @@
 #          correctness.json (row-by-row file check), summary.md (comparison table).
 #          Row counts must match or the run FAILS.
 #
-# Prereqs: docker or podman CLI. No compose needed; plain CLI commands only.
+# Prereqs: docker CLI. No compose needed; plain CLI commands only.
 set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,18 +109,17 @@ case "$MODE" in
   *) echo "--mode must be standalone, distributed, or both" >&2; exit 2 ;;
 esac
 
-if command -v docker >/dev/null 2>&1; then CLI=docker;
-elif command -v podman >/dev/null 2>&1; then CLI=podman;
-else echo "need docker or podman CLI" >&2; exit 1; fi
+if ! command -v docker >/dev/null 2>&1; then echo "need docker CLI" >&2; exit 1; fi
+CLI=docker
 
 # Fail fast with a useful message instead of dying mid-run on the first CLI call.
 if ! $CLI info >/dev/null 2>&1; then
   cat >&2 <<'EOF'
-cannot reach a container engine through the detected CLI.
-- podman machine not running?  podman machine start  (then retry)
+cannot reach Docker through the docker CLI.
+- Docker Desktop not running? Start Docker Desktop (then retry)
 - socket live but CLI pointed elsewhere?
-  export CONTAINER_HOST=unix:///var/run/docker.sock  (then retry)
-- no engine at all? Install Docker Desktop or `podman machine init && podman machine start`.
+  export DOCKER_HOST=unix:///var/run/docker.sock  (then retry)
+- no engine at all? Install Docker Desktop.
 EOF
   exit 1
 fi
@@ -238,7 +237,7 @@ def stats_all(names):
     return rows
 
 def to_mib(raw):
-    # docker reports IEC (MiB/GiB), podman reports SI (MB/GB) — handle both.
+    # docker stats reports IEC (MiB/GiB).
     try:
         if raw.endswith("TiB"):
             return float(raw[:-3]) * 1048576
@@ -369,8 +368,7 @@ sample_stats() { # $1=container $2=csv
   while $CLI ps --format '{{.Names}}' | grep -qx "$1"; do
     line=$($CLI stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "$1" 2>/dev/null || true)
     if [ -n "$line" ]; then
-      # line looks like: 12.3% 1.5GiB / 15.6GiB (docker, IEC) or
-      #                  12.3% 1.5GB / 15.6GB   (podman, SI) — handle both.
+      # line looks like: 12.3% 1.5GiB / 15.6GiB (docker, IEC).
       cpu=$(echo "$line" | awk '{gsub(/%/,"",$1); print $1}')
       mem=$(echo "$line" | awk '{print to_mib($2)}
         function to_mib(s) {

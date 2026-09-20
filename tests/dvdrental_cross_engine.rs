@@ -118,7 +118,7 @@ async fn pg_extractor() -> PostgresExtractor {
 
 async fn my_extractor() -> (MysqlExtractor, String) {
     let (h, p, u, pw, db) = parse(&my_url(), 3306);
-    let ex = MysqlExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000)
+    let ex = MysqlExtractor::connect(&h, p, &u, &pw, &db, 4)
         .await
         .unwrap_or_else(|e| panic!("MysqlExtractor::connect: {e}"));
     (ex, db)

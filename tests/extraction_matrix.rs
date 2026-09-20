@@ -108,16 +108,21 @@ async fn pg_extractor() -> PostgresExtractor {
 }
 async fn my_extractor() -> (MysqlExtractor, String) {
     let (h, p, u, pw, db) = parse(&my_url(), 3306);
-    let ex = MysqlExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000).await.unwrap_or_else(|e| panic!("MysqlExtractor::connect: {e}"));
+    let ex = MysqlExtractor::connect(&h, p, &u, &pw, &db, 4)
+        .await
+        .unwrap_or_else(|e| panic!("MysqlExtractor::connect: {e}"));
     (ex, db)
 }
 
 // ---- canonicalization ----
 
-/// One canonical string per value, applied identically on every side. Trims trailing zeros in a
+/// One canonical string per value, applied identically on every side. Trims trailing spaces
+/// first (`bpchar`/`CHAR(n)` pads to length on store while `CAST(... AS text/CHAR)` trims, so the
+/// padded connector value and the trimmed oracle text converge), then trailing zeros in a
 /// fractional part (and a bare trailing dot), which converges decimal scale and timestamp precision
-/// across Arrow rendering and each engine's `CAST(... AS text)`; leaves values without a `.` alone.
+/// across Arrow rendering and each engine's `CAST(... AS text)`; leaves other values alone.
 fn canon(s: &str) -> String {
+    let s = s.trim_end_matches(' ');
     if s.contains('.') {
         let t = s.trim_end_matches('0');
         let t = t.trim_end_matches('.');

@@ -8,8 +8,8 @@ env:
   RUST_LOG: warn
   CARGO_BUILD_JOBS: 2
   RUSTFLAGS: "-C debuginfo=0"
-  # On CI we use a containerized Postgres; locally tests self-provision via
-  # postgresql_embedded when DATABASE_URL is unset (see tests/common/mod.rs).
+  # On CI we use a containerized Postgres; locally tests use the Docker compose
+  # stack (see tests/docker/compose.yaml and tests/common/mod.rs).
   DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/test
 
 jobs:

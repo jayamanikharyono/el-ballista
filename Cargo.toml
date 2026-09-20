@@ -76,8 +76,5 @@ name = "pipeline_extraction"
 path = "examples/pipeline_extraction.rs"
 
 [dev-dependencies]
-# Self-provisioning Postgres for integration/e2e tests: no Docker, no externally
-# running server required. Default features (theseus + tls-native-tls) already
-# give the async API used in tests/common/mod.rs; binaries are cached under
-# ~/.theseus/postgresql after the first download.
-postgresql_embedded = "0.21"
+# Integration/e2e tests run against the Docker compose stack
+# (tests/docker/compose.yaml); no test-only dependencies.

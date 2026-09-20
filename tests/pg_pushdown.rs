@@ -2,8 +2,8 @@
 //!
 //! The single highest-value integration test (testing-plan.md Phase C.2): any fidelity
 //! lie — including the fixed OR-index shortcut — shows up as a row mismatch.
-//! Run: `cargo test --test pg_pushdown` (self-provisions Postgres; set `DATABASE_URL` to
-//! point at a specific server instead).
+//! Run: `cargo test --test pg_pushdown` (requires the compose stack up;
+//! `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -15,7 +15,7 @@ use rust_ballista_extraction_layer::config::{
 };
 use rust_ballista_extraction_layer::distributed::DistributedContext;
 
-/// Always provisions a real database (embedded, unless `DATABASE_URL` is set) — never
+/// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
 macro_rules! live {
     () => {

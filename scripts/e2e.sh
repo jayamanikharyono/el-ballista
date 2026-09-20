@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Bring up the compose test databases, run the full suite against them, then tear down.
-# Override the container engine with COMPOSE, e.g.  COMPOSE='podman compose' scripts/e2e.sh
+# Requires Docker: `docker compose` must be on PATH.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-COMPOSE="${COMPOSE:-docker compose}"
+COMPOSE="docker compose"
 export DATABASE_URL="${DATABASE_URL:-postgres://postgres:postgres@127.0.0.1:5432/test}"
 export MYSQL_URL="${MYSQL_URL:-mysql://root:password@127.0.0.1:3306/test}"
 

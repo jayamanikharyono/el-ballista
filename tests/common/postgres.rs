@@ -9,7 +9,7 @@
 //! past.
 //!
 //! ```bash
-//! docker compose -f tests/docker/compose.yaml up -d --wait   # or: podman compose ...
+//! docker compose -f tests/docker/compose.yaml up -d --wait
 //! cargo test --test pg_paths -- --test-threads=1
 //! docker compose -f tests/docker/compose.yaml down -v
 //! ```

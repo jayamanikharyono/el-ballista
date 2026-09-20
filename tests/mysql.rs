@@ -20,7 +20,7 @@ use rust_ballista_extraction_layer::connector::mysql::{
 
 /// Connect an extractor to the per-test database (all tests share this boilerplate).
 async fn extractor(db: &MySqlTestDb) -> MysqlExtractor {
-    MysqlExtractor::connect(&db.host, db.port, &db.user, &db.password, &db.database, 4, 30_000)
+    MysqlExtractor::connect(&db.host, db.port, &db.user, &db.password, &db.database, 4)
         .await
         .expect("MysqlExtractor::connect")
 }
@@ -106,7 +106,12 @@ async fn full_extract_typed_schema_values_and_datafusion_ingest() {
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     assert_eq!(name.value(0), "Zürich");
-    assert!(name.is_null(4)); // 'nulls' row
+    let nick = batch
+        .column(batch.schema().index_of("nick").unwrap())
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    assert!(nick.is_null(4)); // 'nulls' row (name is the literal 'nulls', nick is NULL)
     // `amount DECIMAL(12,2)` = 123.45 → Decimal128 unscaled 12345 at scale 2.
     let amount = batch
         .column(batch.schema().index_of("amount").unwrap())
@@ -166,8 +171,14 @@ async fn projection_returns_requested_columns() {
 async fn empty_table_yields_valid_empty_arrow() {
     let db = MySqlTestDb::connect().await;
     let empty_table = format!("{}.hostile_empty", db.database);
+    // Each identifier quoted separately: one backtick pair around `db.table` is a single
+    // identifier containing a dot, not a qualified name.
     sqlx::query(sqlx::AssertSqlSafe(
-        format!("CREATE TABLE `{empty_table}` LIKE `{}`", db.table()).as_str(),
+        format!(
+            "CREATE TABLE `{}`.`hostile_empty` LIKE `{}`.`hostile`",
+            db.database, db.database
+        )
+        .as_str(),
     ))
     .execute(&db.pool)
     .await
@@ -190,7 +201,7 @@ async fn empty_table_yields_valid_empty_arrow() {
     assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 
     sqlx::query(sqlx::AssertSqlSafe(
-        format!("DROP TABLE `{empty_table}`").as_str(),
+        format!("DROP TABLE `{}`.`hostile_empty`", db.database).as_str(),
     ))
     .execute(&db.pool)
     .await

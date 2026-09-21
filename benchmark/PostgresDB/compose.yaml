@@ -4,6 +4,9 @@ services:
   postgres:
     image: docker.io/library/postgres:17
     container_name: pg-learust
+    # Hardcoded test budget (same rule as benchmark bench-pg): cores 4-5 + 2g RAM.
+    cpuset: '4-5'
+    mem_limit: 2g
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres

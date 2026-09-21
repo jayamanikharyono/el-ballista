@@ -36,10 +36,12 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 | Sink | `parquet::arrow::ArrowWriter`, Snappy, single file | `df.write.parquet`, Snappy |
 | Timed | Schema discovery + scan + collect + encode (`scan_ms` + `write_ms` split in JSON) | Bounds query excluded; read + write + read-back count |
 
-Batch size (`--batch-size`) is optional and only affects Spark's JDBC `fetchsize`. **Auto run** (flag absent): Spark uses driver default (buffers each partition fully); Rust batch size is controlled by DataFusion's streaming. **Manual run** (`--batch-size 64000`): Spark streams that many rows per batch. Partition counts derive from the 64000 reference as ceil(table_rows / 64000) — ~95 partitions at 6M rows — so an auto run and a manual run differ only in Spark's per-batch streaming, never in fan-out. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
+Batch size (`--batch-size`) is optional and only affects Spark's JDBC `fetchsize`. **Auto run** (flag absent): Spark uses driver default (buffers each partition fully); Rust batch size is controlled by DataFusion's streaming. **Manual run** (`--batch-size 64000`): Spark streams that many rows per batch. Partition counts derive from the 64000 reference as ceil(table_rows / 64000) — 157 partitions at 10M rows — so an auto run and a manual run differ only in Spark's per-batch streaming, never in fan-out. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
 
 CPU/MEM for distributed runs aggregates the whole cluster (scheduler + workers + client
-summed per tick), comparable to single-container runs. Everything runs sequentially —
+summed per tick), comparable to single-container runs. bench-pg is profiled on the same
+ticks into a separate series so every run shows source-database cost without polluting
+engine totals. Everything runs sequentially —
 nothing contends for CPU. Best-of-`REPEAT` smooths JVM warmup and page-cache effects.
 
 ## Layout
@@ -53,7 +55,7 @@ benchmark/
 ├── spark/
 │   ├── Dockerfile     # apache/spark:3.5.4 + PostgreSQL JDBC 42.7.13 baked in
 │   └── load.py        # the equivalent workload, JSON summary to stdout
-├── scale.sql          # grow toward SCALE_ROWS (~5M default); run.sh computes the
+├── scale.sql          # grow toward SCALE_ROWS (~10M default); run.sh computes the
 #                       # factor from the live count and skips when already there
 ├── run.sh             # orchestrator: build → postgres → scale → run → profile → gate → report
 ├── results/           # *.json, *_cluster.csv, *_c_*.csv, summary.md (gitignored)
@@ -62,7 +64,7 @@ benchmark/
 
 ## Quickstart
 
-Needs the `docker` CLI. ~5M-row default takes a few minutes plus a one-time Rust
+Needs the `docker` CLI. ~10M-row default takes a few minutes plus a one-time Rust
 release build (Ballista + DataFusion — go make coffee).
 
 ```bash
@@ -72,12 +74,40 @@ benchmark/run.sh --repeat 3
 # Smoke test on the 20k seed (seconds):
 benchmark/run.sh --skip-scale --repeat 1
 
+# Tiny host (~1GB RAM) smoke test: shrink everything to fit, stay on the 20k seed.
+# Adjust --cpuset-cpus to the cores you actually have (the default 0-3 fails fast
+# otherwise). Explicit small slices bypass the floors — your risk. Smoke ONLY:
+# different data scale means different spec, never quote these numbers.
+benchmark/run.sh --skip-scale --repeat 1 --mode standalone \
+  --cpuset-cpus 0-1 --memory 1g --workers 1 \
+  --scheduler-memory 128m --client-memory 128m --worker-memory 256m
+
 # Skip builds entirely (images already present):
 benchmark/run.sh --no-build --repeat 3
+
+# Apples-to-apples on 4 cores (default: every container pinned to cores 0-3 and
+# running its runtime unrestricted — Spark local[*], DataFusion defaults):
+benchmark/run.sh --repeat 3
 
 # Cleanup everything (containers, network, volume, results):
 benchmark/run.sh --clean
 ```
+
+Every container the script starts defaults to a hard pin on cores 0-3
+(`--cpuset-cpus 0-3`, overridable; a host with fewer than 4 cores fails fast instead
+of benchmarking the wrong budget) and `--memory 4g`. Memory is a per-deployment
+budget: Spark and the standalone Rust client each get the full 4g, while
+the distributed deployment shares it — 512m scheduler + 512m client + the rest split
+evenly across workers (768m each at `--workers 4`). Postgres is fixed outside this
+budget at cores 4-5 + 2g RAM (hardcoded in `run.sh` and both compose files, clear of
+the engine pin) so the shared fixture never changes shape. Tune with `--cpus N` (replaces
+the pin with a quota), `--cpuset-cpus RANGE`, `--memory SIZE`, `--scheduler-memory`
+/ `--client-memory` / `--worker-memory` (or `CPUS` / `MEMORY` / `CPUSET_CPUS` /
+`SCHEDULER_MEMORY` / `CLIENT_MEMORY` / `WORKER_MEMORY` env; empty lifts the default).
+Prefer the pin over the quota: the JVM honors a CFS quota, but Rust's
+`available_parallelism` (which sizes DataFusion partitions and Ballista task slots)
+only sees a cpuset pin — under plain `--cpus` the Rust side still sizes its pools
+from all host CPUs.
 
 ## Prebuilt images (skip the build)
 
@@ -89,10 +119,10 @@ around it:
    re-running costs minutes, not a full rebuild.
 
 `PG_PORT` defaults to 5433 so it never clashes with a dev DB on 5432. `BENCH_PG_PASSWORD`
-defaults to `postgres` (matches the seed compose). `BENCH_CONCURRENT_TASKS`, when set,
-pins each worker's task slots (default: the worker's visible CPU count) — the closest
-thing Ballista has to CPUs-per-executor; there is no CPU pinning, tasks share one Tokio
-runtime over all visible cores.
+defaults to `postgres` (matches the seed compose). `BENCH_CONCURRENT_TASKS` pins each worker's task slots (default: all visible CPUs,
+i.e. the pinned budget) — the closest thing Ballista has to CPUs-per-executor; there
+is no CPU pinning, tasks share one Tokio runtime over all visible cores. Leave it
+unset for headline runs; it is a diagnostic knob, not a spec knob.
 
 ## What you get
 
@@ -120,11 +150,41 @@ the scan or one idled. The JSON carries both levels:
 }
 ```
 
-and the summary prints per-container sub-rows under each distributed row. CPU% sums across
+and the summary prints per-container sub-rows under each distributed row, plus a
+`postgres` sub-row per engine run: bench-pg is sampled on the same ticks into
+`<prefix>_pg.csv` (never summed into engine totals) so every run also shows what the
+source database cost — the way to tell a pushdown win (low PG CPU) from a fast scan.
+`mem_mib` everywhere is cgroup `usage` (RSS **plus page cache**): engine outputs and
+the PG buffer pool both inflate it, so read it as total footprint, not pure process
+memory. CPU% sums across
 cores *and* containers (200% on 2 cores fully lit is normal); RSS sums the high-water marks
 (processes don't share Arrow buffers, so the sum is the true cluster footprint). Series are
-100ms samples — spikes inside a tick are still invisible; size conclusions on
-averages and peaks, not single samples.
+100ms Engine-API polls (`BENCH_SAMPLE_INTERVAL` to change): each tick differences the
+daemon's cumulative CPU counters, so per-interval CPU is exact — short bursts can no
+longer hide between polls the way they did under the old `docker stats` CLI loop
+(which once reported a 1.2s selective run as 0.0% CPU). A tail sample after client
+exit catches compute that finished on the last tick. Reported peaks are maxes over a
+500ms rolling mean, not raw single ticks: counter-granularity mismatch between the
+container and system counters can spike one 100ms tick above anything physical
+(observed 643% on a 4-core pin, whose ceiling is 400%) — a real sustained burst
+survives the smoothing, a one-tick artifact does not. The smoothed peak is then
+capped at the run's CPU budget × 100 (`PIN_MAX_PCT` from the pin/quota): the pin is
+kernel-enforced, so no true peak can exceed it and the cap only removes artifact. A single hot container (usually
+Spark, whose GC/stage boundaries make its usage spikier tick-to-tick) can still print
+a peak above the pin ceiling while the distributed sum — six series diluting one
+another's spikes — stays nearer it. That gap is measurement noise, not an engine
+property: compare averages, which cancel it. `run.sh` also verifies the pin itself
+(`docker inspect` on every started container, `pin: <name> -> [0-3]` per run, WARN
+otherwise — a stale `bench-pg` reused from an unpinned run would otherwise silently
+benchmark a different spec). Memory is instantaneous per
+sample, so sub-100ms RSS spikes can still hide; size conclusions on averages and
+peaks, not single samples. One lifecycle asymmetry to read correctly: the distributed
+cluster (scheduler + workers) starts once per mode and serves `full` then `selective`,
+while the standalone/Spark clients start fresh per scenario — so selective worker RSS
+carries retained memory from the earlier full scan (allocator arenas and pools don't
+return RSS; Ballista installs no memory pool by default, so this is residue, not
+reservation). That is the honest cost of a warm long-lived cluster, but it means
+selective worker RSS is not comparable to the cold-start standalone/Spark numbers.
 
 ## Correctness check (independent, row-by-row)
 
@@ -146,101 +206,134 @@ make row order nondeterministic, so file hashes would false-fail on every run.
 ## Results
 
 Toolchain: see [Versions](#versions). Source database is the PostgreSQL above.
-Spark heap is sized as machine RAM minus 2 GB (`SPARK_DRIVER_MEM`).
+Spark heap follows the formula (`overhead = max(384m, 10% of heap)`) inside whatever
+engine budget the run uses — 1664m at 2g, 3712m at 4g, 7447m at 8g; explicit
+`SPARK_DRIVER_MEM` always wins, and the effective heap prints in every run's budget
+line, so heap is never a hidden variable.
 
-### 8 GB machine — tool-default batching (auto)
+All runs below: 10M rows, best of 3, tool-default batching, pin 0-3, pg 4-5 + 2g,
+157/157 fan-out. The only variable across the three tables is the engine memory
+budget (2g/4g/8g). `postgres` sub-rows show source-database cost during that engine's
+run (same ticks, never summed into engine totals).
 
-| engine                   | scenario  | rows              | elapsed                        | avg CPU% | max CPU% | max RSS MiB |
-|--------------------------|-----------|-------------------|--------------------------------|----------|----------|-------------|
-| pyspark-3.5.4            | full      | 6060000           | 19690ms                        | 221.5    | 245.7    | 3767        |
-| rust-ballista-standalone | full      | 6060000           | 18944ms                        | 122.9    | 168.4    | 127         |
-| rust-ballista-remote     | full      | 6060000           | 15508ms                        | 139.6    | 150.2    | 294         |
-|                          |           | `bench-rust-dist` | avg 6.9% / peak 19.5% / 86MiB  |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.3% / peak 0.3% / 8MiB    |          |          |             |
-|                          |           | `bench-worker-1`  | avg 33.6% / peak 37.0% / 66MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 33.1% / peak 36.5% / 60MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 32.6% / peak 35.8% / 65MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 33.0% / peak 36.1% / 88MiB |          |          |             |
-| pyspark-3.5.4            | selective | 194223            | 4374ms                         | 192.0    | 212.1    | 734         |
-| rust-ballista-standalone | selective | 194223            | 6174ms                         | 5.6      | 7.9      | 16          |
-| rust-ballista-remote     | selective | 194223            | 602ms                          | 118.1    | 124.2    | 219         |
-|                          |           | `bench-rust-dist` | avg 1.1% / peak 4.8% / 7MiB    |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.3% / peak 0.4% / 9MiB    |          |          |             |
-|                          |           | `bench-worker-1`  | avg 29.7% / peak 30.3% / 50MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 29.4% / peak 30.0% / 51MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 28.7% / peak 29.3% / 51MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 28.9% / peak 29.5% / 52MiB |          |          |             |
+### Engine budget 2g (workers 256m each, spark heap 1664m)
 
-### 8 GB machine — batch size 64000 (manual)
+| engine                   | scenario  | component         | elapsed_ms | avg_cpu_pct | peak_cpu_pct | peak_rss_mib |
+|--------------------------|-----------|-------------------|------------|-------------|--------------|--------------|
+| rust-ballista-remote     | full      |                   | 19650      | 266.3       | 400.0        | 1531         |
+|                          |           | `bench-rust-dist` |            | 32.2        | 95.7         | 512          |
+|                          |           | `bench-scheduler` |            | 0.3         | 0.9          | 8            |
+|                          |           | `bench-worker-1`  |            | 60.6        | 154.3        | 256          |
+|                          |           | `bench-worker-2`  |            | 56.4        | 121.3        | 256          |
+|                          |           | `bench-worker-3`  |            | 60.1        | 146.9        | 257          |
+|                          |           | `bench-worker-4`  |            | 56.7        | 126.5        | 256          |
+|                          |           | `postgres`        |            | 53.2        | 127.8        | 2048         |
+| rust-ballista-standalone | full      |                   | 27368      | 174.5       | 221.8        | 1486         |
+|                          |           | `postgres`        |            | 39.4        | 68.8         | 2048         |
+| pyspark-3.5.4            | full      |                   | 20741      | 250.2       | 392.3        | 2049         |
+|                          |           | `postgres`        |            | 60.4        | 106.7        | 2048         |
+| rust-ballista-remote     | selective |                   | 1424       | 57.5        | 72.8         | 1045         |
+|                          |           | `bench-rust-dist` |            | 6.1         | 33.6         | 10           |
+|                          |           | `bench-scheduler` |            | 4.5         | 6.2          | 12           |
+|                          |           | `bench-worker-1`  |            | 12.2        | 15.5         | 256          |
+|                          |           | `bench-worker-2`  |            | 11.4        | 13.9         | 256          |
+|                          |           | `bench-worker-3`  |            | 11.9        | 15.6         | 256          |
+|                          |           | `bench-worker-4`  |            | 11.2        | 13.6         | 256          |
+|                          |           | `postgres`        |            | 148.6       | 196.1        | 2048         |
+| rust-ballista-standalone | selective |                   | 10273      | 12.7        | 24.4         | 22           |
+|                          |           | `postgres`        |            | 23.7        | 78.1         | 2048         |
+| pyspark-3.5.4            | selective |                   | 5030       | 220.5       | 344.5        | 637          |
+|                          |           | `postgres`        |            | 34.6        | 130.3        | 2048         |
 
-| engine                   | scenario  | rows              | elapsed                         | avg CPU% | max CPU% | max RSS MiB |
-|--------------------------|-----------|-------------------|---------------------------------|----------|----------|-------------|
-| pyspark-3.5.4            | full      | 6060000           | 18690ms                         | 207.2    | 236.8    | 2884        |
-| rust-ballista-standalone | full      | 6060000           | 21269ms                         | 122.9    | 169.1    | 303         |
-| rust-ballista-remote     | full      | 6060000           | 19317ms                         | 134.5    | 143.5    | 584         |
-|                          |           | `bench-rust-dist` | avg 7.1% / peak 18.3% / 87MiB   |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.3% / peak 0.3% / 8MiB     |          |          |             |
-|                          |           | `bench-worker-1`  | avg 33.4% / peak 36.5% / 130MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 31.5% / peak 34.3% / 146MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 30.4% / peak 33.2% / 130MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 31.8% / peak 34.8% / 141MiB |          |          |             |
-| pyspark-3.5.4            | selective | 194223            | 4337ms                          | 187.3    | 212.5    | 767         |
-| rust-ballista-standalone | selective | 194223            | 6280ms                          | 16.1     | 30.5     | 16          |
-| rust-ballista-remote     | selective | 194223            | 613ms                           | 114.4    | 119.5    | 491         |
-|                          |           | `bench-rust-dist` | avg 1.1% / peak 4.4% / 6MiB     |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.3% / peak 0.4% / 9MiB     |          |          |             |
-|                          |           | `bench-worker-1`  | avg 29.7% / peak 30.2% / 113MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 27.9% / peak 28.4% / 117MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 27.0% / peak 27.4% / 111MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 28.3% / peak 28.7% / 136MiB |          |          |             |
+### Engine budget 4g (workers 768m each, spark heap 3712m) — engine totals
+
+| engine                   | scenario  | component         | elapsed_ms | avg_cpu_pct | peak_cpu_pct | peak_rss_mib |
+|--------------------------|-----------|-------------------|------------|-------------|--------------|--------------|
+| rust-ballista-remote     | full      |                   | 19461      | 269.1       | 400.0        | 1646         |
+|                          |           | `bench-rust-dist` |            | 32.6        | 97.4         | 512          |
+|                          |           | `bench-scheduler` |            | 0.3         | 0.8          | 8            |
+|                          |           | `bench-worker-1`  |            | 57.8        | 104.0        | 292          |
+|                          |           | `bench-worker-2`  |            | 59.4        | 120.0        | 272          |
+|                          |           | `bench-worker-3`  |            | 59.7        | 140.9        | 283          |
+|                          |           | `bench-worker-4`  |            | 59.3        | 125.8        | 295          |
+|                          |           | `postgres`        |            | 52.7        | 124.0        | 2048         |
+| rust-ballista-standalone | full      |                   | 27296      | 185.1       | 221.3        | 1477         |
+|                          |           | `postgres`        |            | 40.1        | 71.5         | 2048         |
+| pyspark-3.5.4            | full      |                   | 21704      | 246.8       | 391.1        | 3154         |
+|                          |           | `postgres`        |            | 62.5        | 138.0        | 2048         |
+| rust-ballista-remote     | selective |                   | 1573       | 62.0        | 80.5         | 2987         |
+|                          |           | `bench-rust-dist` |            | 6.0         | 23.8         | 9            |
+|                          |           | `bench-scheduler` |            | 5.0         | 7.1          | 12           |
+|                          |           | `bench-worker-1`  |            | 12.6        | 15.8         | 766          |
+|                          |           | `bench-worker-2`  |            | 13.0        | 15.9         | 719          |
+|                          |           | `bench-worker-3`  |            | 13.2        | 16.9         | 729          |
+|                          |           | `bench-worker-4`  |            | 12.3        | 15.6         | 752          |
+|                          |           | `postgres`        |            | 137.9       | 195.1        | 2048         |
+| rust-ballista-standalone | selective |                   | 10249      | 12.3        | 20.6         | 22           |
+|                          |           | `postgres`        |            | 21.6        | 72.6         | 2048         |
+| pyspark-3.5.4            | selective |                   | 5990       | 216.2       | 330.7        | 641          |
+|                          |           | `postgres`        |            | 33.2        | 125.2        | 2048         |
+
+### Engine budget 8g (workers 1792m each, spark heap 7447m)
+
+| engine                   | scenario  | component         | elapsed_ms | avg_cpu_pct | peak_cpu_pct | peak_rss_mib |
+|--------------------------|-----------|-------------------|------------|-------------|--------------|--------------|
+| rust-ballista-remote     | full      |                   | 19440      | 269.5       | 400.0        | 1635         |
+|                          |           | `bench-rust-dist` |            | 35.1        | 99.7         | 512          |
+|                          |           | `bench-scheduler` |            | 0.3         | 0.7          | 8            |
+|                          |           | `bench-worker-1`  |            | 55.9        | 101.7        | 283          |
+|                          |           | `bench-worker-2`  |            | 59.5        | 123.5        | 285          |
+|                          |           | `bench-worker-3`  |            | 59.6        | 143.0        | 288          |
+|                          |           | `bench-worker-4`  |            | 59.1        | 114.6        | 283          |
+|                          |           | `postgres`        |            | 50.9        | 106.3        | 2048         |
+| rust-ballista-standalone | full      |                   | 27275      | 183.5       | 218.8        | 1485         |
+|                          |           | `postgres`        |            | 38.4        | 64.7         | 2048         |
+| pyspark-3.5.4            | full      |                   | 22018      | 251.7       | 393.7        | 4323         |
+|                          |           | `postgres`        |            | 64.8        | 129.7        | 2048         |
+| rust-ballista-remote     | selective |                   | 1429       | 57.9        | 73.7         | 3006         |
+|                          |           | `bench-rust-dist` |            | 6.3         | 34.9         | 10           |
+|                          |           | `bench-scheduler` |            | 4.5         | 6.0          | 11           |
+|                          |           | `bench-worker-1`  |            | 11.4        | 13.9         | 762          |
+|                          |           | `bench-worker-2`  |            | 12.1        | 14.6         | 738          |
+|                          |           | `bench-worker-3`  |            | 11.8        | 14.0         | 765          |
+|                          |           | `bench-worker-4`  |            | 11.7        | 14.5         | 719          |
+|                          |           | `postgres`        |            | 148.4       | 195.8        | 2047         |
+| rust-ballista-standalone | selective |                   | 10154      | 12.0        | 20.8         | 22           |
+|                          |           | `postgres`        |            | 23.6        | 77.6         | 2048         |
+| pyspark-3.5.4            | selective |                   | 5602       | 214.8       | 340.0        | 861          |
+|                          |           | `postgres`        |            | 37.9        | 136.8        | 2048         |
+
+### Takeaways (10M rows, best of 3, equal-spec per the rule above)
 
 
-### 4 GB machine — tool-default batching (auto)
+Across three runs at each engine budget (2g, 4g, and 8g), the distributed Rust/DataFusion/Ballista implementation consistently delivered the best overall performance for the tested PostgreSQL extraction workloads.
 
-| engine                   | scenario  | rows              | elapsed                        | avg CPU% | max CPU% | max RSS MiB |
-|--------------------------|-----------|-------------------|--------------------------------|----------|----------|-------------|
-| pyspark-3.5.4            | full      | 6060000           | 18364ms                        | 202.3    | 228.2    | 1933        |
-| rust-ballista-standalone | full      | 6060000           | 18841ms                        | 122.0    | 167.1    | 129         |
-| rust-ballista-remote     | full      | 6060000           | 16104ms                        | 220.3    | 271.8    | 367         |
-|                          |           | `bench-rust-dist` | avg 8.4% / peak 21.1% / 140MiB |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.8% / peak 2.9% / 56MiB   |          |          |             |
-|                          |           | `bench-worker-1`  | avg 54.6% / peak 71.6% / 59MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 48.6% / peak 63.5% / 52MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 54.0% / peak 68.1% / 55MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 54.0% / peak 69.5% / 59MiB |          |          |             |
-| pyspark-3.5.4            | selective | 194223            | 4158ms                         | 192.0    | 217.2    | 593         |
-| rust-ballista-standalone | selective | 194223            | 6158ms                         | 14.1     | 23.7     | 17          |
-| rust-ballista-remote     | selective | 194223            | 633ms                          | 119.8    | 124.5    | 265         |
-|                          |           | `bench-rust-dist` | avg 1.1% / peak 3.3% / 5MiB    |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.3% / peak 0.4% / 43MiB   |          |          |             |
-|                          |           | `bench-worker-1`  | avg 30.5% / peak 31.1% / 56MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 29.1% / peak 29.7% / 52MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 28.8% / peak 29.4% / 51MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 30.0% / peak 30.6% / 58MiB |          |          |             |
+Full extraction: distributed Rust averaged 19.52s, compared with 21.49s for PySpark and 27.31s for standalone Rust.
+Selective extraction: distributed Rust averaged 1.48s, compared with 5.54s for PySpark and 10.23s for standalone Rust.
+Memory: distributed Rust used approximately 1.5–1.65 GiB during full extraction, while PySpark reached 2.0–4.3 GiB depending on the configured heap.
+Memory scaling: increasing the engine budget from 2g → 4g → 8g produced little change in execution time for either workload, indicating that the tested workloads were not significantly memory-bound.
+Distributed execution: the remote scheduler/worker deployment substantially outperformed standalone execution, particularly for selective extraction.
 
-### 4 GB machine — batch size 64000 (manual)
+Overall, these results show that the distributed Rust implementation can provide comparable or better performance than PySpark for this workload, with lower memory requirements for full extraction, while retaining a distributed execution model through Ballista.
 
-| engine                   | scenario  | rows              | elapsed                         | avg CPU% | max CPU% | max RSS MiB |
-|--------------------------|-----------|-------------------|---------------------------------|----------|----------|-------------|
-| pyspark-3.5.4            | full      | 6060000           | 17268ms                         | 208.3    | 232.0    | 2209        |
-| rust-ballista-remote     | full      | 6060000           | 16677ms                         | 129.3    | 139.3    | 567         |
-| rust-ballista-standalone | full      | 6060000           | 20098ms                         | 119.4    | 166.8    | 214         |
-|                          |           | `bench-rust-dist` | avg 6.9% / peak 18.4% / 83MiB   |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.3% / peak 0.3% / 11MiB    |          |          |             |
-|                          |           | `bench-worker-1`  | avg 30.5% / peak 33.5% / 145MiB |          |          |             |
-|                          |           | `bench-worker-2`  | avg 30.4% / peak 33.8% / 157MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 30.4% / peak 33.6% / 149MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 30.8% / peak 34.0% / 139MiB |          |          |             |
-| pyspark-3.5.4            | selective | 194223            | 4435ms                          | 186.6    | 214.6    | 594         |
-| rust-ballista-standalone | selective | 194223            | 6216ms                          | 13.5     | 22.4     | 16          |
-| rust-ballista-remote     | selective | 194223            | 704ms                           | 114.8    | 118.8    | 472         |
-|                          |           | `bench-rust-dist` | avg 4.8% / peak 8.9% / 9MiB     |          |          |             |
-|                          |           | `bench-scheduler` | avg 0.4% / peak 0.4% / 30MiB    |          |          |             |
-|                          |           | `bench-worker-1`  | avg 27.3% / peak 27.3% / 85MiB  |          |          |             |
-|                          |           | `bench-worker-2`  | avg 27.6% / peak 27.6% / 134MiB |          |          |             |
-|                          |           | `bench-worker-3`  | avg 27.3% / peak 27.4% / 100MiB |          |          |             |
-|                          |           | `bench-worker-4`  | avg 27.4% / peak 27.5% / 117MiB |          |          |             |
+### Equal-spec rule (read before quoting a number)
 
+A benchmark number is only quotable when every engine ran the same spec:
+
+- same data (`SCALE_ROWS`, same seed/scale path),
+- same container budget (default `--cpuset-cpus 0-3` + `--memory 4g`, shared across
+  the distributed deployment — not per container),
+- same source fixture (bench-pg pinned to cores 4-5 + 2g, shared by all runs),
+- same scan fan-out derivation (default `ceil(rows/64000)` both sides),
+- same batch knob (explicit `--batch-size` both sides, or label the run "tool defaults"),
+- sequential runs, best-of-`REPEAT`.
+
+`run.sh` prints this spec card on every run and bakes the spec into
+`results/summary.md`. A missing item means the numbers are smoke, not headlines.
+Equality lives ONLY at the container boundary: inside, every runtime runs
+unrestricted (Spark `local[*]`, DataFusion defaults, Ballista visible-CPU slots).
+Never cap one side from the inside (`--spark-cores`, `BENCH_CONCURRENT_TASKS` are
+diagnostics only) — that is precisely benchmarking with a different spec.
 
 ### Reading the numbers (read before quoting them)
 
@@ -262,15 +355,19 @@ different bytes, always:
   worth investigating.
 
 - 20k seeded rows complete in seconds on either engine (noise dominates) — that's why
-  scaling exists (`SCALE_ROWS`, default 5M; `--skip-scale` stays on the raw seed).
+  scaling exists (`SCALE_ROWS`, default 10M; `--skip-scale` stays on the raw seed).
   Always report the row count next to the time.
 - JVM boot is excluded from Spark's time; process init is negligible for Rust. What's timed
   is scan + write on both sides.
 - Spark reads back its own output to count rows (inside its timed section); Rust counts
   collected batches (free). The read-back is honest work but not identical work — the JSON
   splits don't separate it. Compare `elapsed_ms` as system-vs-system, not kernel-vs-kernel.
-- Both containers are unconstrained (no `--memory`/`--cpus` limits) on the same host,
-  run sequentially. Numbers are host-specific; the *ratio* is the portable part.
+- Every container runs pinned to cores 0-3 with `--memory 4g` unless overridden
+  (distributed shares the 4g across scheduler/client/workers — see Quickstart);
+  everything runs sequentially on the same host. Numbers are host-specific; the
+  *ratio* is the portable part. For cross-host comparisons keep the pin — runtimes
+  adapt from the inside, so the same script flag means the same budget everywhere.
+  bench-pg (cores 4-5 + 2g, fixed) is the same fixture for every engine and scenario.
 - Memory shape: both sides stream to disk, so memory stays O(batch) at any row count
   on the Rust side (batches flow straight into the writer) and bounded on Spark's.
 - Apple Silicon works unmodified: every image is multi-arch (amd64 + arm64).

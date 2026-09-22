@@ -614,7 +614,9 @@ mod tests {
 
     /// A decode-side provider (no pool): `scan()` resolves the pool lazily, so with a
     /// dummy password env var this exercises the full filter→SQL path with zero network.
-    fn test_provider() -> PostgresTableProvider {
+    /// Each test passes its OWN var name: lib tests run in parallel and env vars are
+    /// process-global, so sharing one var between set/remove pairs races.
+    fn test_provider(password_env: &str) -> PostgresTableProvider {
         use crate::types::TableMetadata;
 
         let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
@@ -627,7 +629,7 @@ mod tests {
                 host: "test-invalid-host".to_string(),
                 port: 1,
                 user: "test".to_string(),
-                password_env: "REL_TEST_DUMMY_PW".to_string(),
+                password_env: password_env.to_string(),
                 database: "testdb".to_string(),
                 pool_max: 1,
                 expected_workers: 1,
@@ -660,7 +662,7 @@ mod tests {
         unsafe {
             std::env::set_var("REL_TEST_DUMMY_PW", "dummy");
         }
-        let provider = test_provider();
+        let provider = test_provider("REL_TEST_DUMMY_PW");
         let ctx = SessionContext::new();
         let state = ctx.state();
 
@@ -690,9 +692,9 @@ mod tests {
         // must carry the (empty) projected schema so the aggregate counts rows,
         // and the generated SQL must stay valid (`SELECT 1`, never `SELECT FROM`).
         unsafe {
-            std::env::set_var("REL_TEST_DUMMY_PW", "dummy");
+            std::env::set_var("REL_TEST_DUMMY_PW2", "dummy");
         }
-        let provider = test_provider();
+        let provider = test_provider("REL_TEST_DUMMY_PW2");
         let ctx = SessionContext::new();
         let state = ctx.state();
 
@@ -716,7 +718,7 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("REL_TEST_DUMMY_PW");
+            std::env::remove_var("REL_TEST_DUMMY_PW2");
         }
     }
 }

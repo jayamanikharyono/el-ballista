@@ -1,11 +1,14 @@
 //! End-to-end suite: Postgres → extractor → Arrow → Ballista → validation.
 //!
-//! The four core E2E tests from the testing strategy, run entirely in-process for the
-//! compute side: the Ballista scheduler + executor run standalone in this same process
+//! The E2E tests run entirely in-process for the compute side: the Ballista
+//! scheduler + executor run standalone in this same process
 //! (`DistributedContext::standalone`, the same in-proc path `tests/pg_distributed.rs`
 //! exercises). Postgres always comes from the Docker compose stack
 //! (`tests/docker/compose.yaml` — `DATABASE_URL` overrides the default endpoint); no
 //! embedded server, no external scheduler/workers, no silent skips.
+//!
+//! Filtering is caller-provided (full scan or explicit predicates) with direct SQL
+//! as the oracle; split checkpointing is covered through `Pipeline::run` retry.
 //!
 //! ```bash
 //! docker compose -f tests/docker/compose.yaml up -d --wait
@@ -16,20 +19,19 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use chrono::{Duration, TimeZone, Utc};
 use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::checkpoint::{
-    CheckpointStore, JobKey, RunStats, json_store::JsonCheckpointStore,
+    CheckpointStore, JobKey, json_store::JsonCheckpointStore,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 use rust_ballista_extraction_layer::distributed::DistributedContext;
-use uuid::Uuid;
 
 struct E2E {
     db: TestDb,
@@ -56,6 +58,7 @@ impl E2E {
             job_id: format!("e2e-{}", pool_max),
             table: "hostile".to_string(),
             columns: None,
+            filters: Vec::new(),
             source: SourceConfig {
                 host: self.db.host.clone(),
                 port: self.db.port,
@@ -66,12 +69,6 @@ impl E2E {
                 statement_timeout_ms: 300_000,
                 application_name: format!("relex-e2e-{}", pool_max),
                 schema: self.db.schema.clone(),
-            },
-            mode: ExtractionMode::Incremental,
-            incremental: IncrementalConfig {
-                column: "updated_at".to_string(),
-                safety_lag_secs: 0,
-                max_window_secs: 21600,
             },
             sink: SinkConfig {
                 path: "/tmp/relex_e2e_sink".to_string(),
@@ -149,97 +146,72 @@ async fn e2e_full_extraction() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn e2e_incremental_extraction() -> Result<(), Box<dyn std::error::Error>> {
+async fn e2e_filtered_extraction() -> Result<(), Box<dyn std::error::Error>> {
     let e = live!();
     let ctx = e.standalone(2).await?;
 
-    // First extraction: everything through 2024-01-04, then commit the watermark.
-    let first = e
-        .remote_ids(
-            &ctx,
-            "SELECT id FROM hostile WHERE updated_at <= '2024-01-04T00:00:00Z'",
-        )
+    // Caller-provided range predicate: the extraction layer pushes it to the source,
+    // and the result must match Postgres exactly (differential oracle).
+    let got = e
+        .remote_ids(&ctx, "SELECT id FROM hostile WHERE id > 4 AND id <= 8")
         .await?;
-    assert_eq!(first, vec![1, 2, 3, 4]);
+    assert_eq!(got, vec![5, 6, 7, 8]);
+    assert_eq!(got, e.expected_ids("id > 4 AND id <= 8").await?);
 
-    let dir = std::env::temp_dir().join(format!("relex_e2e_{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    // Same range through the connector's filtered path (config filters → pushdown).
+    let mut config = e.job(2);
+    config.filters = vec![
+        FilterEntry::Single(FilterInput::Shorthand("id>4".to_string())),
+        FilterEntry::Single(FilterInput::Shorthand("id<=8".to_string())),
+    ];
+    let batches = PostgresConnector::from_config(config)
+        .extract()
+        .standalone()
+        .collect()
+        .await?;
+    let mut ids = Vec::new();
+    for b in &batches {
+        ids.extend(common::int64_col(b, "id"));
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, got);
+    Ok(())
+}
+
+#[tokio::test]
+async fn e2e_split_checkpoint_retry_skips_completed() -> Result<(), Box<dyn std::error::Error>> {
+    let e = live!();
+    let mut config = e.job(2);
+    let dir = std::env::temp_dir().join(format!(
+        "relex_e2e_retry_{}_{}",
+        std::process::id(),
+        config.job_id
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    config.checkpoint.dir = dir.to_string_lossy().to_string();
+
+    // First run completes and records per-split progress.
+    let first = PostgresConnector::from_config(config.clone())
+        .extract()
+        .standalone()
+        .run()
+        .await?;
+    assert_eq!(first.splits_completed, first.splits_total);
+    assert!(first.splits_total >= 1);
+
     let store = JsonCheckpointStore::new(&dir)?;
-    let key = JobKey {
-        job_id: "e2e".to_string(),
-        namespace: "incr".to_string(),
-    };
-    let run_id = Uuid::new_v4();
-    store
-        .acquire(&key, run_id, Duration::hours(1), "updated_at")
-        .await?;
-    let hi = Utc.with_ymd_and_hms(2024, 1, 4, 0, 0, 0).unwrap();
-    store
-        .commit(
-            &key,
-            run_id,
-            hi,
-            RunStats {
-                rows_extracted: first.len() as u64,
-                window_lo: None,
-                window_hi: Some(hi),
-            },
-        )
-        .await?;
+    let key = JobKey::new(config.job_id.clone());
+    let saved = store.read(&key).await?.expect("checkpoint recorded");
+    assert!(saved.all_completed());
 
-    // Insert new records, two sharing one timestamp (checkpoint semantics proof).
-    // A third sits exactly ON the committed watermark: (lo, hi] excludes it.
-    let sql = format!(
-        "INSERT INTO {}.hostile (name, updated_at) VALUES
-         ('n1', '2024-02-01 00:00:00+00'),
-         ('n2', '2024-02-01 00:00:00+00'),
-         ('edge', '2024-01-04 00:00:00+00')",
-        e.db.schema
-    );
-    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-        .execute(&e.db.pool)
+    // Second run skips every completed split and reports the same row count.
+    let second = PostgresConnector::from_config(config)
+        .extract()
+        .standalone()
+        .run()
         .await?;
-
-    // Second extraction: everything after the committed watermark. The fixture already
-    // has four rows dated past 2024-01-04 (ids 5-8), so this is NOT "only the two new
-    // rows" -- it's the full post-watermark set, which must match Postgres exactly (the
-    // real checkpoint-semantics proof is the two targeted checks below).
-    let second = e
-        .remote_ids(
-            &ctx,
-            "SELECT id FROM hostile WHERE updated_at > '2024-01-04T00:00:00Z'",
-        )
-        .await?;
-    let expected = e
-        .expected_ids("updated_at > '2024-01-04T00:00:00Z'")
-        .await?;
-    assert_eq!(
-        second, expected,
-        "must match Postgres exactly: nothing lost or duplicated"
-    );
-
-    // The row sitting exactly ON the watermark must be excluded: (lo, hi] is exclusive-lo,
-    // inclusive-hi at commit time, but a *new* extraction's lower bound is that same hi,
-    // so a row timestamped exactly at the old hi must not reappear.
-    let edge_id = e.expected_ids("name = 'edge'").await?;
-    assert_eq!(edge_id.len(), 1, "fixture inserted exactly one 'edge' row");
-    assert!(
-        !second.contains(&edge_id[0]),
-        "row exactly on the committed watermark must be excluded"
-    );
-
-    // The two rows sharing one timestamp (past the watermark) must both survive: a
-    // window boundary must never arbitrarily keep one and drop the other.
-    let dup_ids = e.expected_ids("name IN ('n1', 'n2')").await?;
-    assert_eq!(
-        dup_ids.len(),
-        2,
-        "fixture inserted exactly two duplicate-timestamp rows"
-    );
-    assert!(
-        dup_ids.iter().all(|id| second.contains(id)),
-        "both duplicate-timestamp rows must survive the boundary"
-    );
+    assert_eq!(second.splits_completed, second.splits_total);
+    assert_eq!(second.rows_extracted, first.rows_extracted);
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

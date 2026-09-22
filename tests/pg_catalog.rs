@@ -1,8 +1,6 @@
 //! Devil's-advocate coverage for DB-facing functions that cannot be unit-tested without a
-//! live Postgres: privilege checks, the safe-high-watermark query, catalog statistics
-//! (pg_stats/pg_index/pg_enum), and EXPLAIN-based cost estimation. Each of these had zero
-//! coverage before (flagged by the test-suite audit): only their pure helper functions
-//! were tested. Since `TestDb::connect()` now always provisions a real database, there is
+//! live Postgres: catalog statistics (pg_stats/pg_index/pg_enum) and EXPLAIN-based cost
+//! estimation. Since `TestDb::connect()` now always provisions a real database, there is
 //! no reason for these to stay untested.
 //!
 //! Run: `cargo test --test pg_catalog` (requires the compose stack up;
@@ -12,9 +10,6 @@
 mod common;
 
 use common::TestDb;
-use rust_ballista_extraction_layer::incremental::{
-    WatermarkSource, check_pg_read_all_stats_privilege, safe_high_watermark,
-};
 use rust_ballista_extraction_layer::pushdown::explain::ExplainEstimator;
 use rust_ballista_extraction_layer::pushdown::stats::TableStatsSource;
 use std::sync::Arc;
@@ -24,58 +19,6 @@ macro_rules! live {
     () => {
         TestDb::connect().await
     };
-}
-
-#[tokio::test]
-async fn privilege_check_returns_a_real_answer_and_is_cached()
--> Result<(), Box<dyn std::error::Error>> {
-    let db = live!();
-    // Whatever the answer is for this role, it must be a concrete bool, not an error --
-    // the function's whole contract is "never fail the caller over a privilege check".
-    let first = check_pg_read_all_stats_privilege(&db.pool).await?;
-    let second = check_pg_read_all_stats_privilege(&db.pool).await?;
-    assert_eq!(
-        first, second,
-        "result is process-wide cached; must be stable within a run"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn safe_high_watermark_never_returns_a_future_timestamp()
--> Result<(), Box<dyn std::error::Error>> {
-    let db = live!();
-    let before = chrono::Utc::now();
-    let watermark = safe_high_watermark(&db.pool, chrono::Duration::seconds(0)).await?;
-    let after = chrono::Utc::now();
-    // Whether or not this role has pg_read_all_stats (real query vs. fallback), the
-    // contract is the same: never advance past "now" (the whole point of the safety
-    // mechanism), and never so far in the past that it predates the test starting.
-    assert!(watermark <= after, "watermark must never be in the future");
-    assert!(
-        watermark >= before - chrono::Duration::seconds(5),
-        "watermark implausibly old"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn safe_high_watermark_trait_impl_agrees_with_free_function()
--> Result<(), Box<dyn std::error::Error>> {
-    let db = live!();
-    let via_trait = db
-        .pool
-        .safe_high_watermark(chrono::Duration::seconds(1))
-        .await?;
-    let via_free_fn = safe_high_watermark(&db.pool, chrono::Duration::seconds(1)).await?;
-    // Both should read "now" to within a couple of seconds of each other -- this pins that
-    // the free function really does delegate to the trait impl, not a divergent copy.
-    let drift = (via_trait - via_free_fn).num_milliseconds().abs();
-    assert!(
-        drift < 5_000,
-        "free function and trait impl drifted by {drift}ms"
-    );
-    Ok(())
 }
 
 #[tokio::test]

@@ -119,8 +119,6 @@ mod tests {
             },
             pushed_filters: vec![],
             pushed_limit: None,
-            watermark_column: None,
-            window: None,
             batch_size: 8192,
             partitions: vec![],
             run_id: "r_test".to_string(),

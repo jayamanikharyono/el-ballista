@@ -20,17 +20,26 @@ pub struct SourceCapabilities {
     pub projection_pushdown: bool,
     pub limit_pushdown: bool,
     pub parallel_scan: ParallelScan,      // None | KeysetRange | CtidRange
-    pub incremental: IncrementalConfig,   // timestamp mode only
 }
 ```
 
 ```rust
-/// Per-connector dialect and rendering
-pub trait SqlDialect {
-    fn try_render(&self, expr: &Expr, params: &mut ParamBuffer) -> Option<String>;
-    fn fidelity(&self, expr: &Expr, col_meta: &ColumnMeta) -> Fidelity; // Exact | Inexact
-    fn quote_ident(&self, ident: &str) -> String;
-    fn placeholder(&self, index: usize) -> String;   // "$1" for pg
+/// Per-connector dialect: quoting, placeholders, and fidelity rules
+/// (`src/pushdown/dialect.rs`; implemented per backend)
+pub trait SqlDialect: Send + Sync {
+    fn quote_ident(&self, name: &str) -> String;
+    fn placeholder(&self, param_index: usize) -> String;   // "$1" for pg, "?" for MySQL
+    fn column_literal_fidelity(
+        &self,
+        column: &ColumnMetadata,
+        literal_is_text: bool,
+        literal_is_float: bool,
+    ) -> Fidelity; // Exact | Inexact
+    fn column_column_fidelity(
+        &self,
+        left_column: &ColumnMetadata,
+        right_column: &ColumnMetadata,
+    ) -> Fidelity;
 }
 ```
 
@@ -38,11 +47,11 @@ pub trait SqlDialect {
 /// Checkpoint store abstraction
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
-    async fn acquire(&self, key: &JobKey, run_id: Uuid, lease: Duration, watermark_column: &str)
-        -> Result<Checkpoint, AppError>;
-    async fn commit(&self, key: &JobKey, run_id: Uuid, next: DateTime<Utc>, stats: RunStats)
-        -> Result<(), AppError>;
-    async fn read(&self, key: &JobKey) -> Result<Option<Checkpoint>, AppError>;
+    async fn begin(&self, key: &JobKey, split_ids: &[String]) -> Result<JobCheckpoint, AppError>;
+    async fn mark_running(&self, key: &JobKey, split_id: &str) -> Result<(), AppError>;
+    async fn mark_completed(&self, key: &JobKey, split_id: &str, rows_extracted: u64) -> Result<(), AppError>;
+    async fn mark_failed(&self, key: &JobKey, split_id: &str, err: &str) -> Result<(), AppError>;
+    async fn read(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError>;
 }
 ```
 
@@ -55,16 +64,16 @@ abstractions above.
 
 ## 2. Capability comparison
 
-| Capability | PostgreSQL |
-| --- | --- |
-| Parallel scan splitting | keyset, `ctid` physical ranges |
-| In-flight transaction visibility | `pg_stat_activity.xact_start` |
-| Column histograms | `pg_stats` (always maintained) |
-| Log-based CDC (future) | logical replication / `pgoutput` (planned) |
+| Capability | PostgreSQL | MySQL (prototype) |
+| --- | --- | --- |
+| Parallel scan splitting | keyset, `ctid` physical ranges | serial only (keyset planned) |
+| Filter pushdown | cost-based (`always`/`never`/`cost_based`/`strict`/`hinted`) | not implemented |
+| Column histograms | `pg_stats` (always maintained) | opt-in `COLUMN_STATISTICS` |
+| Log-based CDC (future) | logical replication / `pgoutput` (planned) | binlog (planned) |
 
 ---
 
-## 2. Decoding to Arrow
+## 3. Decoding to Arrow
 
 The PostgreSQL connector uses `sqlx` text protocol. Rows arrive as `sqlx::Row` values (an
 intermediate representation) which are then decoded into Arrow array builders:
@@ -80,7 +89,7 @@ backpressure work end to end (see [architecture](../architecture.md#5-execution-
 
 ---
 
-## 3. Type mapping rules
+## 4. Type mapping rules
 
 Three rules apply to both dialects:
 
@@ -90,10 +99,12 @@ Three rules apply to both dialects:
    [pushdown §3](../pushdown.md#3-where-pushdown-silently-changes-results)).
 
 2. **Never widen silently to `Utf8`.** Falling back to a string for anything unrecognized produces
-   a pipeline that "works" and a warehouse full of strings that nobody can aggregate. An unmapped
-   type is an error at plan time, with an explicit per-column `cast_to` escape hatch in the job
-   spec for the cases where a string genuinely is the right answer. **NOT YET IMPLEMENTED** for the
-   `cast_to` hatch.
+   a pipeline that "works" and a warehouse full of strings that nobody can aggregate. On Postgres
+   an unmapped type is an error at plan time, with an explicit per-column `cast_to` escape hatch
+   in the job spec for the cases where a string genuinely is the right answer. **NOT YET
+   IMPLEMENTED** for the `cast_to` hatch — and the MySQL prototype currently violates this rule
+   (unknown types fall back to `Utf8`; see [mysql.md](mysql.md)), which must be fixed when the
+   prototype is promoted.
 
 3. **Unrepresentable values become null, loudly.** Postgres `timestamp 'infinity'`, and a `NUMERIC`
    exceeding the declared decimal precision have no Arrow representation. Each maps to null *and*
@@ -105,7 +116,7 @@ Per-dialect mapping tables live in each connector document.
 
 ---
 
-## 4. Parallel scan
+## 5. Parallel scan
 
 Splitting a scan across connections multiplies throughput and multiplies the load you place on a
 production database. It is off by default and opt-in per job.
@@ -123,7 +134,7 @@ job that consumes every available connection slot on a primary during business h
 
 ---
 
-## 5. Connection hygiene
+## 6. Connection hygiene
 
 Non-negotiable for every connector, because an extraction tool must never be the cause of a
 production incident:
@@ -136,13 +147,14 @@ production incident:
   a DBA looking at `pg_stat_activity` or `performance_schema` can attribute every query.
 - **Session settings are explicit.** UTC time zone, UTF-8 client encoding, read-only where supported.
   Never inherit a server default that could change underneath the pipeline.
-- **Retries are bounded and classified.** Transient errors (connection reset, deadlock, replica
-  recovery conflict) retry with jittered backoff; semantic errors (undefined column, permission
-  denied) fail immediately. Retrying a permission error for ten minutes helps no one.
+- **Failures are recorded per split, retry is orchestrator-driven.** A failed split is marked
+  `Failed` with its error without touching completed splits; re-running the job skips
+  completed splits and retries the rest. There is no in-layer retry-with-backoff and no
+  pipeline-level retry policy — that lives in the orchestrator.
 
 ---
 
-## 6. Adding a connector later
+## 7. Adding a connector later
 
 Beyond Postgres, the SPI is deliberately shaped to accommodate sources that are *not*
 SQL databases, because that is where cross-source joins get interesting. A key-value or wide-column

@@ -6,7 +6,7 @@
 //! reading — through a non-Postgres backend so we can see which abstractions hold and which leak.
 //!
 //! Scope (prototype): connect, read schema from `information_schema`, and full-table extract to
-//! Arrow. NOT included yet: pushdown, incremental watermarks, parallel/distributed execution,
+//! Arrow. NOT included yet: pushdown, parallel/distributed execution,
 //! or bounded-memory cursor streaming. Columns decode to typed Arrow arrays via [`row_adapter`]
 //! (width-preserving integers, `Decimal128`, `Boolean`, dates/timestamps, `Binary`, `Utf8`
 //! otherwise); `fetch_all` still materializes the whole result in memory — prototype only.

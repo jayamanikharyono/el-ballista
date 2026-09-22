@@ -22,7 +22,7 @@ all:
 # What "Python support" looks like right now, and it is fine
 BashOperator(
     task_id="extract_orders",
-    bash_command="rel run --config extract.toml --job orders_incremental",
+    bash_command="rel run --config extract.toml --job orders_extract",
 )
 ```
 
@@ -45,7 +45,6 @@ ctx = ExtractContext.from_config("extract.toml")
 
 df = (
     ctx.source("orders_pg", "public.orders")
-       .incremental(column="updated_at")
        .filter(col("status") == lit("PAID"))
        .select("order_id", "user_id", "amount")
 )

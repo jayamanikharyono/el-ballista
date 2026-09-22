@@ -36,24 +36,12 @@ uuid = { version = "1.26.0", features = ["v4", "serde"] }
 async-stream = "0.3"
 
 [[example]]
-name = "incremental_extraction"
-path = "examples/incremental_extraction.rs"
-
-[[example]]
-name = "end_to_end"
-path = "examples/end_to_end.rs"
-
-[[example]]
 name = "full_extraction"
 path = "examples/full_extraction.rs"
 
 [[example]]
-name = "daily_incremental"
-path = "examples/daily_incremental.rs"
-
-[[example]]
-name = "hourly_incremental"
-path = "examples/hourly_incremental.rs"
+name = "filtered_extraction"
+path = "examples/filtered_extraction.rs"
 
 [[example]]
 name = "parallel_extraction"

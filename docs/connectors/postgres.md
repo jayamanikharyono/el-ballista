@@ -4,17 +4,20 @@ Crate: `rel-connector-postgres`. Built on `sqlx` (text protocol, streaming curso
 SQL from the planner and need parameterized queries, not binary `COPY`.
 
 Covers self-managed PostgreSQL, Cloud SQL for PostgreSQL, and AlloyDB. Read replicas and hot
-standbys are supported with an important watermark caveat in §5.3.
+standbys are supported.
+
+> **Scope note:** watermark computation (§5 in earlier revisions) is deferred — see
+> [deferred/incremental-extraction.md](../deferred/incremental-extraction.md). The connector
+> exposes full/filtered scans, partitioning, and pushdown; range selection is caller-provided.
 
 ---
 
 ## 1. Why Postgres is the reference implementation
 
-Postgres provides three capabilities that make it the reference:
+Postgres provides two capabilities that make it the reference:
 
 - **Cursor-based portal scans** give a streaming path with bound parameters and no full
   result-set buffering.
-- **`pg_stat_activity.xact_start`** lets us compute an exact — not heuristic — safe high watermark.
 - Deterministic collations (`C` / `POSIX`) make `Exact` fidelity comparisons possible.
 
 ---
@@ -47,7 +50,7 @@ decoder was removed when the COPY path was removed).
 | `float4` / `float8` | `Float32` / `Float64` | **Implemented** | IEEE-754; `NaN` ordering differs from Arrow — see [pushdown §3.3](../pushdown.md#33-numeric-type-width-and-precision) |
 | `numeric(p,s)`, p ≤ 38 | `Decimal128(p, s)` | **Implemented** | Text protocol; sqlx decodes to BigDecimal |
 | `numeric`, unconstrained | `Decimal128(38, 10)` by default | **Implemented** | Overflow → error or null. `NaN`/`±Infinity` sign words map to null |
-| `text`, `varchar`, `char`, `name` | `Utf8` | **Implemented** | Collation recorded in `ColumnMeta`; drives `Exact` vs `Inexact` |
+| `text`, `varchar`, `char`, `name` | `Utf8` | **Implemented** | Collation recorded in `ColumnMetadata`; drives `Exact` vs `Inexact` |
 | `citext` | `Utf8` | **NOT IMPLEMENTED** | Comparisons would always be `Inexact` |
 | `bytea` | `Binary` | **Implemented** | |
 | `uuid` | `Utf8` | **Implemented** | Text protocol (not `FixedSizeBinary(16)`) |
@@ -97,8 +100,8 @@ EXPLAIN (FORMAT JSON, VERBOSE false, COSTS true) SELECT …;
 Postgres maintains `pg_stats` automatically via autovacuum, so the cost model has real distribution
 data without asking anyone to run maintenance commands. `most_common_vals` / `most_common_freqs`
 give accurate selectivity for exactly the low-cardinality equality predicates that dominate
-extraction jobs (`status = 'PAID'`), and `histogram_bounds` handles range predicates on the
-watermark column.
+extraction jobs (`status = 'PAID'`), and `histogram_bounds` handles range predicates on
+caller-provided filter columns.
 
 `EXPLAIN` is the decisive input: its plan node type tells us whether the predicate produces an
 `Index Scan`, `Bitmap Heap Scan`, or `Seq Scan`, and its cost estimate feeds directly into the
@@ -110,27 +113,16 @@ boundaries without a `min`/`max` scan.
 
 ---
 
-## 5. Consistency and watermark computation
+## 5. Consistency notes
 
----
-
-The exact form of the [commit-skew mitigation](../incremental-extraction.md#31-commit-time-vs-updated_at-skew--the-primary-hazard):
-
-```sql
-SELECT LEAST(
-         now() - INTERVAL '1 second',
-         COALESCE(MIN(xact_start), now())
-       ) AS safe_hi
-FROM pg_stat_activity
-WHERE backend_type = 'client backend'
-  AND state <> 'idle'
-  AND datname = current_database();
-```
-
-Requires `pg_read_all_stats` membership (or superuser) to see other roles' `xact_start`; without it
-the column is NULL for other sessions and the query silently returns `now()`. The connector
-**verifies the privilege at startup** and falls back to a fixed `safety_lag` with a loud warning if
-it is missing — a silent downgrade here means silent data loss later.
+The extraction layer makes **no snapshot guarantee**: concurrent writes during a scan may
+appear or not depending on timing and isolation level. For hot tables prefer `keyset`
+partitioning over `ctid` (concurrent updates move rows between physical pages), and never
+rely on row order without an explicit `ORDER BY` — the source returns rows in unspecified
+order. Timestamp-based incremental protocols (commit-skew mitigation via
+`pg_stat_activity.xact_start`, safety lag, bounded windows) are deferred — see
+[deferred/incremental-extraction.md](../deferred/incremental-extraction.md). The orchestrator
+owns range selection; this connector only executes the scan it is given.
 
 ---
 
@@ -160,7 +152,6 @@ GRANT CONNECT ON DATABASE app TO rel_extract;
 GRANT USAGE  ON SCHEMA public TO rel_extract;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO rel_extract;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO rel_extract;
-GRANT pg_read_all_stats TO rel_extract;   -- for the exact safe high watermark (§5.2)
 ```
 
 ---
@@ -194,7 +185,8 @@ START_REPLICATION SLOT rel_orders LOGICAL 0/0 (proto_version '4', publication_na
   Arrow batches with an op column, checkpointed by LSN
 ```
 
-The checkpoint becomes an LSN, which is monotonic in commit order, so §3.1 of the incremental doc
+The checkpoint becomes an LSN, which is monotonic in commit order, so the timestamp
+commit-skew hazard (§3.1 of the deferred [incremental design](../deferred/incremental-extraction.md))
 simply stops applying.
 
 The operational hazard is severe enough to state up front: **an unconsumed replication slot retains

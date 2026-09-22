@@ -48,41 +48,6 @@ fn default_schema() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct IncrementalConfig {
-    /// The watermark column, e.g. `updated_at`. Only `timestamp` mode is implemented —
-    /// `append_id` / `snapshot` / `log` from docs/incremental-extraction.md §1 are follow-ups.
-    /// Ignored when the job's `mode` is `full`.
-    #[serde(default = "default_ts_column")]
-    pub column: String,
-    #[serde(default = "default_safety_lag_secs")]
-    pub safety_lag_secs: i64,
-    #[serde(default = "default_max_window_secs")]
-    pub max_window_secs: i64,
-}
-
-impl Default for IncrementalConfig {
-    fn default() -> Self {
-        Self {
-            column: default_ts_column(),
-            safety_lag_secs: default_safety_lag_secs(),
-            max_window_secs: default_max_window_secs(),
-        }
-    }
-}
-
-fn default_ts_column() -> String {
-    "updated_at".to_string()
-}
-
-fn default_safety_lag_secs() -> i64 {
-    300
-}
-
-fn default_max_window_secs() -> i64 {
-    6 * 3600
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct SinkConfig {
     /// Local filesystem directory. Object-store URIs (gs://...) are a follow-up — see
     /// docs/phase-one-implementation-plan.md §7.
@@ -239,17 +204,91 @@ impl Default for ParallelScanConfig {
     }
 }
 
-/// How `rel run` extracts the table.
+/// Comparison operator for a structured filter predicate. Symbolic spellings match
+/// the CLI shorthand (`--filter "amount>=100"`), so both forms share one vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum FilterOp {
+    #[serde(rename = "=")]
+    Eq,
+    #[serde(rename = "!=")]
+    NotEq,
+    #[serde(rename = ">")]
+    Gt,
+    #[serde(rename = ">=")]
+    GtEq,
+    #[serde(rename = "<")]
+    Lt,
+    #[serde(rename = "<=")]
+    LtEq,
+    #[serde(rename = "is_null")]
+    IsNull,
+    #[serde(rename = "is_not_null")]
+    IsNotNull,
+}
+
+impl FilterOp {
+    /// The symbolic spelling used in JSON and the CLI shorthand.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::NotEq => "!=",
+            FilterOp::Gt => ">",
+            FilterOp::GtEq => ">=",
+            FilterOp::Lt => "<",
+            FilterOp::LtEq => "<=",
+            FilterOp::IsNull => "is_null",
+            FilterOp::IsNotNull => "is_not_null",
+        }
+    }
+}
+
+/// One caller-provided filter predicate in structured form.
 ///
-/// * `incremental` (default): checkpoint-driven watermark windows (docs/incremental-extraction.md).
-/// * `full`: a stateless full-table scan — every row, no watermark filter and no checkpoint.
-///   Used for initial data loads and periodic full refreshes. The `incremental` block is ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExtractionMode {
-    #[default]
-    Incremental,
-    Full,
+/// ```json
+/// { "column": "status", "op": "=", "value": "PAID" }
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FilterSpec {
+    pub column: String,
+    pub op: FilterOp,
+    /// JSON-native value: a number becomes an int/float literal, a boolean a boolean
+    /// literal, a string a text literal (or a timestamp/date literal when the column
+    /// type says so — see schema-aware lowering), null a NULL check. Nested
+    /// arrays/objects are rejected. May be omitted for `is_null` / `is_not_null`.
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+/// One entry of [`JobConfig::filters`]: either the CLI-style shorthand
+/// (`"status=PAID"`, handy for simple cases and `--filter` flags) or the
+/// structured form above (the recommended JSON representation — typed values,
+/// `is_null`, and timestamp coercion). Both lower to the same DataFusion predicate.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FilterInput {
+    Shorthand(String),
+    Structured(FilterSpec),
+}
+
+/// One AND-conjunct of [`JobConfig::filters`]: either a single predicate or an
+/// OR-group written as an inner JSON array. The outer list is always ANDed;
+/// an inner array is ORed, then ANDed with its siblings:
+///
+/// ```json
+/// "filters": [
+///   [{ "column": "status", "op": "=", "value": "PAID" },
+///    { "column": "amount", "op": ">", "value": 100 }],
+///   { "column": "updated_at", "op": ">=", "value": "2026-01-01T00:00:00Z" }
+/// ]
+/// ```
+/// means `(status = 'PAID' OR amount > 100) AND updated_at >= ...`.
+/// An empty inner array is rejected at validation (it would otherwise read as
+/// "no constraint" or "no rows" depending on the reader — never guess).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FilterEntry {
+    Single(FilterInput),
+    OrGroup(Vec<FilterInput>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,13 +297,14 @@ pub struct JobConfig {
     pub table: String,
     /// `None` means "all columns" (still resolved against the catalog schema).
     pub columns: Option<Vec<String>>,
-    /// Extraction mode: incremental watermark windows (default) or a full table scan.
+    /// Caller-provided filter predicates, applied as the extraction filter.
+    /// Empty means a full extraction (every row).
+    /// The outer list is ANDed; an inner array entry is an OR-group
+    /// (see [`FilterEntry`]).
+    /// The orchestrator decides WHAT range to extract; the extraction layer decides HOW.
     #[serde(default)]
-    pub mode: ExtractionMode,
+    pub filters: Vec<FilterEntry>,
     pub source: SourceConfig,
-    /// Watermark settings. Used only in incremental mode; defaulted (and ignored) in full mode.
-    #[serde(default)]
-    pub incremental: IncrementalConfig,
     pub sink: SinkConfig,
     #[serde(default)]
     pub checkpoint: CheckpointConfig,
@@ -302,22 +342,21 @@ impl JobConfig {
     }
 
     /// Reject degenerate values that cause silent misbehavior downstream: a zero
-    /// `max_window_secs` freezes backfill chunking in an infinite loop, a zero
     /// `batch_size` makes every FETCH return zero rows, and zero pools/workers/
-    /// partitions divide budgets by zero or scan nothing.
+    /// partitions divide budgets by zero or scan nothing. An empty OR-group
+    /// (`"filters": [[]]`) is equally degenerate — it has no defined
+    /// AND/OR meaning — so it fails here rather than as zero rows downstream.
     pub fn validate(&self) -> Result<(), AppError> {
         let mut bad = Vec::new();
-        if self.incremental.max_window_secs < 1 {
-            bad.push(format!(
-                "incremental.max_window_secs must be >= 1 (got {})",
-                self.incremental.max_window_secs
-            ));
-        }
-        if self.incremental.safety_lag_secs < 0 {
-            bad.push(format!(
-                "incremental.safety_lag_secs must be >= 0 (got {})",
-                self.incremental.safety_lag_secs
-            ));
+        if self
+            .filters
+            .iter()
+            .any(|e| matches!(e, FilterEntry::OrGroup(g) if g.is_empty()))
+        {
+            bad.push(
+                "filters contains an empty OR-group (inner array must hold >= 1 predicate)"
+                    .to_string(),
+            );
         }
         if self.execution.batch_size < 1 {
             bad.push(format!(
@@ -374,11 +413,10 @@ mod tests {
         // Tests run with CWD at the crate root, where examples/ lives.
         let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
 
-        assert_eq!(config.job_id, "orders_incremental");
+        assert_eq!(config.job_id, "orders_extract");
         assert_eq!(config.table, "orders");
         assert_eq!(config.resolved_table(), "public.orders");
         assert_eq!(config.source.password_env, "ORDERS_PG_PASSWORD");
-        assert_eq!(config.incremental.column, "updated_at");
         assert!(
             config
                 .columns
@@ -412,31 +450,168 @@ mod tests {
 
     #[test]
     fn test_from_file_full_config() {
-        // The full-extraction spec must parse, select full mode, and validate even though it
-        // carries no `incremental` block (defaults fill it and are ignored in full mode).
+        // The full-extraction spec must parse and validate (no watermark/incremental blocks).
         let config = JobConfig::from_file("examples/configs/full_extract.example.json").unwrap();
         assert_eq!(config.job_id, "orders_full");
-        assert_eq!(config.mode, ExtractionMode::Full);
-        assert_eq!(config.incremental.column, "updated_at");
+        assert!(config.filters.is_empty());
         config.validate().unwrap();
     }
 
     #[test]
-    fn test_mode_defaults_to_incremental() {
+    fn test_example_config_carries_structured_filters() {
+        // extract.example.json simulates an orchestrator-supplied slice of ANDed
+        // structured predicates. (OR-groups like `[[A, B], C]` parse too — see
+        // `test_filters_or_group_inner_array_means_or` — but this fixture stays
+        // flat so the example remains the pure-AND case.)
         let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
-        assert_eq!(config.mode, ExtractionMode::Incremental);
+        assert_eq!(config.filters.len(), 4);
+        for (entry, (column, op, value)) in config.filters.iter().zip([
+            ("status", FilterOp::Eq, serde_json::json!("PAID")),
+            ("amount", FilterOp::Gt, serde_json::json!(100)),
+            (
+                "updated_at",
+                FilterOp::GtEq,
+                serde_json::json!("2026-01-01T00:00:00Z"),
+            ),
+            ("user_id", FilterOp::GtEq, serde_json::json!(500)),
+        ]) {
+            match entry {
+                FilterEntry::Single(FilterInput::Structured(spec)) => {
+                    assert_eq!(spec.column, column);
+                    assert_eq!(spec.op, op);
+                    assert_eq!(spec.value, value);
+                }
+                _ => panic!("expected single structured filter for {column}"),
+            }
+        }
+        config.validate().unwrap();
+    }
+
+    fn filters_from_json(raw: &str) -> Vec<FilterEntry> {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn single_input(entry: &FilterEntry) -> &FilterInput {
+        match entry {
+            FilterEntry::Single(input) => input,
+            FilterEntry::OrGroup(_) => panic!("expected single"),
+        }
+    }
+
+    #[test]
+    fn test_filters_accept_shorthand_and_structured_forms() {
+        let filters =
+            filters_from_json(r#"["status=PAID", {"column": "amount", "op": ">", "value": 100}]"#);
+        assert_eq!(filters.len(), 2);
+        assert!(matches!(
+            single_input(&filters[0]),
+            FilterInput::Shorthand(_)
+        ));
+        match single_input(&filters[1]) {
+            FilterInput::Structured(spec) => {
+                assert_eq!(spec.column, "amount");
+                assert_eq!(spec.op, FilterOp::Gt);
+                assert_eq!(spec.value, serde_json::json!(100));
+            }
+            FilterInput::Shorthand(_) => panic!("expected structured"),
+        }
+    }
+
+    #[test]
+    fn test_filters_or_group_inner_array_means_or() {
+        // `[[A, B], C]` parses as OR-group + single: `(A OR B) AND C`.
+        let filters = filters_from_json(
+            r#"[[{"column": "status", "op": "=", "value": "PAID"},
+                 {"column": "amount", "op": ">", "value": 100}],
+                {"column": "user_id", "op": ">=", "value": 500}]"#,
+        );
+        assert_eq!(filters.len(), 2);
+        match &filters[0] {
+            FilterEntry::OrGroup(group) => assert_eq!(group.len(), 2),
+            FilterEntry::Single(_) => panic!("expected OR-group"),
+        }
+        assert!(matches!(&filters[1], FilterEntry::Single(_)));
+    }
+
+    #[test]
+    fn test_filters_empty_or_group_fails_validation() {
+        let raw = r#"[[], {"column": "a", "op": "=", "value": 1}]"#;
+        let filters: Vec<FilterEntry> = serde_json::from_str(raw).unwrap();
+        let mut config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
+        config.filters = filters;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_filters_value_typing_follows_json() {
+        let filters = filters_from_json(
+            r#"[{"column": "a", "op": "=", "value": 100},
+                {"column": "b", "op": "=", "value": 1.5},
+                {"column": "c", "op": "=", "value": true},
+                {"column": "d", "op": "=", "value": "PAID"},
+                {"column": "e", "op": "=", "value": null}]"#,
+        );
+        assert_eq!(filters.len(), 5);
+        for (filter, expected) in filters.iter().zip([
+            serde_json::json!(100),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!("PAID"),
+            serde_json::json!(null),
+        ]) {
+            match single_input(filter) {
+                FilterInput::Structured(spec) => assert_eq!(spec.value, expected),
+                FilterInput::Shorthand(_) => panic!("expected structured"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_filters_is_null_needs_no_value() {
+        let filters = filters_from_json(r#"[{"column": "deleted_at", "op": "is_null"}]"#);
+        match single_input(&filters[0]) {
+            FilterInput::Structured(spec) => {
+                assert_eq!(spec.op, FilterOp::IsNull);
+                assert_eq!(spec.value, serde_json::Value::Null);
+            }
+            FilterInput::Shorthand(_) => panic!("expected structured"),
+        }
+    }
+
+    #[test]
+    fn test_filters_unknown_op_fails_at_config_load() {
+        let err = serde_json::from_str::<Vec<FilterEntry>>(
+            r#"[{"column": "a", "op": "==", "value": 1}]"#,
+        )
+        .unwrap_err();
+        // The untagged enum rejects the entry at load time (neither the
+        // shorthand-string nor the structured variant matches).
+        assert!(err.to_string().contains("did not match any variant"));
+    }
+
+    #[test]
+    fn test_filter_op_symbols_round_trip() {
+        for (op, symbol) in [
+            (FilterOp::Eq, "="),
+            (FilterOp::NotEq, "!="),
+            (FilterOp::Gt, ">"),
+            (FilterOp::GtEq, ">="),
+            (FilterOp::Lt, "<"),
+            (FilterOp::LtEq, "<="),
+            (FilterOp::IsNull, "is_null"),
+            (FilterOp::IsNotNull, "is_not_null"),
+        ] {
+            assert_eq!(op.as_str(), symbol);
+            let back: FilterOp = serde_json::from_str(&format!("\"{symbol}\"")).unwrap();
+            assert_eq!(back, op);
+        }
     }
 
     #[test]
     fn test_validate_rejects_degenerate_values() {
-        // A zero max_window_secs freezes backfill chunking in an infinite loop;
-        // zero batch/partitions/workers/pool silently scan nothing or divide by zero.
+        // Zero batch/partitions/workers/pool silently scan nothing or divide by zero.
         let mut config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
         config.validate().unwrap();
-
-        config.incremental.max_window_secs = 0;
-        assert!(config.validate().is_err());
-        config.incremental.max_window_secs = 3600;
 
         config.execution.batch_size = 0;
         assert!(config.validate().is_err());
@@ -453,9 +628,6 @@ mod tests {
         config.source.pool_max = 0;
         assert!(config.validate().is_err());
         config.source.pool_max = 8;
-
-        config.incremental.safety_lag_secs = -1;
-        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -464,6 +636,7 @@ mod tests {
             job_id: "test".to_string(),
             table: "orders".to_string(),
             columns: None,
+            filters: Vec::new(),
             source: SourceConfig {
                 host: "localhost".to_string(),
                 port: 5432,
@@ -474,12 +647,6 @@ mod tests {
                 statement_timeout_ms: 1000,
                 application_name: "test".to_string(),
                 schema: "public".to_string(),
-            },
-            mode: ExtractionMode::Incremental,
-            incremental: IncrementalConfig {
-                column: "updated_at".to_string(),
-                safety_lag_secs: 60,
-                max_window_secs: 3600,
             },
             sink: SinkConfig {
                 path: "./tmp".to_string(),
@@ -503,6 +670,7 @@ mod tests {
             job_id: "test".to_string(),
             table: "orders".to_string(),
             columns: None,
+            filters: Vec::new(),
             source: SourceConfig {
                 host: "localhost".to_string(),
                 port: 5432,
@@ -513,12 +681,6 @@ mod tests {
                 statement_timeout_ms: 1000,
                 application_name: "test".to_string(),
                 schema: "public".to_string(),
-            },
-            mode: ExtractionMode::Incremental,
-            incremental: IncrementalConfig {
-                column: "updated_at".to_string(),
-                safety_lag_secs: 60,
-                max_window_secs: 3600,
             },
             sink: SinkConfig {
                 path: "./tmp".to_string(),

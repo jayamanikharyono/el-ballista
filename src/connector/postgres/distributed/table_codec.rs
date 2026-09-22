@@ -140,8 +140,6 @@ mod tests {
             policy: crate::pushdown::PushdownPolicy::CostBased,
             deny: vec!["secret".to_string()],
             push: vec![],
-            watermark_column: Some("updated_at".to_string()),
-            window: None,
             batch_size: 1024,
             parallel_workers: 4,
             partition_column: Some("order_id".to_string()),

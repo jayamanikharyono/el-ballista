@@ -1,7 +1,13 @@
 {
-  "job_id": "orders_incremental",
+  "job_id": "orders_extract",
   "table": "orders",
   "columns": ["order_id", "user_id", "status", "amount", "currency", "item_count", "tags", "metadata", "shipped_on", "ext_ref", "created_at", "updated_at"],
+  "filters": [
+    { "column": "status", "op": "=", "value": "PAID" },
+    { "column": "amount", "op": ">", "value": 100 },
+    { "column": "updated_at", "op": ">=", "value": "2026-01-01T00:00:00Z" },
+    { "column": "user_id", "op": ">=", "value": 500 }
+  ],
   "source": {
     "host": "localhost",
     "port": 5432,
@@ -13,13 +19,8 @@
     "application_name": "rust-extract-layer",
     "schema": "public"
   },
-  "incremental": {
-    "column": "updated_at",
-    "safety_lag_secs": 300,
-    "max_window_secs": 21600
-  },
   "sink": {
-    "path": "./warehouse/raw/orders"
+    "path": "./output/orders"
   },
   "checkpoint": {
     "dir": "./.checkpoints"

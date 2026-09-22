@@ -26,6 +26,17 @@ pub fn registry() -> &'static SourcePoolRegistry {
     REGISTRY.get_or_init(SourcePoolRegistry::new)
 }
 
+/// Identifies the current tokio runtime for pool sharing. sqlx sockets only
+/// make progress on the reactor that opened them, so pools must never cross a
+/// runtime boundary. Outside any runtime (a scheduler that only plans) there
+/// is nothing to isolate from — those pools stay lazy and never connect.
+fn runtime_key() -> String {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => format!("{:?}", handle.id()),
+        Err(_) => "no-runtime".to_string(),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SourcePoolRegistry {
     pools: Mutex<HashMap<String, PgPool>>,
@@ -44,7 +55,16 @@ impl SourcePoolRegistry {
         &self,
         descriptor: &PostgresConnectionDescriptor,
     ) -> Result<PgPool, ExtractorError> {
-        let key = descriptor.registry_key();
+        // sqlx connections are bound to the I/O driver (reactor) of the tokio
+        // runtime that opened them. A process-global pool outlives any one
+        // runtime, so a pool created under a dead runtime (e.g. a previous
+        // #[tokio::test]'s per-test runtime) hands out sockets that can never
+        // make progress — acquires stall until timeout. Keying pools per
+        // runtime keeps the documented invariant (one pool per source wherever
+        // there is a single runtime: every CLI invocation, the scheduler, and
+        // all executors sharing an executor process) while isolating runtimes
+        // that merely share a process.
+        let key = format!("{}|rt={}", descriptor.registry_key(), runtime_key());
         let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pool) = pools.get(&key) {
@@ -160,6 +180,27 @@ mod tests {
         assert_eq!(descriptor(1).budgeted_max_connections(), 8);
         // 8 connections across 16 workers -> floor is 1, not 0.
         assert_eq!(descriptor(16).budgeted_max_connections(), 1);
+    }
+
+    #[test]
+    fn test_runtime_key_isolates_runtimes() {
+        // Outside any runtime there is nothing to isolate from.
+        assert_eq!(runtime_key(), "no-runtime");
+        let key_in = |rt: &tokio::runtime::Runtime| rt.block_on(async { runtime_key() });
+        let a = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let b = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Distinct runtimes (e.g. per-test runtimes) must not share pools:
+        // sqlx sockets from a dead runtime never make progress again.
+        assert_ne!(key_in(&a), key_in(&b));
+        // Same runtime is stable: one pool per source still holds everywhere
+        // it matters (CLI, scheduler, co-located executors).
+        assert_eq!(key_in(&a), key_in(&a));
     }
 
     #[test]

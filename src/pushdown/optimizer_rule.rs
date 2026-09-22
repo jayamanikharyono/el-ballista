@@ -208,8 +208,6 @@ mod tests {
             policy,
             deny: vec![],
             push: vec![],
-            watermark_column: None,
-            window: None,
             batch_size: 8192,
             parallel_workers: 1,
             partition_column: None,

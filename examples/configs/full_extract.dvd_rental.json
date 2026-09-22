@@ -1,21 +1,21 @@
 {
-  "job_id": "orders_full",
-  "table": "orders",
-  "columns": ["order_id", "user_id", "status", "amount", "currency", "item_count", "tags", "metadata", "shipped_on", "ext_ref", "created_at", "updated_at"],
+  "job_id": "dvd_rental_full",
+  "table": "payment",
+  "columns": ["payment_id", "customer_id", "staff_id", "rental_id", "amount", "payment_date"],
   "filters": [],
   "source": {
     "host": "localhost",
     "port": 5432,
     "user": "postgres",
     "password_env": "ORDERS_PG_PASSWORD",
-    "database": "app",
+    "database": "test",
     "pool_max": 8,
     "statement_timeout_ms": 300000,
-    "application_name": "rust-extract-layer-full",
+    "application_name": "rust-extract-dvd-rental-full",
     "schema": "public"
   },
   "sink": {
-    "path": "./output/orders_full"
+    "path": "./warehouse/raw/payment_full"
   },
   "checkpoint": {
     "dir": "./.checkpoints"
@@ -28,7 +28,7 @@
   "parallel_scan": {
     "strategy": "none",
     "partitions": 1,
-    "partition_column": "order_id"
+    "partition_column": "payment_id"
   },
   "execution": {
     "batch_size": 8192

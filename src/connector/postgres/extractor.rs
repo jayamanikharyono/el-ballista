@@ -90,8 +90,8 @@ impl PostgresExtractor {
         })
     }
 
-    /// The underlying pool, for callers (e.g. the safe-high-watermark query in
-    /// `crate::incremental`) that need to run something other than a table scan.
+    /// The underlying pool, for callers (e.g. partition-bound computation) that
+    /// need to run something other than a table scan.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -102,109 +102,6 @@ impl PostgresExtractor {
     fn tag(&self, strategy: &str) -> String {
         self.query_session.tag(strategy).render()
     }
-    /// Extract via server-side cursor (portal) — true streaming with bounded memory.
-    /// Uses `DECLARE CURSOR ... WITH HOLD` + `FETCH FORWARD n` + `CLOSE`.
-    /// Each FETCH returns up to `batch_size` rows, processed incrementally.
-    pub async fn extract_incremental_via_cursor(
-        &self,
-        table_name: &str,
-        columns: Option<Vec<&str>>,
-        timestamp_column: &str,
-        lo: DateTime<Utc>,
-        hi: DateTime<Utc>,
-        batch_size: usize,
-    ) -> Result<Vec<RecordBatch>, ExtractorError> {
-        let schema_reader = PostgresSchemaReader::new(&self.pool);
-        let table_metadata = schema_reader.get_table_metadata(table_name).await?;
-        let table_metadata = table_metadata.select_columns(columns.as_deref());
-
-        // Build the base query
-        let mut query_builder = QueryBuilder::<Postgres>::new("");
-        PostgresQueryBuilder::build_incremental(
-            &mut query_builder,
-            &table_metadata,
-            timestamp_column,
-            lo,
-            hi,
-        );
-        let sql_str = query_builder.sql();
-        let select_sql = sql_str.as_str();
-
-        let mut conn = self.pool.acquire().await?;
-        let mut tx = conn.begin().await?;
-
-        // Use a unique cursor name to avoid conflicts
-        let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
-
-        // Declare cursor. The SELECT text carries $1/$2 placeholders from QueryBuilder,
-        // so the lo/hi values must be bound here — executing without binds fails with
-        // "there is no parameter $1". The debug tag is prepended to both DECLARE and
-        // every FETCH: DECLARE embeds the real SELECT, but FETCH is what's actually
-        // running (and visible in pg_stat_activity) for the bulk of a long extraction.
-        let tag = self.tag("incremental_cursor");
-        log::debug!("generated query [incremental_cursor]: {select_sql} (bind $1={lo}, $2={hi})");
-        let declare_sql = format!(
-            "{tag}DECLARE {} CURSOR WITH HOLD FOR {}",
-            cursor_name, select_sql
-        );
-        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
-            .bind(lo)
-            .bind(hi)
-            .execute(&mut *tx)
-            .await?;
-
-        // Guarded fetch loop so CLOSE runs even if `append_row` or `finish` fails.
-        // `WITH HOLD` would otherwise keep the portal on the pooled connection until session close.
-        let mut batches = Vec::new();
-        let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
-
-        let fetch_result: Result<(), ExtractorError> = async {
-            loop {
-                let fetch_sql = format!("{tag}FETCH FORWARD {} FROM {}", batch_size, cursor_name);
-                let rows = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str()))
-                    .fetch_all(&mut *tx)
-                    .await?;
-
-                if rows.is_empty() {
-                    break;
-                }
-
-                for row in rows {
-                    batch_builder.append_row(&row, &table_metadata)?;
-
-                    if batch_builder.row_count() >= batch_size {
-                        let batch = batch_builder.finish()?;
-                        batches.push(batch);
-                        batch_builder = CursorBatchBuilder::new(&table_metadata)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        // Always try to close the cursor; ignore errors if fetch already failed.
-        let close_sql = format!("{tag}CLOSE {}", cursor_name);
-        let _ = sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str()))
-            .execute(&mut *tx)
-            .await;
-
-        match fetch_result {
-            Ok(()) => {
-                tx.commit().await?;
-                if !batch_builder.is_empty() {
-                    batches.push(batch_builder.finish()?);
-                }
-                Ok(batches)
-            }
-            Err(e) => {
-                let _ = tx.rollback().await;
-                // Preserve any partial batch error as the primary failure.
-                Err(e)
-            }
-        }
-    }
-
     /// Extract keyset partition via cursor.
     pub async fn extract_keyset_partition_via_cursor(
         &self,
@@ -294,71 +191,8 @@ impl PostgresExtractor {
         }
     }
 
-    /// Extract the half-open-on-the-low-side window `(lo, hi]` — docs/incremental-extraction.md
-    /// §2. Callers resolve `lo` from the checkpoint store and compute a safe `hi` (see
-    /// `crate::incremental::safe_high_watermark`) before calling this; this method just runs the
-    /// window it is given.
-    /// `batch_size` controls cursor `FETCH` size; callers should pass
-    /// `config.execution.batch_size` rather than relying on the default.
-    pub async fn extract_incremental_window(
-        &self,
-        table_name: &str,
-        columns: Option<Vec<&str>>,
-        timestamp_column: &str,
-        lo: DateTime<Utc>,
-        hi: DateTime<Utc>,
-    ) -> Result<RecordBatch, ExtractorError> {
-        self.extract_incremental_window_with_batch_size(
-            table_name,
-            columns,
-            timestamp_column,
-            lo,
-            hi,
-            8192,
-        )
-        .await
-    }
-
-    pub async fn extract_incremental_window_with_batch_size(
-        &self,
-        table_name: &str,
-        columns: Option<Vec<&str>>,
-        timestamp_column: &str,
-        lo: DateTime<Utc>,
-        hi: DateTime<Utc>,
-        batch_size: usize,
-    ) -> Result<RecordBatch, ExtractorError> {
-        // Schema + arrow_schema needed only to materialize an empty batch when cursor returns 0 rows.
-        // The cursor path re-reads schema internally, so don't build the SELECT here.
-        let schema_reader = PostgresSchemaReader::new(&self.pool);
-        let table_metadata = schema_reader
-            .get_table_metadata(table_name)
-            .await?
-            .select_columns(columns.as_deref());
-        let arrow_schema = PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
-
-        let batches = self
-            .extract_incremental_via_cursor(
-                table_name,
-                columns,
-                timestamp_column,
-                lo,
-                hi,
-                batch_size,
-            )
-            .await?;
-
-        if batches.is_empty() {
-            return Ok(RecordBatch::new_empty(arrow_schema));
-        }
-        // Legacy API concatenates; for > ~1M rows prefer the `*_via_cursor` streaming variants
-        // that return `Vec<RecordBatch>` and avoid a single contiguous allocation.
-        let combined = arrow::compute::concat_batches(&arrow_schema, &batches)?;
-        Ok(combined)
-    }
-
-    /// Extract all rows from a table without date filtering.
-    /// This is used for full table loads where no incremental window is needed.
+    /// Extract all rows from a table without filtering.
+    /// This is used for full table loads.
     /// Prefer `extract_full_table_via_cursor_batches` for large tables to avoid
     /// concatenating all batches into one allocation.
     pub async fn extract_full_table(

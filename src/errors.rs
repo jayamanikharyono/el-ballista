@@ -18,7 +18,4 @@ pub enum AppError {
 
     #[error("checkpoint error: {0}")]
     Checkpoint(String),
-
-    #[error("incremental extraction error: {0}")]
-    Incremental(String),
 }

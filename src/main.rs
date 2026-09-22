@@ -19,7 +19,7 @@ async fn main() -> Result<(), AppError> {
     logging::init_from_env_and_args();
 
     // No args: run the demo pipeline (extract -> filter -> transform -> drop/rename ->
-    // aggregate -> write). Any args: hand off to the checkpoint-driven CLI (`rel run`,
+    // aggregate -> write). Any args: hand off to the CLI (`rel run`,
     // `rel checkpoint show|reset`, or `rel demo` to run the same pipeline explicitly).
     let has_args = std::env::args().nth(1).is_some();
 

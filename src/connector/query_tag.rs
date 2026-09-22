@@ -7,7 +7,7 @@
 //! Rendered shape (single line, sqlcommenter-adjacent but hand-rolled — no new dependency):
 //!
 //! ```text
-//! /* rust-extract query_id=q_1a2b3c4d pipeline=orders_incremental run_id=r_9f8e7d6c strategy=incremental partition=7/23 */
+//! /* rust-extract query_id=q_1a2b3c4d pipeline=orders_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
 //! ```
 //!
 //! `query_id` is fresh per query (one [`QueryTag`] per statement); `pipeline` and `run_id`
@@ -71,7 +71,7 @@ impl QuerySession {
     }
 
     /// Build the tag for one query: a fresh `query_id`, this session's `pipeline`/`run_id`,
-    /// and the caller-supplied `strategy` (e.g. "full", "incremental", "cursor", "keyset").
+    /// and the caller-supplied `strategy` (e.g. "full", "full+pushdown", "cursor", "keyset").
     pub fn tag(&self, strategy: impl Into<String>) -> QueryTag {
         QueryTag {
             query_id: format!("q_{}", short_id()),
@@ -146,13 +146,13 @@ mod tests {
 
     #[test]
     fn test_render_contains_all_fields_in_order() {
-        let session = QuerySession::from_parts("orders_incremental", "r_9f8e7d6c");
-        let tag = session.tag("incremental");
+        let session = QuerySession::from_parts("orders_extract", "r_9f8e7d6c");
+        let tag = session.tag("full");
         let rendered = tag.render();
         assert!(rendered.starts_with("/* rust-extract query_id=q_"));
-        assert!(rendered.contains("pipeline=orders_incremental"));
+        assert!(rendered.contains("pipeline=orders_extract"));
         assert!(rendered.contains("run_id=r_9f8e7d6c"));
-        assert!(rendered.contains("strategy=incremental"));
+        assert!(rendered.contains("strategy=full"));
         assert!(rendered.trim_end().ends_with("*/"));
         assert!(
             !rendered.contains("partition="),
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_with_partition_appends_index_and_total() {
-        let session = QuerySession::from_parts("orders_incremental", "r_9f8e7d6c");
+        let session = QuerySession::from_parts("orders_extract", "r_9f8e7d6c");
         let tag = session.tag("keyset").with_partition(7, 23);
         assert!(tag.render().contains("partition=7/23"));
     }

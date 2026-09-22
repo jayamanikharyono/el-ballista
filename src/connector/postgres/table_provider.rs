@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use datafusion::catalog::Session;
 use datafusion::{
     datasource::TableProvider,
@@ -36,8 +35,6 @@ pub struct PostgresTableProviderModel {
     pub deny: Vec<String>,
     #[serde(default)]
     pub push: Vec<String>,
-    pub watermark_column: Option<String>,
-    pub window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub batch_size: usize,
     pub parallel_workers: usize,
     pub partition_column: Option<String>,
@@ -80,8 +77,6 @@ pub struct PostgresTableProvider {
     /// from a serialized plan on a scheduler, which must not open source connections:
     /// they push everything translatable, preserving Phase 4 behavior.
     cost_enabled: bool,
-    watermark_column: Option<String>,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     batch_size: usize,
     parallel_workers: usize,
     partition_column: Option<String>,
@@ -164,8 +159,6 @@ impl PostgresTableProvider {
             enum_columns,
             estimator: Some(estimator),
             cost_enabled: true,
-            watermark_column: None,
-            window: None,
             batch_size,
             parallel_workers: 1,
             partition_column: None,
@@ -205,8 +198,6 @@ impl PostgresTableProvider {
             enum_columns: model.enum_columns.into_iter().collect(),
             estimator: None,
             cost_enabled: false,
-            watermark_column: model.watermark_column,
-            window: model.window,
             batch_size: model.batch_size,
             parallel_workers: model.parallel_workers,
             partition_column: model.partition_column,
@@ -221,8 +212,6 @@ impl PostgresTableProvider {
             policy: self.policy,
             deny: self.deny.clone(),
             push: self.push.clone(),
-            watermark_column: self.watermark_column.clone(),
-            window: self.window,
             batch_size: self.batch_size,
             parallel_workers: self.parallel_workers,
             partition_column: self.partition_column.clone(),
@@ -246,18 +235,6 @@ impl PostgresTableProvider {
     ) -> Self {
         self.parallel_workers = workers.max(1);
         self.partition_column = partition_column;
-        self
-    }
-
-    #[allow(dead_code)]
-    pub fn with_watermark(
-        mut self,
-        column: impl Into<String>,
-        lo: DateTime<Utc>,
-        hi: DateTime<Utc>,
-    ) -> Self {
-        self.watermark_column = Some(column.into());
-        self.window = Some((lo, hi));
         self
     }
 
@@ -620,8 +597,6 @@ impl TableProvider for PostgresTableProvider {
             projected_schema,
             pushed,
             pushed_limit,
-            self.watermark_column.clone(),
-            self.window,
             self.batch_size,
             partitions,
             crate::connector::query_tag::fresh_run_id(),
@@ -668,8 +643,6 @@ mod tests {
             policy: PushdownPolicy::CostBased,
             deny: vec![],
             push: vec![],
-            watermark_column: None,
-            window: None,
             batch_size: 8192,
             parallel_workers: 1,
             partition_column: None,
@@ -704,6 +677,42 @@ mod tests {
         assert!(
             sql.contains(r#""status"::text = $1"#),
             "scan must push the normalized label comparison, got: {sql}"
+        );
+
+        unsafe {
+            std::env::remove_var("REL_TEST_DUMMY_PW");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_empty_projection_for_count_star() {
+        // `SELECT COUNT(*)` prunes the scan projection to zero columns: the plan
+        // must carry the (empty) projected schema so the aggregate counts rows,
+        // and the generated SQL must stay valid (`SELECT 1`, never `SELECT FROM`).
+        unsafe {
+            std::env::set_var("REL_TEST_DUMMY_PW", "dummy");
+        }
+        let provider = test_provider();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = provider
+            .scan(&state, Some(&vec![]), &[], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.schema().fields().len(),
+            0,
+            "empty projection must reach the scan as a 0-field schema"
+        );
+        let plan = plan
+            .downcast_ref::<PostgresExecutionPlan>()
+            .expect("a PostgresExecutionPlan");
+        let sql = plan.build_query(0).sql();
+        assert!(
+            sql.as_str().contains("SELECT 1 FROM"),
+            "empty projection must select a constant, got: {}",
+            sql.as_str()
         );
 
         unsafe {

@@ -9,9 +9,9 @@
 //!    own sink ([`pushdown::PgParamSink`]). The observable `(sql, params)` form
 //!    ([`pushdown::Predicate::render_sql`]) is what a MySQL connector would walk into its
 //!    own driver.
-//! 2. **What window is safe?** — [`incremental::WatermarkSource`]: the oldest timestamp no
-//!    still-open transaction can invalidate (`pg_stat_activity` on Postgres,
-//!    `SHOW PROCESSLIST` on MySQL). Window math never sees the difference.
+//! 2. **What filter?** — caller-provided predicates or ranges. The orchestrator decides
+//!    WHAT range to extract; the extraction layer decides HOW to extract it efficiently
+//!    (full / filtered scan, partitioning, DataFusion/Ballista execution).
 //! 3. **What does it cost?** — [`pushdown::stats::TableStatsSource`]: table/column
 //!    statistics and index metadata for the cost model, behind a TTL cache.
 //! 4. **Which pool?** — [`SourceDescriptor`]: everything needed to open (or find) a
@@ -32,7 +32,6 @@
 //! [`pushdown::dialect::SqlDialect`]: crate::pushdown::dialect::SqlDialect
 //! [`pushdown::PgParamSink`]: crate::pushdown::PgParamSink
 //! [`pushdown::Predicate::render_sql`]: crate::pushdown::Predicate::render_sql
-//! [`incremental::WatermarkSource`]: crate::incremental::WatermarkSource
 //! [`pushdown::stats::TableStatsSource`]: crate::pushdown::stats::TableStatsSource
 //! [`pushdown::optimizer_rule::SourceAwarePushdownRule`]: crate::pushdown::optimizer_rule::SourceAwarePushdownRule
 //! [`distributed::pool_registry`]: crate::distributed::pool_registry

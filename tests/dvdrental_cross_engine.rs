@@ -72,15 +72,25 @@ fn parse(url: &str, default_port: u16) -> (String, u16, String, String, String) 
         .split_once("://")
         .map(|(_, r)| r)
         .unwrap_or_else(|| panic!("bad url {url:?}"));
-    let (auth, rest) = rest.split_once('@').unwrap_or_else(|| panic!("bad url {url:?}"));
+    let (auth, rest) = rest
+        .split_once('@')
+        .unwrap_or_else(|| panic!("bad url {url:?}"));
     let (user, password) = auth.split_once(':').unwrap_or((auth, ""));
-    let (hostport, database) = rest.split_once('/').unwrap_or_else(|| panic!("bad url {url:?}"));
+    let (hostport, database) = rest
+        .split_once('/')
+        .unwrap_or_else(|| panic!("bad url {url:?}"));
     let database = database.split('?').next().unwrap_or(database);
     let (host, port) = match hostport.split_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
         None => (hostport.to_string(), default_port),
     };
-    (host, port, user.to_string(), password.to_string(), database.to_string())
+    (
+        host,
+        port,
+        user.to_string(),
+        password.to_string(),
+        database.to_string(),
+    )
 }
 
 async fn pg_pool() -> PgPool {
@@ -179,8 +189,16 @@ async fn connector_extraction_row_counts_match_reference() {
             .extract_full_table(&format!("{db}.{t}"), None)
             .await
             .unwrap_or_else(|e| panic!("MySQL extract {t}: {e}"));
-        assert_eq!(pg_batch.num_rows() as i64, *expected, "PG connector rows for {t}");
-        assert_eq!(my_batch.num_rows() as i64, *expected, "MySQL connector rows for {t}");
+        assert_eq!(
+            pg_batch.num_rows() as i64,
+            *expected,
+            "PG connector rows for {t}"
+        );
+        assert_eq!(
+            my_batch.num_rows() as i64,
+            *expected,
+            "MySQL connector rows for {t}"
+        );
     }
 }
 
@@ -202,7 +220,10 @@ async fn connectors_read_identical_category_names() {
     let my_names = sorted_string_col(&my_batch, "name");
 
     // Cross-engine: the two connectors read the same values from the same source dataset.
-    assert_eq!(pg_names, my_names, "category names must be identical across engines");
+    assert_eq!(
+        pg_names, my_names,
+        "category names must be identical across engines"
+    );
 
     // Absolute oracle: the known dvdrental category set.
     let expected = vec![
@@ -223,7 +244,10 @@ async fn connectors_read_identical_category_names() {
         "Sports",
         "Travel",
     ];
-    assert_eq!(pg_names, expected, "category names match the known dvdrental set");
+    assert_eq!(
+        pg_names, expected,
+        "category names match the known dvdrental set"
+    );
 }
 
 #[tokio::test]

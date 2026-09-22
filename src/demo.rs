@@ -1,20 +1,20 @@
-//! Demo pipeline with Phase 1 and Phase 2 features.
+//! Demo pipeline with extraction, pushdown, and DataFusion transforms.
 //! demo.rs
 //! Demonstrates:
-//! - Phase 1: extraction, filtering, aggregation, Parquet output with metadata columns.
-//! - Phase 2: collation-aware pushdown, statistics collection, cost-based decision framework,
+//! - Full extraction with schema support
+//! - Filtered extraction (caller-provided predicates)
+//! - Collation-aware pushdown, statistics collection, cost-based decisions,
 //!   parallel scan configuration, and the DataFrame builder API concepts.
 //!
 //! This is a smoke test / illustration of the pieces wired together with DataFusion doing
 //! the in-memory transform work, not a production entry point.
 
-use chrono::{DateTime, Utc};
 use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::prelude::*;
 use std::sync::Arc;
 
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
     ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
@@ -24,10 +24,10 @@ use rust_ballista_extraction_layer::pushdown::stats::StatisticsCollector;
 use rust_ballista_extraction_layer::types::ColumnMetadata;
 
 pub async fn run() -> Result<(), AppError> {
-    println!("\n=== Phase 1 & Phase 2 Feature Demonstration ===\n");
+    println!("\n=== Extraction Feature Demonstration ===\n");
 
-    // Phase 1: Extract with schema support
-    println!("► Phase 1: Extraction with schema support");
+    // Full extraction with schema support
+    println!("► Extraction with schema support");
     let extractor = PostgresExtractor::connect(
         "localhost",
         5432,
@@ -40,11 +40,8 @@ pub async fn run() -> Result<(), AppError> {
     )
     .await?;
 
-    let lo = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
-    let hi = Utc::now();
-
     let batch = extractor
-        .extract_incremental_window(
+        .extract_full_table(
             "public.orders", // Now uses explicit schema
             Some(vec![
                 "order_id",
@@ -54,20 +51,17 @@ pub async fn run() -> Result<(), AppError> {
                 "created_at",
                 "updated_at",
             ]),
-            "updated_at",
-            lo,
-            hi,
         )
         .await?;
 
     let num_rows_extracted = batch.num_rows();
     println!(
-        "  ✓ Extracted {} row(s) from public.orders",
+        "  ✓ Extracted {} row(s) from public.orders (full scan)",
         num_rows_extracted
     );
 
     // Phase 2: Demonstrate SqlDialect (collation-aware fidelity)
-    println!("\n► Phase 2: SqlDialect and collation-aware fidelity");
+    println!("\n► SqlDialect and collation-aware fidelity");
     let dialect = PostgresDialect;
 
     let text_col_c = ColumnMetadata {
@@ -107,8 +101,8 @@ pub async fn run() -> Result<(), AppError> {
     );
     println!("  ✓ Placeholder generation: {}", dialect.placeholder(1));
 
-    // Phase 2: Statistics collection framework
-    println!("\n► Phase 2: Statistics collection (framework)");
+    // Statistics collection framework
+    println!("\n► Statistics collection (framework)");
     let pool = Arc::new(extractor.pool().clone());
     let stats_collector = StatisticsCollector::new(pool.clone(), 900);
 
@@ -125,8 +119,8 @@ pub async fn run() -> Result<(), AppError> {
         }
     }
 
-    // Phase 1 & 2: DataFrame operations and metadata columns
-    println!("\n► Phase 1 & 2: DataFusion transformation with Parquet output");
+    // DataFrame operations and metadata columns
+    println!("\n► DataFusion transformation with Parquet output");
     let ctx = SessionContext::new();
     ctx.register_batch("orders_raw", batch)?;
     let df = ctx.table("orders_raw").await?;
@@ -166,7 +160,7 @@ pub async fn run() -> Result<(), AppError> {
         return Ok(());
     }
 
-    println!("\n► Phase 1 & 2: Data ready for output");
+    println!("\n► Data ready for output");
     println!(
         "  - {} rows collected via DataFusion",
         batches.iter().map(|b| b.num_rows()).sum::<usize>()
@@ -175,12 +169,15 @@ pub async fn run() -> Result<(), AppError> {
     println!("  - This project extracts to Arrow only");
     println!("  - Sink functionality delegated to external libraries");
 
-    // Phase 2: Demonstrate config framework
-    println!("\n► Phase 2: Configuration framework");
+    // Demonstrate config framework
+    println!("\n► Configuration framework");
     let _config = JobConfig {
         job_id: "demo_orders".to_string(),
         table: "orders".to_string(),
         columns: None,
+        filters: vec![FilterEntry::Single(FilterInput::Shorthand(
+            "status=PAID".to_string(),
+        ))],
         source: SourceConfig {
             host: "localhost".to_string(),
             port: 5432,
@@ -191,12 +188,6 @@ pub async fn run() -> Result<(), AppError> {
             statement_timeout_ms: 300_000,
             application_name: "rust-extract-layer".to_string(),
             schema: "public".to_string(),
-        },
-        mode: ExtractionMode::Incremental,
-        incremental: IncrementalConfig {
-            column: "updated_at".to_string(),
-            safety_lag_secs: 300,
-            max_window_secs: 6 * 3600,
         },
         sink: SinkConfig {
             path: "./demo_output".to_string(),
@@ -224,7 +215,7 @@ pub async fn run() -> Result<(), AppError> {
     println!("    - keep_threshold: 0.30 (push if selectivity < 30%)");
     println!("    - statistics_ttl: 900 seconds");
     println!("  ✓ Parallel scan: disabled (strategy=none, partitions=1)");
-    println!("    - Ready for Phase 2.5: keyset or ctid strategies");
+    println!("  ✓ Filtered extraction via caller-provided predicates (e.g. status=PAID)");
 
     println!("\n=== Demo complete ===\n");
     println!("Output:");

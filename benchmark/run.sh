@@ -914,11 +914,6 @@ cat > "$BENCH_DIR/bench-config.json" <<EOF
     "application_name": "rel-bench-rust",
     "schema": "public"
   },
-  "incremental": {
-    "column": "updated_at",
-    "safety_lag_secs": 300,
-    "max_window_secs": 21600
-  },
   "checkpoint": {
     "dir": "/tmp/.checkpoints"
   },

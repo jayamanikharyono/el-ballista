@@ -61,14 +61,13 @@ impl Fidelity {
 
 /// The push/keep policy — docs/pushdown.md §4.3.
 /// - `Always`: push everything translatable (minus denylist). Dedicated replica.
-/// - `Never`: keep everything; only the watermark predicate is pushed (it bypasses this
-///   function — see `PostgresQueryBuilder`). Emergency: source under pressure.
+/// - `Never`: keep everything in Arrow. Emergency: source under pressure.
 /// - `CostBased`: the §4.2 model over real statistics (default). Normal operation.
 /// - `Strict`: paranoid mode — push a filter only if every referenced column is indexed,
 ///   selectivity says it removes at least `(1 - keep_threshold)` of rows, and every literal
 ///   and column involved is primitive (bool/int/timestamp; numerics, floats, text, and casts
 ///   never push). `LIMIT` is never pushed under `strict`, and `push` hints are ignored
-///   (`deny` still applies). Emergency: source under pressure but the watermark must flow.
+///   (`deny` still applies). Emergency: source under pressure.
 /// - `Hinted`: per-column overrides from the job spec — `push` forces, `deny` refuses, the
 ///   rest falls back to the cost model. When you know something the stats do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

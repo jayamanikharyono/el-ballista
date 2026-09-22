@@ -169,7 +169,14 @@ mod tests {
             _ => None,
         };
         let o = LogOptions::resolve(
-            &args(&["rel", "run", "--log-level", "debug", "--log-file", "/cli.log"]),
+            &args(&[
+                "rel",
+                "run",
+                "--log-level",
+                "debug",
+                "--log-file",
+                "/cli.log",
+            ]),
             env,
         );
         assert_eq!(o.level, LevelFilter::Debug);
@@ -190,8 +197,10 @@ mod tests {
 
     #[test]
     fn eq_form_and_numeric_level() {
-        let o =
-            LogOptions::resolve(&args(&["rel", "--log-level=4", "--log-file=/a.log"]), no_env);
+        let o = LogOptions::resolve(
+            &args(&["rel", "--log-level=4", "--log-file=/a.log"]),
+            no_env,
+        );
         assert_eq!(o.level, LevelFilter::Debug);
         assert_eq!(o.file, Some(PathBuf::from("/a.log")));
     }

@@ -11,4 +11,4 @@ pub mod types;
 // compatibility shims; new code should prefer the `connector::postgres::*` paths and the
 // `connector::postgres::PostgresConnector` entry point.
 pub mod pushdown; // shared, connector-agnostic (dialects live under each connector)
-pub use connector::postgres::{distributed, engine, incremental, pipeline};
+pub use connector::postgres::{distributed, engine, pipeline};

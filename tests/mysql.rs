@@ -3,7 +3,7 @@
 //!
 //! A real MySQL is always provided by the compose stack via `tests/common/mysql.rs`
 //! (`MYSQL_URL` or the compose default), so these tests never skip — a harness failure is a
-//! hard failure, not a silent pass. Prototype scope: MySQL has no pushdown/incremental/
+//! hard failure, not a silent pass. Prototype scope: MySQL has no pushdown/
 //! distributed path yet, so "e2e" means "MySQL → typed Arrow → DataFusion can query it".
 
 #[path = "common/mysql.rs"]
@@ -39,7 +39,10 @@ async fn schema_reads_hostile() {
         meta.columns.len() >= 20,
         "expected >=20 columns, got {}: {:?}",
         meta.columns.len(),
-        meta.columns.iter().map(|c| &c.column_name).collect::<Vec<_>>()
+        meta.columns
+            .iter()
+            .map(|c| &c.column_name)
+            .collect::<Vec<_>>()
     );
     // Spot-check a few MySQL types are present
     assert!(meta.columns.iter().any(|c| c.column_name == "name"));
@@ -93,7 +96,10 @@ async fn full_extract_typed_schema_values_and_datafusion_ingest() {
     assert_eq!(dt("name"), DataType::Utf8);
     assert_eq!(dt("ratio"), DataType::Float64);
     assert_eq!(dt("day"), DataType::Date32);
-    assert_eq!(dt("updated_at"), DataType::Timestamp(TimeUnit::Microsecond, None));
+    assert_eq!(
+        dt("updated_at"),
+        DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
     assert_eq!(dt("flag"), DataType::Boolean);
     assert_eq!(dt("payload"), DataType::Binary);
     assert_eq!(dt("amount"), DataType::Decimal128(12, 2)); // exact decimal, like Postgres
@@ -123,7 +129,13 @@ async fn full_extract_typed_schema_values_and_datafusion_ingest() {
     // DataFusion can ingest the typed batch (proves Arrow validity, not just row count).
     let ctx = SessionContext::new();
     let df = ctx.read_batch(batch.clone()).unwrap();
-    let rows: usize = df.collect().await.unwrap().iter().map(|b| b.num_rows()).sum();
+    let rows: usize = df
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
     assert_eq!(rows, 8);
 }
 
@@ -230,10 +242,10 @@ async fn datafusion_filter_over_extract() {
     assert_eq!(rows, 1);
 }
 
-/// Simulate an incremental window: the prototype has no watermark API, so we window the typed
-/// `updated_at` timestamp in DataFusion. Rows are dated 2024-01-01..08; `> 2024-01-04` keeps 4.
+/// Filter in DataFusion over the typed `updated_at` timestamp (caller-provided range).
+/// Rows are dated 2024-01-01..08; `> 2024-01-04` keeps 4.
 #[tokio::test]
-async fn datafusion_incremental_window_simulation() {
+async fn datafusion_filtered_range_simulation() {
     let db = MySqlTestDb::connect().await;
     let ex = extractor(&db).await;
     let batch = ex.extract_full_table(&db.table(), None).await.unwrap();

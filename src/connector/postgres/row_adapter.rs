@@ -1,7 +1,7 @@
 //! Postgres Row Adapter
 //! extractor/postgres/row_adapter.rs
 //! This module is used to convert the PostgreSQL rows to the Arrow record batch.
-//! Phase 3: Includes RowBatchBuilder for incremental row-by-row appending with streaming batches.
+//! Phase 3: Includes RowBatchBuilder for row-by-row appending with streaming batches.
 use arrow::array::{
     ArrayBuilder, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
     Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder, Float64Array,
@@ -10,7 +10,7 @@ use arrow::array::{
     TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use sqlx::{Row, postgres::PgRow};
@@ -49,7 +49,7 @@ impl PostgresRowAdapter {
     }
 }
 
-/// RowBatchBuilder: Accumulates rows into Arrow builders for incremental batching.
+/// RowBatchBuilder: Accumulates rows into Arrow builders for streaming batching.
 /// Phase 3: Enables true streaming with bounded memory O(batch_size) instead of O(total_rows).
 pub struct RowBatchBuilder {
     schema: Arc<Schema>,
@@ -334,7 +334,15 @@ impl RowBatchBuilder {
             arrays.push(array);
         }
 
-        let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
+        // A zero-column projection (e.g. `COUNT(*)`, which only needs row counts)
+        // carries its row count explicitly: `try_new` without it rejects empty
+        // column lists ("must either specify a row count or at least one column").
+        let batch = if arrays.is_empty() {
+            let options = RecordBatchOptions::new().with_row_count(Some(self.row_count));
+            RecordBatch::try_new_with_options(self.schema.clone(), arrays, &options)?
+        } else {
+            RecordBatch::try_new(self.schema.clone(), arrays)?
+        };
 
         // Reset builders for next batch
         self.builders.clear();
@@ -749,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_batch_builder_incremental_batching() {
+    fn test_row_batch_builder_streaming_batching() {
         // This test verifies the batching semantics
         let table_metadata = test_table_metadata();
         let mut builder = RowBatchBuilder::new(&table_metadata).unwrap();
@@ -901,5 +909,21 @@ mod tests {
         let batch = builder.finish().unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_zero_column_batch_carries_row_count() {
+        // `COUNT(*)` prunes the scan to zero columns: `finish()` must produce a
+        // valid 0-column batch instead of failing with "must either specify a
+        // row count or at least one column".
+        let metadata = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![],
+        };
+        let mut builder = RowBatchBuilder::new(&metadata).unwrap();
+        let batch = builder.finish().unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 0);
     }
 }

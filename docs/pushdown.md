@@ -51,21 +51,28 @@ removed, so a source-side `LIMIT n` could leave fewer than `n` valid rows.
 
 ## 2. Expression translation
 
-`rel-planner` walks the DataFusion `Expr` tree and attempts to render it into a dialect-specific
-SQL fragment with bound parameters. Translation is **allowlist-based**: an expression node we do
+`pushdown::translate` walks the DataFusion `Expr` tree and attempts to render it into a dialect-specific
+`Predicate` IR with bound parameters. Translation is **allowlist-based**: an expression node we do
 not explicitly recognize is not pushed. A denylist would mean every new DataFusion release could
 silently start pushing something we have never validated.
 
 ```rust
-pub trait SqlDialect {
-    /// Render `expr` as a parameterized SQL fragment, or None if not expressible.
-    fn try_render(&self, expr: &Expr, params: &mut ParamBuffer) -> Option<String>;
-
-    /// How faithfully does the rendered SQL reproduce Arrow semantics?
-    fn fidelity(&self, expr: &Expr, col_meta: &ColumnMeta) -> Fidelity; // Exact | Inexact
-
-    fn quote_ident(&self, ident: &str) -> String;
-    fn placeholder(&self, index: usize) -> String;   // "$1" for Postgres
+/// Per-connector dialect: quoting, placeholders, and fidelity rules
+/// (`src/pushdown/dialect.rs`; implemented per backend)
+pub trait SqlDialect: Send + Sync {
+    fn quote_ident(&self, name: &str) -> String;
+    fn placeholder(&self, param_index: usize) -> String;   // "$1" for Postgres
+    fn column_literal_fidelity(
+        &self,
+        column: &ColumnMetadata,
+        literal_is_text: bool,
+        literal_is_float: bool,
+    ) -> Fidelity; // Exact | Inexact
+    fn column_column_fidelity(
+        &self,
+        left_column: &ColumnMetadata,
+        right_column: &ColumnMetadata,
+    ) -> Fidelity;
 }
 ```
 
@@ -244,9 +251,9 @@ Two guardrails override the arithmetic:
 | Mode | Behavior | When to use |
 | --- | --- | --- |
 | `always` | Push everything expressible and safe | Dedicated replica, no production impact |
-| `never` | Only the watermark predicate is pushed | Emergency: source is under pressure |
+| `never` | Keep everything in Arrow | Emergency: source is under pressure |
 | `cost_based` | The model above (default) | Normal operation |
-| `strict` | Push a filter only if every referenced column is indexed, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp); never push `LIMIT`; `push` hints ignored, `deny` still applies | Source under pressure but the watermark must flow |
+| `strict` | Push a filter only if every referenced column is indexed, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp); never push `LIMIT`; `push` hints ignored, `deny` still applies | Source under pressure |
 | `hinted` | Per-column and per-predicate overrides in the job spec | When you know something the stats do not |
 
 Configured per source, overridable per job (JSON job spec):
@@ -264,9 +271,9 @@ Configured per source, overridable per job (JSON job spec):
 }
 ```
 
-The watermark predicate from [incremental extraction](incremental-extraction.md) is a special case:
-it is **always pushed**, in every mode, because without it the job reads the entire table. If it
-cannot be pushed, the job fails rather than degrading into a full scan.
+Filtered extraction has no always-pushed predicate: every caller-provided filter goes through
+the same fidelity + policy decision. (The watermark special case from the deferred
+[ incremental extraction](deferred/incremental-extraction.md) design no longer applies.)
 
 ---
 
@@ -277,13 +284,11 @@ Much simpler, and much higher value per line of code than filter pushdown.
 **Projection** is pushed unconditionally. DataFusion tells the `TableProvider` exactly which column
 indices the plan needs, and narrowing `SELECT *` to four columns on a 27-column table is often a
 larger win than any filter — it reduces bytes on the wire, decode CPU, and Arrow memory
-simultaneously. The only nuance is that the watermark column and any primary key used for
-partitioning or checkpointing must be added back into the source projection even when the user did
-not select them, then dropped before the sink.
+simultaneously.
 
 **Limit** is pushed when no `Inexact` filter is present (per DataFusion's rule) and no sort is
 being applied at the source. A `LIMIT` without `ORDER BY` returns an arbitrary subset, which is
-fine for `rel plan --sample` but must never be used in a production incremental job.
+fine for sampling but must never be relied on for deterministic extraction.
 
 ---
 
@@ -292,15 +297,15 @@ fine for `rel plan --sample` but must never be used in a production incremental 
 Pushdown bugs return *plausible* wrong answers, so testing needs to be differential rather than
 example-based.
 
-1. **Differential correctness tests.** For each dialect, run every allowlisted predicate against a
+1. **Differential correctness tests (implemented, `tests/pg_pushdown.rs`).** For each dialect, run every allowlisted predicate against a
    seeded table with the full hostile-value set (NULLs, empty strings, mixed case, accents, `NaN`,
    `±infinity`, zero dates, max/min integers, high-precision decimals) both with pushdown enabled
    and with `policy = "never"`. The two result sets must be identical. This test catches every
    hazard in §3 and is the single highest-value test in the project.
-2. **Property tests.** Generate random predicate trees with `proptest`, then assert the same
+2. **Property tests (planned).** Generate random predicate trees with `proptest`, then assert the same
    equality. Random trees find the `NOT`/`OR`/NULL interactions that hand-written tests miss.
 3. **Plan snapshot tests.** Assert the *decisions*, not just the results, so a stats or cost-model
    change that quietly disables all pushdown shows up as a diff.
-4. **Fidelity assertion.** In debug builds, every predicate marked `Exact` is re-evaluated in Arrow
+4. **Fidelity assertion (planned).** In debug builds, every predicate marked `Exact` is re-evaluated in Arrow
    and the row count compared. A mismatch panics. This turns a silent data bug into a loud test
    failure.

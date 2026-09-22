@@ -15,7 +15,7 @@ execution — is shared, and only genuinely backend-specific pieces live under e
 ## Current state
 
 After the modularization, all Postgres code lives under `src/connector/postgres/`, with
-`distributed`, `engine`, `incremental`, and `pushdown` physically there and re-exported at the
+`distributed`, `engine`, and `pipeline` physically there and re-exported at the
 crate root as transitional shims (see AGENTS.md — Postgres connector modularization). The MySQL
 prototype (`src/connector/mysql/`) is a walking skeleton: `MysqlDialect`, a type mapper, a
 `information_schema` reader, and a full-table extractor (materializes `Utf8` via `CAST`).

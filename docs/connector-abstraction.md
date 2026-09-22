@@ -29,7 +29,7 @@ Generic (already reused unchanged by MySQL):
 Leaks to fix during the lift:
 - `SqlDialect` and `Fidelity` live under `connector::postgres::pushdown`, so MySQL imports a
   Postgres module. They must move to a shared location.
-- `connector::errors::ExtractorError` messages say "PostgreSQL error" — make them backend-neutral.
+- `connector::errors::ExtractorError` messages say "PostgreSQL error" — make them backend-neutral. (DONE — now "Source error" / "Unsupported source type".)
 
 Stays connector-specific (never shared):
 - The SQL dialect impl (`PostgresDialect` / `MysqlDialect`), placeholders (`$1` vs `?`),

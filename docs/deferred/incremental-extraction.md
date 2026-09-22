@@ -1,4 +1,10 @@
-# Incremental Extraction
+# Incremental Extraction (DEFERRED — out of scope)
+
+> **Status:** this design is intentionally NOT implemented. The extraction layer
+> covers full/filtered extraction, partitioning, split checkpointing, and
+> DataFusion/Ballista execution; watermark management, incremental state,
+> backfill orchestration, and CDC live in the orchestrator and are expressed as
+> caller-provided filter predicates. This document is kept for reference only.
 
 This document specifies the incremental extraction modes, the checkpoint store, the commit protocol, and the failure modes for watermark-based extraction.
 
@@ -12,7 +18,7 @@ The extraction layer is source-aware and outputs native Arrow on DataFusion/Ball
 | --- | --- | --- | --- | --- | --- |
 | `append_id` | `id > :lo AND id <= :hi` | no | no | Monotonic, gapless-enough surrogate key | Not implemented |
 | `timestamp` | `updated_at > :lo AND updated_at <= :hi` | yes | no | An `updated_at` maintained on every write | **Implemented** |
-| `snapshot` | none — full table read | yes | yes | Tolerance for reading the whole table | Not implemented as a mode (full loads go through `extract_full_table` / the end-to-end example, without checkpointing) |
+| `snapshot` | none — full table read | yes | yes | Tolerance for reading the whole table | Not implemented as a mode (full loads go through `extract_full_table` / the `full_extraction` example, without checkpointing) |
 | `log` (future) | LSN / GTID range | yes | **yes** | Logical replication or binlog access | Roadmap |
 
 `timestamp` is the default and the mode most of this document is about. `append_id` is strictly
@@ -373,6 +379,6 @@ A large range is walked in `max_window_secs`-bounded chunks with one acquire/ext
 cycle per chunk, so a crash resumes from the last committed chunk rather than restarting the
 whole range. Chunking is strictly sequential — there is no `--chunk`/`--parallel` fan-out and
 no `--strategy keyset` primary-key chunking; for very large historical loads, full-table
-extraction (see `examples/end_to_end.rs`) is currently the faster path. Sink output, such as
+extraction (see `examples/full_extraction.rs`) is currently the faster path. Sink output, such as
 it is, goes wherever the run writes it — there are no window-derived object paths and no
 partition layout shared with incremental output yet.

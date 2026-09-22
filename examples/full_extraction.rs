@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run --example full_load
+//! cargo run --example full_extraction
 //! ```
 
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let table_name = "public.orders";
     let columns = Some(vec![
         "order_id",
-        "customer_name",
+        "user_id",
         "amount",
         "status",
         "updated_at",

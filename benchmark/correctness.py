@@ -102,6 +102,12 @@ def main():
     for scenario, paths, columns in (("full", full_files, FULL_COLUMNS),
                                      ("selective", sel_files, SELECTIVE_COLUMNS)):
         if len(paths) < 2:
+            # Never silently skip: every run produces all engines' outputs, so fewer
+            # than two files means an engine's output went missing (e.g. wiped), and
+            # a vacuous "all identical" would be a false PASS.
+            overall &= check(
+                "{} row-identical: need >= 2 engine outputs".format(scenario),
+                False, "found {}".format(len(paths)))
             continue
         base = paths[0]
         for other in paths[1:]:
@@ -134,6 +140,8 @@ def main():
         engine = os.path.basename(sel).replace("_selective.parquet", "")
         full = os.path.join(out_dir, engine + "_full.parquet")
         if not os.path.exists(full):
+            overall &= check("selective ⊆ full: " + engine, False,
+                             "missing {}".format(full))
             continue
         try:
             qsel = compare_select(sel, SELECTIVE_COLUMNS)

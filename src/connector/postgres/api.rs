@@ -14,7 +14,7 @@
 //! ```
 //!
 //! `collect()` returns the Arrow batches with no checkpoint side effects; `run()` performs the
-//! operational job (checkpoint protocol in incremental mode) and returns a [`RunOutcome`].
+//! operational job (split-execution checkpointing) and returns a [`RunOutcome`].
 
 use arrow::record_batch::RecordBatch;
 
@@ -48,6 +48,16 @@ impl PostgresConnector {
     /// The config backing this connector.
     pub fn config(&self) -> &JobConfig {
         self.pipeline.config()
+    }
+
+    /// The underlying pipeline — programmatic access to the job's parsed filters
+    /// ([`Pipeline::filter_exprs`]) and per-filter pushdown preview
+    /// ([`Pipeline::explain_filters`]).
+    ///
+    /// [`Pipeline::filter_exprs`]: super::pipeline::Pipeline::filter_exprs
+    /// [`Pipeline::explain_filters`]: super::pipeline::Pipeline::explain_filters
+    pub fn pipeline(&self) -> &Pipeline {
+        &self.pipeline
     }
 
     /// Begin an extraction; pick the target with [`ExtractBuilder::standalone`] or
@@ -102,7 +112,7 @@ impl StandaloneExtraction<'_> {
         self.pipeline.extract().await
     }
 
-    /// Execute the operational job (checkpoint protocol in incremental mode). Returns stats.
+    /// Execute the operational job (split-execution checkpointing). Returns stats.
     pub async fn run(self) -> Result<RunOutcome, AppError> {
         self.pipeline.run().await
     }
@@ -142,7 +152,7 @@ impl DistributedExtraction<'_> {
             .await
     }
 
-    /// Execute the operational job (checkpoint protocol in incremental mode). Returns stats.
+    /// Execute the operational job (split-execution checkpointing). Returns stats.
     pub async fn run(self) -> Result<RunOutcome, AppError> {
         self.pipeline
             .run_distributed(self.workers, self.scheduler.as_deref())
@@ -168,7 +178,10 @@ mod tests {
     fn scheduler_and_in_process_override_the_default() {
         let connector =
             PostgresConnector::from_config_file("examples/configs/extract.example.json").unwrap();
-        let dist = connector.extract().distributed().scheduler("http://sched:50050");
+        let dist = connector
+            .extract()
+            .distributed()
+            .scheduler("http://sched:50050");
         assert_eq!(dist.scheduler.as_deref(), Some("http://sched:50050"));
         let local = connector.extract().distributed().in_process();
         assert!(local.scheduler.is_none());

@@ -1,16 +1,20 @@
-//! P0-2 proof: every extraction path binds its parameters.
+//! Extraction-path agreement: full scan, keyset partitions, and filtered extraction
+//! return identical data.
 //!
-//! `extract_incremental_window` and the `*_via_cursor` methods used to inline
-//! `$1/$2` placeholders into `DECLARE … FOR` with zero binds (every call failed
-//! with "there is no parameter $1"). All three paths must return identical data.
-//! Run: `cargo test --test pg_paths` (requires the compose stack up;
-//! `DATABASE_URL` overrides the default endpoint).
+//! The cursor/FETCH paths used to inline `$1/$2` placeholders into `DECLARE … FOR`
+//! with zero binds (every call failed with "there is no parameter $1"). All paths
+//! must return identical data. Run: `cargo test --test pg_paths` (requires the
+//! compose stack up; `DATABASE_URL` overrides the default endpoint).
 
 #[path = "common/mod.rs"]
 mod common;
 
-use chrono::{TimeZone, Utc};
-use common::TestDb;
+use common::{TEST_PASSWORD_ENV, TestDb};
+use rust_ballista_extraction_layer::config::{
+    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
+    PushdownConfig, SinkConfig, SourceConfig,
+};
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
@@ -21,8 +25,49 @@ macro_rules! live {
     };
 }
 
+fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
+    use rust_ballista_extraction_layer::config::{FilterEntry, FilterInput};
+    let filters = filters
+        .into_iter()
+        .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))
+        .collect();
+    JobConfig {
+        job_id: format!("paths-{}", db.schema),
+        table: "hostile".to_string(),
+        columns: None,
+        filters,
+        source: SourceConfig {
+            host: db.host.clone(),
+            port: db.port,
+            user: db.user.clone(),
+            password_env: TEST_PASSWORD_ENV.to_string(),
+            database: db.database.clone(),
+            pool_max: 4,
+            statement_timeout_ms: 300_000,
+            application_name: "relex-test".to_string(),
+            schema: db.schema.clone(),
+        },
+        sink: SinkConfig {
+            path: "/tmp/relex_test_sink".to_string(),
+        },
+        checkpoint: CheckpointConfig {
+            dir: std::env::temp_dir()
+                .join(format!("relex_paths_{}", db.schema))
+                .to_string_lossy()
+                .to_string(),
+        },
+        pushdown: PushdownConfig::default(),
+        parallel_scan: ParallelScanConfig::default(),
+        execution: ExecutionConfig::default(),
+        distributed: DistributedConfig {
+            scheduler_url: String::new(),
+            workers: 1,
+        },
+    }
+}
+
 #[tokio::test]
-async fn full_incremental_and_cursor_agree() -> Result<(), Box<dyn std::error::Error>> {
+async fn full_keyset_and_filtered_agree() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
     let ex = PostgresExtractor::connect(
         &db.host,
@@ -39,39 +84,57 @@ async fn full_incremental_and_cursor_agree() -> Result<(), Box<dyn std::error::E
     let full = ex.extract_full_table(&db.table(), None).await?;
     assert_eq!(full.num_rows(), 8);
 
-    // Wide window covers all rows: exercises lo/hi binding (the old failure).
-    let lo = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-    let hi = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-    let inc = ex
-        .extract_incremental_window(&db.table(), None, "updated_at", lo, hi)
+    // Keyset partitions tiling the id space union to the full scan (metamorphic oracle).
+    let a = ex
+        .extract_keyset_partition(&db.table(), None, "id", 0, 5)
         .await?;
-    assert_eq!(inc.num_rows(), 8);
+    let b = ex
+        .extract_keyset_partition(&db.table(), None, "id", 5, 1_000_000)
+        .await?;
+    let mut union_ids = common::int64_col(&a, "id");
+    union_ids.extend(common::int64_col(&b, "id"));
+    union_ids.sort_unstable();
+    assert_eq!(union_ids, sorted(common::int64_col(&full, "id")));
 
     // Cursor path with a tiny batch size: exercises DECLARE/FETCH batching.
     let cursor_batches = ex
-        .extract_incremental_via_cursor(&db.table(), None, "updated_at", lo, hi, 3)
+        .extract_keyset_partition_via_cursor(&db.table(), None, "id", 0, 1_000_000, 3)
         .await?;
     let cursor_rows: usize = cursor_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(cursor_rows, 8);
 
     // Same data through every path: ids and exact decimal amounts agree.
     let full_ids = common::int64_col(&full, "id");
-    let inc_ids = common::int64_col(&inc, "id");
-    assert_eq!(sorted(full_ids), sorted(inc_ids));
-    assert_eq!(
-        common::decimal_col(&full, "amount"),
-        common::decimal_col(&inc, "amount")
-    );
+    assert_eq!(sorted(full_ids), union_ids);
+    let mut cursor_ids = Vec::new();
+    for batch in &cursor_batches {
+        cursor_ids.extend(common::int64_col(batch, "id"));
+    }
+    assert_eq!(sorted(cursor_ids), union_ids);
 
-    // A narrow window slices correctly. Windows are half-open (lo, hi] (documented in
-    // docs/incremental-extraction.md): row 3's updated_at sits exactly ON lo2, so it is
-    // EXCLUDED (lo is exclusive); rows 4 and 5 fall inside (0, hi2] and are included.
-    let lo2 = Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap();
-    let hi2 = Utc.with_ymd_and_hms(2024, 1, 5, 12, 0, 0).unwrap();
-    let slice = ex
-        .extract_incremental_window(&db.table(), None, "updated_at", lo2, hi2)
+    // Filtered extraction (caller-provided predicate) matches direct SQL
+    // (differential oracle: pushed filter vs database ground truth).
+    let batches = PostgresConnector::from_config(filtered_job(&db, vec!["id>3".to_string()]))
+        .extract()
+        .standalone()
+        .collect()
         .await?;
-    assert_eq!(sorted(common::int64_col(&slice, "id")), vec![4, 5]);
+    let mut filtered_ids = Vec::new();
+    for batch in &batches {
+        filtered_ids.extend(common::int64_col(batch, "id"));
+    }
+    filtered_ids.sort_unstable();
+    let sql = format!(
+        "SELECT id FROM {}.hostile WHERE id > 3 ORDER BY id",
+        db.schema
+    );
+    let rows: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(&db.pool)
+        .await?;
+    assert_eq!(
+        filtered_ids,
+        rows.into_iter().map(|r| r.0).collect::<Vec<_>>()
+    );
     Ok(())
 }
 

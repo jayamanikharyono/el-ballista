@@ -1,13 +1,14 @@
 # Architecture
 
 Technical reference for the Rust Extract Layer. This document covers the crate layout, the
-lifecycle of a job from API call to committed checkpoint, the data model, execution and memory
+lifecycle of a job from API call to split-checkpoint commit, the data model, execution and memory
 management, configuration, and observability. The core is a source-aware extraction layer on
 DataFusion/Ballista that outputs native Arrow.
 
 For the reasoning behind the design, start with the [README](../README.md). For the parts that get
-their own documents, see [pushdown](pushdown.md), [incremental extraction](incremental-extraction.md),
-and [connectors](connectors/README.md). Sinks are out of scope.
+their own documents, see [pushdown](pushdown.md)
+and [connectors](connectors/README.md). Watermark/incremental design is deferred under
+[deferred](deferred/incremental-extraction.md). Sinks are out of scope.
 
 ---
 
@@ -23,7 +24,7 @@ public extension points:
 | `ExecutionPlan` | `PostgresExecutionPlan` — a streaming scan node with per-partition source queries | Implemented |
 | `OptimizerRule` | `SourceAwarePushdownRule` — the cost-based push/keep decision | Implemented |
 | `TableProviderFactory` / `SchemaProvider` | Catalog binding for `ctx.source("ref", "table")` | Deferred — the engine registers providers directly |
-| `ScalarUDF` / `AggregateUDF` | Extraction-specific functions (e.g. watermark helpers) | Deferred |
+| `ScalarUDF` / `AggregateUDF` | Extraction-specific functions | Deferred |
 | `ObjectStore` registry | GCS, S3, local filesystem for sinks | Deferred — sinks are out of scope (see roadmap) |
 
 Consequences worth stating explicitly: we inherit DataFusion's optimizer rules for projection,
@@ -71,11 +72,10 @@ rust-ballista-extraction-layer/
 │   │                           # query_builder, parallel, table_provider, execution_plan, extractor
 │   ├── pushdown/               # Predicate IR, translate/decide, dialect, cost_model,
 │   │                           # stats, explain, optimizer_rule
-│   ├── incremental/            # watermarks, windows, clamp_to_observed
-│   ├── checkpoint/             # JsonCheckpointStore: leases + run history on local fs
+│   ├── checkpoint/             # JsonCheckpointStore: per-split execution state on local fs
 │   ├── distributed/            # Ballista codecs, pool registry, DistributedContext
 │   ├── engine/                 # ExtractContext: DataFusion session + builder API
-│   ├── cli/                    # binary commands: run, plan, checkpoint, backfill,
+│   ├── cli/                    # binary commands: run, plan, checkpoint,
 │   │                           # distribute, scheduler, worker, demo
 │   ├── demo.rs                 # no-arg demo pipeline
 │   └── errors.rs               # AppError
@@ -85,8 +85,9 @@ rust-ballista-extraction-layer/
 
 The Source SPI contract lives in `src/connector/mod.rs`: every backend answers four questions
 without the rest of the system knowing which database it is — *what SQL?* (`Predicate::render_to`
-into a `SqlSink`, `SqlDialect` conventions), *what window is safe?* (`WatermarkSource`),
-*what does it cost?* (`TableStatsSource`), *which pool?* (`SourceDescriptor`). The planning SPI
+into a `SqlSink`, `SqlDialect` conventions),
+*what does it cost?* (`TableStatsSource`), *which pool?* (`SourceDescriptor`).
+Caller-provided filter predicates are the only range mechanism; the layer manages no watermarks. The planning SPI
 itself is DataFusion's (`TableProvider` / `ExecutionPlan`). Deliberately backend-concrete:
 `sqlx` pools and `QueryBuilder` binding — another backend would own an analogous registry over its
 own pool type following the same pattern.
@@ -102,7 +103,7 @@ own pool type following the same pattern.
   (2) Logical plan          DataFusion LogicalPlan, sources bound to TableProviders
         │
         ▼
-  (3) Watermark resolution  checkpoint store → concrete predicate injected into the plan
+  (3) Filter resolution     config filters → concrete predicates in the plan
         │
         ▼
   (4) Optimization          DataFusion rules + SourceAwarePushdown
@@ -120,26 +121,24 @@ own pool type following the same pattern.
   (7) Sink durability       Parquet file finalized locally (object-store sinks deferred;
   │                         see roadmap — out of scope for this project)
         ▼
-  (8) Checkpoint commit     new watermark persisted — only after (7) succeeds
+  (8) Checkpoint commit     split states persisted — only after (7) succeeds
 ```
 
-Steps 7 and 8 are ordered and non-atomic on purpose. See
-[incremental extraction](incremental-extraction.md#5-the-commit-protocol) for why this yields
-at-least-once delivery with idempotent object naming rather than a distributed transaction.
+Steps 7 and 8 are ordered and non-atomic on purpose: a failed split is recorded and
+retried, completed splits are skipped. Checkpoints track split execution only.
 
 ### Worked example
 
 ```rust
 let ctx = ExtractContext::from_config(config).await?;
 let batches = ctx.source("postgres", "public.orders").await?
-    .incremental(Watermark::timestamp("updated_at")).await?
     .filter(col("status").eq(lit("PAID")))?
     .select(vec![col("order_id"), col("user_id"), col("amount")])?
     .collect().await?;
 ```
 
-After watermark resolution and optimization, the planner has decided that `updated_at` is indexed
-and highly selective (push it); `status` is a low-cardinality text column with no usable index
+After filter resolution and optimization, the planner considers each caller-provided
+predicate on its merits; `status` is a low-cardinality text column with no usable index
 (keep it under `cost_based`, or push it as `Inexact` under `always` — either way DataFusion
 re-checks it, because string comparisons are never `Exact`). The resulting source query,
 per partition:
@@ -147,19 +146,19 @@ per partition:
 ```sql
 SELECT order_id, user_id, amount, updated_at
 FROM   public.orders
-WHERE  updated_at >  $1 AND updated_at <= $2
-  AND  status = $3
+WHERE  "status" = $1
   AND  order_id >= 1 AND order_id < 25001   -- keyset partition predicate, one range per scan task
 ```
 
 Change one input — say the table is on a hot production primary — and set
 `policy = "strict"`: only indexed, selective, primitive-typed predicates push, `LIMIT` never
-pushes. `rel plan --explain` prints each decision with its reasoning:
+pushes. `rel plan --explain` prints each decision with its reasoning (exact reasons depend
+on live statistics — illustrative output):
 
 ```
 policy: cost_based
   status='PAID'  -> Inexact (PUSH (Inexact; low selectivity (20.00%) and cost (4882) within budget (50000); ("status" = $1)))
-  amount>=100    -> Unsupported (KEEP (unsupported expression; stays in Arrow))
+  amount>=100    -> Keep (KEEP (selectivity above keep threshold; stays in Arrow))
 ```
 
 ---
@@ -195,7 +194,7 @@ time, bounded memory) — with one caveat: rows arrive through `sqlx` as `PgRow`
 so "no intermediate row struct" holds for the Arrow side, not the driver side.
 
 **Metadata columns.** Deferred: batches currently carry exactly the source columns, no
-`_extracted_at` / `_extracted_date` / `_source` / `_watermark_hi` appended. Likewise, values
+`_extracted_at` / `_extracted_date` / `_source` appended. Likewise, values
 representable in the source but not in Arrow are errors today, not nulls-with-a-counter —
 the `rel_null_coerced_total` metric in §7 presupposes instrumentation that doesn't exist yet
 (see §7).
@@ -235,7 +234,7 @@ so a three-worker deployment shows the source the same connection count as one m
 constraint this imposes on new code is modest but real: keep physical plan nodes serializable
 and never smuggle non-serializable state (pools, passwords) into `ExecutionPlan`
 implementations. See [roadmap](roadmap.md#phase-4--distributed-execution) and
-`docs/phase-four-implementation-plan.md`.
+`docs/roadmap/phase-four-implementation-plan.md`.
 
 ---
 
@@ -246,7 +245,7 @@ connection catalog, no TOML. Credentials are managed once, by name, never inline
 
 ```json
 {
-  "job_id": "orders_incremental",
+  "job_id": "orders_extract",
   "table": "orders",
   "columns": ["order_id", "user_id", "status", "amount", "created_at", "updated_at"],
   "source": {
@@ -260,7 +259,7 @@ connection catalog, no TOML. Credentials are managed once, by name, never inline
     "application_name": "rust-extract-layer",
     "schema": "public"
   },
-  "incremental": { "column": "updated_at", "safety_lag_secs": 300, "max_window_secs": 21600 },
+  "filters": [{ "column": "status", "op": "=", "value": "PAID" }],
   "checkpoint": { "dir": "./.checkpoints" },
   "pushdown": {
     "policy": "cost_based",
@@ -281,8 +280,9 @@ Notes against the original TOML sketch this replaces:
 - `password_env` names the environment variable holding the password (resolved in whichever
   process opens the pool — scheduler, worker, and client each resolve it independently).
   There is no `dsn_env` and no `[sources.*]` catalog.
-- Checkpoints are local-directory JSON only (`JsonCheckpointStore`); there is no postgres/gcs
-  checkpoint backend.
+- Checkpoints are local-directory JSON split-state only (`JsonCheckpointStore` — one file
+  per job recording per-split `Pending`/`Running`/`Completed`/`Failed`); there is no
+  postgres/gcs checkpoint backend and no watermark state.
 - There is no `[sinks.*]` section — sinks are out of scope; examples write Parquet via
   DataFusion writers.
 
@@ -296,9 +296,10 @@ idle-in-transaction timeouts).
 
 ## 7. Observability
 
-Logging today is the `log` crate (a `SimpleLogger` in the binary, `RUST_LOG`-gated) — one line
-per job, window, partition scan, and checkpoint commit. There is no `tracing`, no spans, and
-no metrics endpoint. The table below is the instrumentation we want, not what exists; each
+Logging today is the `log` crate (a `fern` backend in the binary writing to stderr plus an
+optional file, level from `--log-level`/`RUST_LOG`, file from `--log-file`/`REL_LOG_FILE`) —
+one line per job, split, partition scan, and checkpoint commit, with every generated SQL query
+at `debug` level. There is no `tracing`, no spans, and no metrics endpoint. The table below is the instrumentation we want, not what exists; each
 row is deferred work, with the code hook it would attach to in parentheses:
 
 | Metric | Type | Why it matters |
@@ -307,9 +308,9 @@ row is deferred work, with the code hook it would attach to in parentheses:
 | `rel_bytes_from_source_total{source,table}` | counter | Directly measures pushdown effectiveness |
 | `rel_source_query_duration_seconds` | histogram | Detects a pushdown that made the DB slow (hook: `build_query` execution) |
 | `rel_pushdown_decision_total{operator,decision}` | counter | Is the cost model actually deciding, or always saying yes? (hook: `decide_cost`) |
-| `rel_watermark_lag_seconds{source,table}` | gauge | The single most important freshness signal |
+| `rel_splits_completed_total{job}` | counter | Split progress and retry behavior (hook: split commit) |
 | `rel_null_coerced_total{source,table,column,reason}` | counter | Unrepresentable values silently becoming null (needs the §4 null-mapping first) |
 | `rel_checkpoint_commit_total{status}` | counter | Failed commits mean duplicate work next run |
 
-`rel_watermark_lag_seconds` deserves a standing alert. It is the metric that tells you a pipeline
-has been quietly extracting nothing for six hours.
+`rel_checkpoint_commit_total{status=failed}` deserves a standing alert: failed split commits mean
+duplicate work on the next run.

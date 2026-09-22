@@ -1,18 +1,16 @@
-//! File-backed `CheckpointStore`.
+//! File-backed [`CheckpointStore`].
 //! checkpoint/json_store.rs
-//! One JSON file per (job_id, namespace), written atomically (write to a `.tmp` file, then
-//! rename over the real path). Good enough for a single scheduler triggering one job at a time
-//! on one machine — the deployment Phase 1 targets — but see the module-level note in
-//! `checkpoint/mod.rs` on what this does *not* guarantee.
+//! One JSON file per job (`{job_id}.json`, sanitized), written atomically (write
+//! to a unique `.tmp` file, then rename over the real path) with fsync of file
+//! and directory so a commit survives a crash on ext4.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
-use uuid::Uuid;
+use chrono::Utc;
 
-use super::{Checkpoint, CheckpointStore, JobKey, RunState, RunStats};
+use super::{CheckpointStore, JobCheckpoint, JobKey, SplitState, SplitStatus};
 use crate::errors::AppError;
 
 pub struct JsonCheckpointStore {
@@ -34,15 +32,10 @@ impl JsonCheckpointStore {
     }
 
     fn path_for(&self, key: &JobKey) -> PathBuf {
-        let file_name = format!(
-            "{}__{}.json",
-            sanitize(&key.job_id),
-            sanitize(&key.namespace)
-        );
-        self.dir.join(file_name)
+        self.dir.join(format!("{}.json", sanitize(&key.job_id)))
     }
 
-    fn read_file(&self, key: &JobKey) -> Result<Option<Checkpoint>, AppError> {
+    fn read_file(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError> {
         let path = self.path_for(key);
 
         if !path.exists() {
@@ -52,14 +45,14 @@ impl JsonCheckpointStore {
         let text = fs::read_to_string(&path)
             .map_err(|e| AppError::Checkpoint(format!("cannot read {}: {e}", path.display())))?;
 
-        let checkpoint: Checkpoint = serde_json::from_str(&text).map_err(|e| {
+        let checkpoint: JobCheckpoint = serde_json::from_str(&text).map_err(|e| {
             AppError::Checkpoint(format!("corrupt checkpoint file {}: {e}", path.display()))
         })?;
 
         Ok(Some(checkpoint))
     }
 
-    fn write_file(&self, key: &JobKey, checkpoint: &Checkpoint) -> Result<(), AppError> {
+    fn write_file(&self, key: &JobKey, checkpoint: &JobCheckpoint) -> Result<(), AppError> {
         let path = self.path_for(key);
         // Unique tmp avoids last-writer-wins collision when concurrent `write_file` calls
         // race on the same job (last `rename` wins, but no torn JSON). `fsync` + dir `fsync`
@@ -115,136 +108,130 @@ fn sanitize(s: &str) -> String {
 
 #[async_trait]
 impl CheckpointStore for JsonCheckpointStore {
-    async fn acquire(
-        &self,
-        key: &JobKey,
-        run_id: Uuid,
-        lease: Duration,
-        watermark_column: &str,
-    ) -> Result<Checkpoint, AppError> {
+    async fn begin(&self, key: &JobKey, split_ids: &[String]) -> Result<JobCheckpoint, AppError> {
         let now = Utc::now();
         let existing = self.read_file(key)?;
 
-        if let Some(current) = &existing
-            && current.state == RunState::Running
-            && let Some(expires) = current.lease_expires_at
-        {
-            if expires > now {
-                return Err(AppError::Checkpoint(format!(
-                    "job '{}' namespace '{}' is already running (run_id={:?}, lease expires {})",
-                    key.job_id, key.namespace, current.run_id, expires
-                )));
+        let mut splits: Vec<SplitStatus> = Vec::with_capacity(split_ids.len());
+        for split_id in split_ids {
+            let preserved = existing
+                .as_ref()
+                .and_then(|c| c.splits.iter().find(|s| &s.split_id == split_id));
+            match preserved {
+                // A retry must not re-run completed splits.
+                Some(prev) if prev.state == SplitState::Completed => splits.push(prev.clone()),
+                Some(prev) => splits.push(SplitStatus {
+                    split_id: split_id.clone(),
+                    state: SplitState::Pending,
+                    rows_extracted: prev.rows_extracted,
+                    updated_at: now,
+                    error: prev.error.clone(),
+                }),
+                None => splits.push(SplitStatus {
+                    split_id: split_id.clone(),
+                    state: SplitState::Pending,
+                    rows_extracted: 0,
+                    updated_at: now,
+                    error: None,
+                }),
             }
-
-            log::warn!(
-                "reclaiming expired lease for job '{}' namespace '{}' (previous run_id={:?})",
-                key.job_id,
-                key.namespace,
-                current.run_id
-            );
         }
 
-        let checkpoint = Checkpoint {
+        let checkpoint = JobCheckpoint {
             job_id: key.job_id.clone(),
-            namespace: key.namespace.clone(),
-            watermark_column: watermark_column.to_string(),
-            watermark_value: existing.as_ref().and_then(|c| c.watermark_value),
-            state: RunState::Running,
-            run_id: Some(run_id),
-            lease_expires_at: Some(now + lease),
+            splits,
             updated_at: now,
         };
-
         self.write_file(key, &checkpoint)?;
-
         Ok(checkpoint)
     }
 
-    async fn commit(
-        &self,
-        key: &JobKey,
-        run_id: Uuid,
-        next: DateTime<Utc>,
-        stats: RunStats,
-    ) -> Result<(), AppError> {
-        let current = self.read_file(key)?.ok_or_else(|| {
-            AppError::Checkpoint(format!("no checkpoint to commit for job '{}'", key.job_id))
+    async fn mark_running(&self, key: &JobKey, split_id: &str) -> Result<(), AppError> {
+        let mut checkpoint = self.read_file(key)?.ok_or_else(|| {
+            AppError::Checkpoint(format!("no checkpoint begun for job '{}'", key.job_id))
         })?;
-
-        if current.run_id != Some(run_id) {
-            return Err(AppError::Checkpoint(format!(
-                "lost the lease for job '{}' (held by {:?}, tried to commit as {})",
-                key.job_id, current.run_id, run_id
-            )));
-        }
-
-        // Monotonicity: a stale or clamped `next` must not rewind the watermark.
-        if let Some(prev) = current.watermark_value
-            && next < prev
-        {
-            return Err(AppError::Checkpoint(format!(
-                "watermark regression for job '{}': current {} -> next {}",
-                key.job_id, prev, next
-            )));
-        }
-
-        // Lease expiry: committing with an expired lease is a split-brain signal.
-        if let Some(expires) = current.lease_expires_at
-            && Utc::now() > expires
-        {
-            log::warn!(
-                "committing watermark for job '{}' with expired lease (expired at {})",
-                key.job_id, expires
-            );
-        }
-
-        log::info!(
-            "job '{}' committing watermark -> {} (rows_extracted={}, window=({:?}, {:?}])",
-            key.job_id,
-            next,
-            stats.rows_extracted,
-            stats.window_lo,
-            stats.window_hi
-        );
-
-        let checkpoint = Checkpoint {
-            watermark_value: Some(next),
-            state: RunState::Committed,
-            run_id: None,
-            lease_expires_at: None,
-            updated_at: Utc::now(),
-            ..current
-        };
-
+        let now = Utc::now();
+        let split = checkpoint
+            .splits
+            .iter_mut()
+            .find(|s| s.split_id == split_id)
+            .ok_or_else(|| {
+                AppError::Checkpoint(format!(
+                    "unknown split '{split_id}' for job '{}'",
+                    key.job_id
+                ))
+            })?;
+        split.state = SplitState::Running;
+        split.updated_at = now;
+        checkpoint.updated_at = now;
         self.write_file(key, &checkpoint)
     }
 
-    async fn abandon(&self, key: &JobKey, run_id: Uuid, err: &str) -> Result<(), AppError> {
-        let current = match self.read_file(key)? {
+    async fn mark_completed(
+        &self,
+        key: &JobKey,
+        split_id: &str,
+        rows_extracted: u64,
+    ) -> Result<(), AppError> {
+        let mut checkpoint = self.read_file(key)?.ok_or_else(|| {
+            AppError::Checkpoint(format!("no checkpoint begun for job '{}'", key.job_id))
+        })?;
+        let now = Utc::now();
+        let split = checkpoint
+            .splits
+            .iter_mut()
+            .find(|s| s.split_id == split_id)
+            .ok_or_else(|| {
+                AppError::Checkpoint(format!(
+                    "unknown split '{split_id}' for job '{}'",
+                    key.job_id
+                ))
+            })?;
+        split.state = SplitState::Completed;
+        split.rows_extracted = rows_extracted;
+        split.error = None;
+        split.updated_at = now;
+        checkpoint.updated_at = now;
+        log::info!(
+            "job '{}' split '{split_id}' completed (rows_extracted={rows_extracted})",
+            key.job_id,
+        );
+        self.write_file(key, &checkpoint)
+    }
+
+    async fn mark_failed(&self, key: &JobKey, split_id: &str, err: &str) -> Result<(), AppError> {
+        let mut checkpoint = match self.read_file(key)? {
             Some(current) => current,
             None => return Ok(()),
         };
-
-        if current.run_id != Some(run_id) {
-            // Someone else already reclaimed or committed the lease; nothing to abandon.
-            return Ok(());
+        let now = Utc::now();
+        if let Some(split) = checkpoint
+            .splits
+            .iter_mut()
+            .find(|s| s.split_id == split_id)
+        {
+            log::warn!("job '{}' split '{split_id}' failed: {err}", key.job_id,);
+            split.state = SplitState::Failed;
+            split.error = Some(err.to_string());
+            split.updated_at = now;
+            checkpoint.updated_at = now;
+            self.write_file(key, &checkpoint)?;
         }
-
-        log::warn!("job '{}' abandoning run {}: {}", key.job_id, run_id, err);
-
-        let checkpoint = Checkpoint {
-            state: RunState::Failed,
-            run_id: None,
-            lease_expires_at: None,
-            updated_at: Utc::now(),
-            ..current
-        };
-
-        self.write_file(key, &checkpoint)
+        Ok(())
     }
 
-    async fn read(&self, key: &JobKey) -> Result<Option<Checkpoint>, AppError> {
+    async fn read(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError> {
         self.read_file(key)
+    }
+
+    async fn reset(&self, key: &JobKey) -> Result<(), AppError> {
+        let path = self.path_for(key);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| {
+                AppError::Checkpoint(format!("cannot reset {}: {e}", path.display()))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -268,130 +255,95 @@ mod tests {
         (store, dir)
     }
 
-    fn stats() -> RunStats {
-        RunStats {
-            rows_extracted: 10,
-            window_lo: None,
-            window_hi: None,
-        }
-    }
-
     #[tokio::test]
-    async fn test_acquire_commit_read_cycle() {
+    async fn test_begin_run_complete_cycle() {
         let (store, dir) = test_store();
         let key = JobKey::new("job_orders");
-        let run_id = Uuid::new_v4();
 
-        // Fresh job: no checkpoint yet, acquire starts clean with no watermark.
         assert!(store.read(&key).await.unwrap().is_none());
         let checkpoint = store
-            .acquire(&key, run_id, Duration::minutes(30), "updated_at")
+            .begin(&key, &["split-0".to_string(), "split-1".to_string()])
             .await
             .unwrap();
-        assert_eq!(checkpoint.state, RunState::Running);
-        assert_eq!(checkpoint.watermark_value, None);
+        assert_eq!(checkpoint.splits.len(), 2);
+        assert!(
+            checkpoint
+                .splits
+                .iter()
+                .all(|s| s.state == SplitState::Pending)
+        );
 
-        // Commit advances the watermark and clears the lease.
-        let hi = DateTime::<Utc>::from_timestamp(1000, 0).unwrap();
-        store.commit(&key, run_id, hi, stats()).await.unwrap();
+        store.mark_running(&key, "split-0").await.unwrap();
+        store.mark_completed(&key, "split-0", 10).await.unwrap();
 
         let checkpoint = store.read(&key).await.unwrap().unwrap();
-        assert_eq!(checkpoint.state, RunState::Committed);
-        assert_eq!(checkpoint.watermark_value, Some(hi));
-        assert_eq!(checkpoint.run_id, None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn test_double_acquire_live_lease_fails() {
-        let (store, dir) = test_store();
-        let key = JobKey::new("job_orders");
-
-        store
-            .acquire(&key, Uuid::new_v4(), Duration::minutes(30), "updated_at")
-            .await
+        let s0 = checkpoint
+            .splits
+            .iter()
+            .find(|s| s.split_id == "split-0")
             .unwrap();
+        assert_eq!(s0.state, SplitState::Completed);
+        assert_eq!(s0.rows_extracted, 10);
+        assert!(!checkpoint.all_completed());
 
-        // A second run while the lease is live must fail, not steal.
-        let err = store
-            .acquire(&key, Uuid::new_v4(), Duration::minutes(30), "updated_at")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("already running"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn test_expired_lease_reclaimed() {
-        let (store, dir) = test_store();
-        let key = JobKey::new("job_orders");
-
-        // Zero-second lease is already expired: the next acquire reclaims it.
-        store
-            .acquire(&key, Uuid::new_v4(), Duration::seconds(0), "updated_at")
-            .await
-            .unwrap();
+        // A retry preserves the completed split and re-queues the rest.
         let checkpoint = store
-            .acquire(&key, Uuid::new_v4(), Duration::minutes(30), "updated_at")
+            .begin(&key, &["split-0".to_string(), "split-1".to_string()])
             .await
             .unwrap();
-        assert_eq!(checkpoint.state, RunState::Running);
+        let s0 = checkpoint
+            .splits
+            .iter()
+            .find(|s| s.split_id == "split-0")
+            .unwrap();
+        assert_eq!(s0.state, SplitState::Completed);
+        assert_eq!(s0.rows_extracted, 10);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn test_commit_wrong_run_id_fails() {
+    async fn test_failed_split_can_retry() {
         let (store, dir) = test_store();
         let key = JobKey::new("job_orders");
-        let run_id = Uuid::new_v4();
 
-        store
-            .acquire(&key, run_id, Duration::minutes(30), "updated_at")
-            .await
-            .unwrap();
-
-        // A stale run committing under its own id must not clobber the lease holder.
-        let err = store
-            .commit(&key, Uuid::new_v4(), Utc::now(), stats())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("lost the lease"));
-
-        // The real holder still commits fine.
-        store
-            .commit(&key, run_id, Utc::now(), stats())
-            .await
-            .unwrap();
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn test_abandon_is_idempotent() {
-        let (store, dir) = test_store();
-        let key = JobKey::new("job_orders");
-        let run_id = Uuid::new_v4();
-
-        // Abandoning a job that was never acquired is a no-op, not an error.
-        store
-            .abandon(&key, run_id, "nothing to abandon")
-            .await
-            .unwrap();
-
-        store
-            .acquire(&key, run_id, Duration::minutes(30), "updated_at")
-            .await
-            .unwrap();
-        store.abandon(&key, run_id, "boom").await.unwrap();
+        store.begin(&key, &["split-0".to_string()]).await.unwrap();
+        store.mark_running(&key, "split-0").await.unwrap();
+        store.mark_failed(&key, "split-0", "boom").await.unwrap();
 
         let checkpoint = store.read(&key).await.unwrap().unwrap();
-        assert_eq!(checkpoint.state, RunState::Failed);
+        assert_eq!(checkpoint.splits[0].state, SplitState::Failed);
 
-        // Second abandon: lease already gone, still fine.
-        store.abandon(&key, run_id, "boom again").await.unwrap();
+        // Retry moves it back to Pending via begin, then Running again.
+        store.begin(&key, &["split-0".to_string()]).await.unwrap();
+        store.mark_running(&key, "split-0").await.unwrap();
+        store.mark_completed(&key, "split-0", 5).await.unwrap();
+        let checkpoint = store.read(&key).await.unwrap().unwrap();
+        assert!(checkpoint.all_completed());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_split_is_an_error() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+
+        store.begin(&key, &["split-0".to_string()]).await.unwrap();
+        let err = store.mark_completed(&key, "nope", 1).await.unwrap_err();
+        assert!(err.to_string().contains("unknown split"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_clears() {
+        let (store, dir) = test_store();
+        let key = JobKey::new("job_orders");
+
+        store.begin(&key, &["split-0".to_string()]).await.unwrap();
+        store.reset(&key).await.unwrap();
+        assert!(store.read(&key).await.unwrap().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2,6 +2,8 @@
 //!
 //! Duplicate timestamps, empty results, batch boundaries, projection, and
 //! date/timestamp fidelity — the "key scenarios" half of the testing strategy.
+//! Filtered extraction is caller-provided (full scan or explicit predicates);
+//! the reference oracle is always direct SQL against the same database.
 //! Run: `cargo test --test pg_edge` (requires the compose stack up;
 //! `DATABASE_URL` overrides the default endpoint).
 
@@ -9,7 +11,12 @@
 mod common;
 
 use chrono::{NaiveDate, TimeZone, Utc};
-use common::TestDb;
+use common::{TEST_PASSWORD_ENV, TestDb};
+use rust_ballista_extraction_layer::config::{
+    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
+    PushdownConfig, SinkConfig, SourceConfig,
+};
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
@@ -34,10 +41,52 @@ async fn extractor(db: &TestDb) -> Result<PostgresExtractor, sqlx::Error> {
     .await
 }
 
+fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
+    use rust_ballista_extraction_layer::config::{FilterEntry, FilterInput};
+    let filters = filters
+        .into_iter()
+        .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))
+        .collect();
+    JobConfig {
+        job_id: format!("edge-{}", db.schema),
+        table: "hostile".to_string(),
+        columns: None,
+        filters,
+        source: SourceConfig {
+            host: db.host.clone(),
+            port: db.port,
+            user: db.user.clone(),
+            password_env: TEST_PASSWORD_ENV.to_string(),
+            database: db.database.clone(),
+            pool_max: 4,
+            statement_timeout_ms: 300_000,
+            application_name: "relex-test".to_string(),
+            schema: db.schema.clone(),
+        },
+        sink: SinkConfig {
+            path: "/tmp/relex_test_sink".to_string(),
+        },
+        checkpoint: CheckpointConfig {
+            dir: std::env::temp_dir()
+                .join(format!("relex_edge_{}", db.schema))
+                .to_string_lossy()
+                .to_string(),
+        },
+        pushdown: PushdownConfig::default(),
+        parallel_scan: ParallelScanConfig::default(),
+        execution: ExecutionConfig::default(),
+        distributed: DistributedConfig {
+            scheduler_url: String::new(),
+            workers: 1,
+        },
+    }
+}
+
 #[tokio::test]
 async fn duplicate_timestamps_all_extracted() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
-    // Three rows sharing one updated_at: checkpoint windows are (lo, hi], never dedup.
+    // Three rows sharing one updated_at: filtered extraction never dedups —
+    // every row in the range comes back. Oracle: direct SQL over the same range.
     // Schema name is harness-generated (test_<pid>_<n>); audited static shape.
     let sql = format!(
         "INSERT INTO {}.hostile (name, updated_at) VALUES
@@ -51,27 +100,91 @@ async fn duplicate_timestamps_all_extracted() -> Result<(), Box<dyn std::error::
         .await
         .map_err(|e| format!("seed dups: {e}"))?;
 
-    let ex = extractor(&db).await?;
-    let lo = Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap();
-    let hi = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
-    let batch = ex
-        .extract_incremental_window(&db.table(), None, "updated_at", lo, hi)
+    let config = filtered_job(&db, vec!["id>8".to_string()]);
+    let batches = PostgresConnector::from_config(config)
+        .extract()
+        .standalone()
+        .collect()
         .await?;
-    assert_eq!(batch.num_rows(), 3);
-    assert_eq!(common::int64_col(&batch, "id"), vec![9, 10, 11]);
+    let mut ids = Vec::new();
+    for b in &batches {
+        ids.extend(common::int64_col(b, "id"));
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec![9, 10, 11]);
+
+    // Reference oracle: the same ids straight from Postgres.
+    let sql = format!(
+        "SELECT id FROM {}.hostile WHERE id > 8 ORDER BY id",
+        db.schema
+    );
+    let rows: Vec<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_all(&db.pool)
+        .await?;
+    assert_eq!(ids, rows.into_iter().map(|r| r.0).collect::<Vec<_>>());
     Ok(())
 }
 
 #[tokio::test]
-async fn empty_window_returns_empty_batch() -> Result<(), Box<dyn std::error::Error>> {
+async fn empty_filter_returns_empty_stream_with_schema() -> Result<(), Box<dyn std::error::Error>> {
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::prelude::{SessionContext, col, lit};
+    use futures::StreamExt;
+    use rust_ballista_extraction_layer::connector::postgres::table_provider::PostgresTableProvider;
+    use rust_ballista_extraction_layer::distributed::connection::PostgresConnectionDescriptor;
+    use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
+    use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
+    use rust_ballista_extraction_layer::pushdown::optimizer_rule::SourceAwarePushdownRule;
+    use std::sync::Arc;
+
     let db = live!();
-    let ex = extractor(&db).await?;
-    let lo = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
-    let hi = Utc.with_ymd_and_hms(2030, 2, 1, 0, 0, 0).unwrap();
-    let batch = ex
-        .extract_incremental_window(&db.table(), None, "updated_at", lo, hi)
-        .await?;
-    assert_eq!(batch.num_rows(), 0);
+    // Oracle: a filter matching nothing yields zero rows, but the stream still
+    // carries the table schema (`collect()` returns zero batches for empty
+    // results, so the schema must be read from the stream, not a batch).
+    let config = filtered_job(&db, vec![]);
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_optimizer_rule(Arc::new(SourceAwarePushdownRule))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
+    let provider = PostgresTableProvider::new(
+        descriptor,
+        &config.resolved_table(),
+        PushdownPolicy::parse(&config.pushdown.policy),
+        config.pushdown.deny.clone(),
+        config.pushdown.push.clone(),
+        CostParams {
+            max_source_cost: config.pushdown.max_source_cost,
+            keep_threshold: config.pushdown.keep_threshold,
+        },
+        config.pushdown.statistics_ttl_secs,
+        config.execution.batch_size,
+    )
+    .await
+    .map_err(|e| format!("provider: {e}"))?;
+    ctx.register_table("hostile", Arc::new(provider))
+        .map_err(|e| format!("register: {e}"))?;
+    let df = ctx
+        .table("hostile")
+        .await
+        .map_err(|e| format!("table: {e}"))?
+        .filter(col("id").gt(lit(1_000_000i64)))
+        .map_err(|e| format!("filter: {e}"))?;
+
+    let mut stream = df
+        .execute_stream()
+        .await
+        .map_err(|e| format!("stream: {e}"))?;
+    assert!(
+        stream.schema().index_of("id").is_ok(),
+        "empty result still carries the schema"
+    );
+    let mut rows = 0usize;
+    while let Some(batch) = stream.next().await {
+        rows += batch.map_err(|e| format!("batch: {e}"))?.num_rows();
+    }
+    assert_eq!(rows, 0);
     Ok(())
 }
 
@@ -79,11 +192,10 @@ async fn empty_window_returns_empty_batch() -> Result<(), Box<dyn std::error::Er
 async fn cursor_respects_batch_boundaries() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
     let ex = extractor(&db).await?;
-    let lo = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-    let hi = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
     // 8 rows at batch 3 -> [3, 3, 2]: batching cuts where it should, tail included.
+    // Keyset partition scan over the whole id space exercises the cursor/FETCH batching.
     let batches = ex
-        .extract_incremental_via_cursor(&db.table(), None, "updated_at", lo, hi, 3)
+        .extract_keyset_partition_via_cursor(&db.table(), None, "id", 0, 1_000_000, 3)
         .await?;
     let sizes: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
     assert_eq!(sizes, vec![3, 3, 2]);

@@ -1,274 +1,169 @@
 # Quickstart Guide
 
-Complete setup and usage guide for the Rust Extract Layer.
+Run the examples first — each one is a runnable demo of one layer capability.
+Setup takes a few minutes; every example below assumes it.
 
 ---
 
 ## Prerequisites
 
 - **Rust 1.98+** (toolchain managed via `rust-toolchain.toml`)
-- **Docker or Podman** (for benchmark/integration tests)
-- **PostgreSQL 17+** (for live testing)
+- **PostgreSQL 17+** with an `orders` table (seed via Docker, below)
+- Password exported: `export ORDERS_PG_PASSWORD=postgres`
 
----
-
-## Quick Start (TL;DR)
+### 1. Start Postgres with seed data
 
 ```bash
-# 1. Start a Postgres instance (Docker)
-docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:17
-
-# 2. Set password env var
-export ORDERS_PG_PASSWORD=postgres
-
-# 3. Run single-node extraction
-cargo run --bin rust-ballista-extraction-layer -- run \
-  --config examples/configs/extract.example.json
-```
-
----
-
-## Detailed Setup
-
-### 1. PostgreSQL
-
-**Option A: Docker (recommended for development)**
-
-```bash
-# Start with benchmark seed data (500 users, 20k orders)
 cd benchmark
 docker compose -f PostgresDB/compose.yaml up -d
-# Postgres available at localhost:5432, password: postgres
+# Postgres at localhost:5432, password: postgres (500 users, 20k orders)
 ```
 
-**Option B: Local installation**
+### 2. Point the examples at it
+
+Config-driven examples read connection + credentials from a job spec
+(`examples/configs/extract.example.json` → database `app`, password from
+`$ORDERS_PG_PASSWORD`):
 
 ```bash
-# Create database and user
-psql -c "CREATE DATABASE app;"
-psql -c "CREATE ROLE rel_extract LOGIN PASSWORD 'your_password';"
-psql -c "GRANT CONNECT ON DATABASE app TO rel_extract;"
-psql -d app -c "GRANT USAGE ON SCHEMA public TO rel_extract;"
-psql -d app -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO rel_extract;"
-psql -d app -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO rel_extract;"
-psql -c "GRANT pg_read_all_stats TO rel_extract;"  # for exact high watermark
+export ORDERS_PG_PASSWORD=postgres
 ```
 
-### 2. Build the Project
-
-```bash
-# Full release build (first time takes ~5-10 min; cargo-chef caches deps)
-cargo build --release --all-targets
-
-# Or just the binary
-cargo build --release --bin rust-ballista-extraction-layer
-```
-
-### 3. Configure Extraction
-
-Copy and edit the example config:
-
-```bash
-cp examples/configs/extract.example.json my-job.json
-# Edit host, password_env, table, incremental.column, etc.
-```
-
-**Key config fields:**
-
-| Field | Purpose |
-|-------|---------|
-| `source.host` / `port` | Postgres connection |
-| `source.password_env` | Env var name holding password (never inline passwords) |
-| `incremental.column` | Watermark column (must be `timestamptz`) |
-| `incremental.safety_lag_secs` | Seconds to subtract from `now()` for safety |
-| `incremental.max_window_secs` | Max window per incremental run |
-| `parallel_scan.strategy` | `keyset` (default) or `ctid` |
-| `parallel_scan.partitions` | Number of parallel partitions |
-| `pushdown.policy` | `always` / `never` / `cost_based` / `strict` / `hinted` |
+`full_extraction` and `parallel_extraction` instead hardcode
+`localhost:5432 / postgres / postgres / app` — no env needed, but no config either.
 
 ---
 
-## Running Extractions
+## Examples: run order and what each shows
 
-### Single-Node (in-process Ballista)
+Suggested path: `full` → `filtered` → `pipeline` → `dataframe` → `parallel` → `distributed` → `bench`.
 
-```bash
-# Full table load
-cargo run --bin rust-ballista-extraction-layer -- run \
-  --config my-job.json
-
-# Incremental window
-cargo run --bin rust-ballista-extraction-layer -- run \
-  --config my-job.json \
-  --filter "status = 'PAID'" \
-  --columns "order_id,amount,status"
-```
-
-### Distributed (Scheduler + Workers)
-
-**Terminal 1 - Scheduler:**
-```bash
-cargo run --bin rust-ballista-extraction-layer -- scheduler \
-  --scheduler-url http://localhost:50050 --bind-host 0.0.0.0
-```
-
-**Terminal 2..N - Workers:**
-```bash
-# Each worker on a separate machine or container
-cargo run --bin rust-ballista-extraction-layer -- worker \
-  --scheduler-url http://<scheduler-host>:50050 \
-  --bind-host 0.0.0.0 --external-host <worker-hostname>
-```
-
-**Terminal N+1 - Client:**
-```bash
-cargo run --bin rust-ballista-extraction-layer -- distribute \
-  --config my-job.json --workers 4 \
-  --scheduler-url http://localhost:50050
-```
-
-### Pushdown Plan Explanation
+### 1. `full_extraction` — the basic contract: DB → Arrow
 
 ```bash
-cargo run --bin rust-ballista-extraction-layer -- plan \
-  --config my-job.json \
-  --policy cost_based \
-  --filter "status = 'PAID'"
+cargo run --example full_extraction
 ```
 
-Output shows per-operator push/keep decisions with cost estimates.
+- **Inside:** `PostgresExtractor::connect` → `extract_full_table("public.orders", columns)` → one Arrow `RecordBatch` → prints schema + row/column counts.
+- **Showcases:** whole-table extraction, schema discovery/type mapping, row→Arrow conversion. No filters, no DataFusion, no checkpointing — the minimal end-to-end data contract.
+
+### 2. `filtered_extraction` — caller-provided predicates + pushdown preview
+
+```bash
+cargo run --example filtered_extraction
+```
+
+- **Inside:** loads `examples/configs/extract.example.json` → `explain_filters()` prints per-filter push/keep decisions → `connector.extract().standalone().collect()` → `.run()` for the checkpointed operational run.
+- **Showcases:** filters as orchestrator input (an OR-group plus time/user ranges), previewing *where* each predicate executes (source vs Arrow) before extracting, and `collect()` (data, no side effects) vs `run()` (split checkpointing).
+
+### 3. `pipeline_extraction` — the one builder every path uses
+
+```bash
+cargo run --example pipeline_extraction -- [config.json]   # default: full_extract.example.json
+```
+
+- **Inside:** `PostgresConnector::from_config_file` → `extract().standalone().collect()` → `extract().standalone().run()` → `extract().distributed().in_process().run()`.
+- **Showcases:** the fluent entry point the CLI (`rel run` / `rel distribute`) also funnels through. If you only read one example to learn the API surface, read this one.
+
+### 4. `dataframe_extraction` — DataFusion-native querying over the source
+
+```bash
+cargo run --example dataframe_extraction -- [config.json]  # default: extract.example.json
+```
+
+- **Inside:** `ExtractContext::from_config` → builder chain (`filter` → `select` → `with_column` → `limit` → `collect`) → then the SQL entry point (`SELECT COUNT(*) AS n FROM public.orders`) against the same registered table.
+- **Showcases:** filtering/projection/derived columns as DataFusion's job (not reimplemented), pushdown through the builder API, and that builder and SQL hit the same source (including the `COUNT(*)` empty-projection path).
+
+### 5. `parallel_extraction` — keyset partitioning mechanics
+
+```bash
+cargo run --example parallel_extraction
+```
+
+- **Inside:** `compute_keyset_partitions` (4 ranges over `order_id`) → one `tokio::spawn` per partition, each with its own extractor/connection → `extract_keyset_partition(lo, hi)` → combined row counts.
+- **Showcases:** non-overlapping `WHERE order_id >= lo AND order_id < hi` ranges (keyset, never `LIMIT/OFFSET`), per-partition connections, and the no-gaps/no-duplicates argument. Single-node parallelism; distribution is the next example.
+
+### 6. `distributed_extraction` — the same job spec on Ballista
+
+```bash
+cargo run --example distributed_extraction -- <config.json> [workers]  # default workers: 2
+```
+
+- **Inside:** `Pipeline::from_config` → in-process Ballista scheduler + executors → applies the config's filters through `filter_exprs_with_schema` (the shared choke point) + column projection → collects → writes `<sink.path>.parquet`.
+- **Showcases:** scaling out without scaling source load (each process opens only `pool_max / workers` connections), and that distributed extraction applies the *identical* filter semantics as standalone. Check the log line `pushed_filters=N`: pushed predicates run in Postgres, the rest filter in Ballista — both AND-correct.
+
+### 7. `bench_full_load` — the fair-benchmark harness (not a demo)
+
+```bash
+cargo run --release --example bench_full_load -- \
+  <config.json> <workers> <output.parquet> [filter_sql] [columns_csv] [scenario]
+# Remote cluster instead of standalone:
+BENCH_SCHEDULER_URL=http://host:port cargo run --release --example bench_full_load -- ...
+```
+
+- **Inside:** `DistributedContext` (standalone or remote, same code path) → raw `SELECT ... WHERE <filter_sql>` → `execute_stream()` straight into a Snappy Parquet writer → prints a JSON summary (`scan_ms` / `write_ms` / rows / batches) for `benchmark/run.sh`.
+- **Showcases:** benchmark comparability, not extraction features — raw SQL passthrough is deliberate so Spark runs the byte-identical predicate, and streaming keeps memory O(batch) at any row count. Normally invoked via `cd benchmark && ./run.sh --skip-scale --repeat 1`.
 
 ---
 
-## Backfill (Historical Load)
+## The job spec in 60 seconds
 
-```bash
-cargo run --bin rust-ballista-extraction-layer -- backfill \
-  --config my-job.json \
-  --namespace historical_load \
-  --from "2023-01-01T00:00:00Z" \
-  --to "2024-01-01T00:00:00Z"
-```
+`examples/configs/extract.example.json` is what the config-driven examples load:
 
-- Walks `[from, to]` in `max_window_secs`-bounded chunks
-- Each chunk: acquire lease → extract → commit watermark
-- Crash-safe: resumes from last committed chunk
+- `table` / `columns` — what to read (omitted `columns` = all).
+- `filters` — ANDed list; an inner array is an OR-group:
+  ```json
+  "filters": [
+    [{ "column": "status", "op": "=", "value": "PAID" },
+     { "column": "amount", "op": ">", "value": 100 }],
+    { "column": "updated_at", "op": ">=", "value": "2026-01-01T00:00:00Z" }
+  ]
+  ```
+  means `(status='PAID' OR amount>100) AND updated_at>=...`. Shorthand strings (`"status=PAID"`) work too and lower identically. Empty = full extraction.
+- `source.password_env` — env var name holding the password (never inline one).
+- `pushdown.policy` — `always` / `never` / `cost_based` (default) / `strict` / `hinted`.
+- `parallel_scan` / `execution.batch_size` / `distributed.workers` — splitting, FETCH size, executor count.
 
----
-
-## Benchmarks
-
-```bash
-cd benchmark
-
-# Full run (builds images, scales to 5M rows, 3 repeats)
-./run.sh --repeat 3
-
-# Smoke test on 20k seed (seconds)
-./run.sh --skip-scale --repeat 1
-
-# Skip builds, use local images
-./run.sh --no-build --repeat 3
-
-# Cleanup everything
-./run.sh --clean
-```
-
-**Key flags:**
-
-| Flag | Purpose |
-|------|---------|
-| `--repeat N` | Best-of-N runs (smooths JVM warmup) |
-| `--mode standalone\|distributed\|both` | Which Rust deployments to run |
-| `--batch-size N` | Spark JDBC fetchsize (Rust uses DataFusion streaming) |
-| `--spark-cores N` | Cap Spark parallelism (e.g., `--spark-cores 2` on small VMs) |
-| `--skip-correctness` | Skip DuckDB row-by-row check |
-
-Outputs in `benchmark/results/`:
-- `summary.md` — comparison table
-- `*.json` — per-run stats (CPU, RSS, elapsed, rows)
-- `correctness.json` — DuckDB row-by-row verification
+`full_extract.example.json` is the same shape with empty `filters` (full load).
 
 ---
 
-## Testing
+## CLI essentials (same paths as the examples)
 
 ```bash
-# Unit tests only (no DB, milliseconds)
-cargo test --lib
+# Full or filtered single-node run (+ optional CLI filters, ANDed with config filters)
+cargo run --bin rust-ballista-extraction-layer -- run --config my-job.json [--filter "status=PAID"]
 
-# Integration tests (needs live Postgres via DATABASE_URL)
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/app cargo test --test pg_
+# What will push to the source under a policy
+cargo run --bin rust-ballista-extraction-layer -- plan --config my-job.json --policy cost_based
 
-# E2E tests (needs live Postgres + running scheduler/workers)
-E2E_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/app \
-E2E_SCHEDULER_URL=http://localhost:50050 \
-cargo test --test e2e
+# Distributed: in-process by default, or point at a live scheduler
+cargo run --bin rust-ballista-extraction-layer -- distribute --config my-job.json --workers 4
 
-# All tests
-cargo test
+# Split checkpoints (execution progress only, never watermarks)
+cargo run --bin rust-ballista-extraction-layer -- checkpoint show --config my-job.json
+cargo run --bin rust-ballista-extraction-layer -- checkpoint reset --config my-job.json
 ```
-
-**Integration test suites (skip without DB):**
-
-| Test file | What it covers |
-|-----------|----------------|
-| `pg_numeric.rs` | Exact decimal decoding (123.45 → 12345) |
-| `pg_paths.rs` | Full ≡ incremental ≡ cursor path equality |
-| `pg_pushdown.rs` | `always` vs `never` differential |
-| `pg_distributed.rs` | Standalone collect over partitions |
-| `pg_edge.rs` | Dup timestamps, empty windows, batch boundaries |
-| `pg_catalog.rs` | Statistics/indexes/enums from live catalog |
-| `e2e.rs` | Full/incremental/selective/distributed over remote cluster |
 
 ---
 
-## Common Issues
+## Tests and benchmarks (pointers)
+
+```bash
+cargo test --lib                                  # unit, no DB
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/app cargo test --test pg_
+cd benchmark && ./run.sh --skip-scale --repeat 1  # smoke benchmark
+```
+
+Details live in `docs/testing-plan.md` and `benchmark/README.md`.
+
+---
+
+## Common issues
 
 | Problem | Solution |
 |---------|----------|
-| `password_env` not set | `export ORDERS_PG_PASSWORD=your_password` |
-| `max_window_secs` validation error | Must be ≥ 1 in config |
-| Backfill infinite loop | Config validation now rejects `max_window_secs=0` |
-| Spark OOM on small VM | Use `SPARK_DRIVER_MEM=1g ./run.sh --spark-cores 2` |
-| `pg_read_all_stats` missing | `GRANT pg_read_all_stats TO rel_extract;` or set `safety_lag_secs` higher |
-| Workers can't connect to scheduler | Ensure `--external-host` is reachable from workers |
-| Linker OOM during build | Docker Desktop → Settings → Resources → Memory: 4GB+ |
-
----
-
-## Architecture Overview
-
-```
-PostgreSQL ──► Cursor-based portal scans (sqlx)
-       │
-       ▼
-   Watermark resolution (pg_stat_activity.xact_start)
-       │
-       ▼
-   Pushdown decision (Exact/Inexact/Keep via cost model)
-       │
-       ▼
-   DataFusion LogicalPlan → PhysicalPlan (PostgresExecutionPlan)
-       │
-       ▼
-   Streaming RecordBatch (sqlx::query().fetch(), RowBatchBuilder)
-       │
-       ▼
-   Arrow IPC (standalone) or Ballista shuffle (distributed)
-       │
-       ▼
-   Sink (Parquet, DataFusion writers, or orchestrator)
-       │
-       ▼
-   Checkpoint commit (atomic JSON rename)
-```
-
----
-
-## Next Steps
-
-- Read the [Roadmap](docs/roadmap.md) for phased delivery status
-- Review [Pushdown](docs/pushdown.md) for fidelity/cost model details
-- See [PostgreSQL Connector](docs/connectors/postgres.md) for type mapping, partitioning, watermarks
-- Check [Testing Plan](docs/testing-plan.md) for test strategy
+| `password_env` / `ORDERS_PG_PASSWORD` not set | `export ORDERS_PG_PASSWORD=postgres` |
+| `batch_size` validation error | Must be ≥ 1 in config |
+| `SELECT COUNT(*)`-style queries fail | Fixed — empty-projection scans select a constant; update past this doc |
+| Linker `__eh_frame` warning on macOS | Toolchain noise, harmless |

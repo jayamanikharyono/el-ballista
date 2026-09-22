@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder};
 
 use crate::types::table_metadata::TableMetadata;
@@ -6,46 +5,15 @@ use crate::types::table_metadata::TableMetadata;
 pub struct PostgresQueryBuilder;
 
 impl PostgresQueryBuilder {
-    /// Builds `SELECT <cols> FROM <table> WHERE <ts> > :lo AND <ts> <= :hi` — the half-open
-    /// `[lo, hi]` window from docs/incremental-extraction.md §2. The low bound is strict and the
-    /// high bound is inclusive so consecutive windows neither overlap nor gap.
-    pub fn build_incremental(
-        query: &mut QueryBuilder<Postgres>,
-        table: &TableMetadata,
-        timestamp_column: &str,
-        lo: DateTime<Utc>,
-        hi: DateTime<Utc>,
-    ) {
-        query.push("SELECT ");
-
-        Self::push_columns(query, table);
-
-        query.push(" FROM ");
-
-        Self::push_identifier(query, &table.schema_name);
-
-        query.push(".");
-
-        Self::push_identifier(query, &table.table_name);
-
-        query.push(" WHERE ");
-
-        Self::push_identifier(query, timestamp_column);
-
-        query.push(" > ");
-
-        query.push_bind(lo);
-
-        query.push(" AND ");
-
-        Self::push_identifier(query, timestamp_column);
-
-        query.push(" <= ");
-
-        query.push_bind(hi);
-    }
-
     pub(crate) fn push_columns(query: &mut QueryBuilder<Postgres>, table: &TableMetadata) {
+        // Empty projection (DataFusion prunes the scan to zero columns for `COUNT(*)`,
+        // which only needs row counts): select a constant so the SQL stays valid.
+        // Values are never read — `RowBatchBuilder` only counts rows when there are
+        // no columns — so this changes no semantics, just minimal source I/O.
+        if table.columns.is_empty() {
+            query.push("1");
+            return;
+        }
         for (index, column) in table.columns.iter().enumerate() {
             if index > 0 {
                 query.push(", ");
@@ -126,7 +94,6 @@ impl PostgresQueryBuilder {
 mod tests {
     use super::*;
     use crate::types::ColumnMetadata;
-    use chrono::{TimeZone, Utc};
 
     fn orders_metadata() -> TableMetadata {
         TableMetadata {
@@ -165,27 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_incremental_shape() {
-        let table = orders_metadata();
-        let mut qb = QueryBuilder::<Postgres>::new("");
-        PostgresQueryBuilder::build_incremental(
-            &mut qb,
-            &table,
-            "updated_at",
-            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap(),
-        );
-
-        let sql_str = qb.sql();
-        let sql = sql_str.as_str();
-        // Half-open window with bound params, in order.
-        assert!(
-            sql.contains(r#"SELECT "order_id", "status"::text AS "status", "updated_at" FROM "public"."orders" WHERE "updated_at" > $1 AND "updated_at" <= $2"#),
-            "unexpected incremental SQL: {sql}"
-        );
-    }
-
-    #[test]
     fn test_build_full_table_shape() {
         let table = orders_metadata();
         let mut qb = QueryBuilder::<Postgres>::new("");
@@ -212,6 +158,25 @@ mod tests {
         assert!(
             sql.contains(r#"WHERE "order_id" >= $1 AND "order_id" < $2"#),
             "unexpected keyset SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_empty_projection_selects_constant() {
+        // DataFusion prunes `COUNT(*)` scans to zero columns; emitting nothing
+        // would produce `SELECT  FROM`, a Postgres syntax error.
+        let table = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![],
+        };
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT ");
+        PostgresQueryBuilder::push_columns(&mut qb, &table);
+        qb.push(" FROM ");
+        assert_eq!(
+            qb.sql().as_str(),
+            r#"SELECT 1 FROM "#,
+            "empty projection must select a constant"
         );
     }
 

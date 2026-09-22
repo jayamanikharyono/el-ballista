@@ -6,6 +6,13 @@ extraction job; nothing after it is required for the project to earn its keep.
 Each phase has **exit criteria** rather than dates, since this is a project that gets worked on in
 evenings.
 
+> **Scope note (Sep 2026):** the extraction layer now covers full/filtered extraction,
+> partitioning, split-execution checkpointing, and DataFusion/Ballista execution.
+> Watermark management, incremental state, backfill orchestration, and CDC are out of
+> scope — the orchestrator expresses those as caller-provided filter predicates.
+> Phase descriptions below are historical; backfill/watermark items are deferred to
+> `deferred/incremental-extraction.md`.
+
 ---
 
 ## Phase 1 — Single-node PostgreSQL Extraction
@@ -20,16 +27,17 @@ or Ballista (ParquetWriter, CSVWriter, etc.) or by the orchestrator.
 
 - PostgreSQL connector: schema resolution, **cursor-based portal scans**, type mapping,
   streaming decode into Arrow builders
-- Incremental extraction in `timestamp` mode with the exact
-  [safe high watermark](connectors/postgres.md#52-the-safe-high-watermark)
-- Checkpoint store (local filesystem, atomic rename semantics) with leases and run history
+- Full and filtered extraction (caller-provided predicates; timestamp watermark mode deferred
+  to [deferred/incremental-extraction.md](deferred/incremental-extraction.md))
+- Split-execution checkpoint store (local filesystem, atomic rename semantics): per-split
+  `Pending`/`Running`/`Completed`/`Failed`, retry skips completed splits
 - Projection and filter pushdown with `Exact`/`Inexact` fidelity rules — cost model not yet, policy
   is `always` for safe predicates
 - Arrow output (RecordBatch streams) to be consumed by DataFusion, Ballista, or orchestrator
 - `rel run`, `rel plan`, `rel checkpoint` CLI commands
 - Structured logging
 
-**Exit criteria.** A real table extracts incrementally on a schedule for two weeks without
+**Exit criteria.** A real table extracts on a schedule for two weeks without
 intervention. The differential correctness suite from
 [pushdown §6](pushdown.md#6-verification-strategy) passes against the hostile-value fixture. A
 killed process mid-run resumes without duplicating or losing a row. Arrow output is verified
@@ -45,7 +53,6 @@ The engine gets a usable front end, and pushdown becomes a decision rather than 
 
 ```rust
 let df = ctx.source("orders_pg", "public.orders")
-    .incremental(Watermark::timestamp("updated_at"))
     .filter(col("status").eq(lit("PAID")))
     .select(vec![col("order_id"), col("amount")])
     .with_column("amount_usd", col("amount") * lit(rate));
@@ -59,7 +66,7 @@ let batches = df.collect().await?;
   the `always` / `never` / `cost_based` / `hinted` policy modes
 - `rel plan --explain` printing per-operator push/keep decisions and their reasoning
 - Parallel scan: `keyset` and `ctid` partition strategies (exported snapshots for atomic parallel scans **deferred**)
-- Backfill orchestration with chunking and a separate checkpoint namespace
+- Backfill orchestration with chunking and a separate checkpoint namespace (DEFERRED — out of scope; backfills are caller-provided historical ranges)
 - Arrow RecordBatch output for consumption by DataFusion writers or orchestrator
 
 **Exit criteria.** For at least one real table, `cost_based` demonstrably chooses differently from
@@ -93,7 +100,7 @@ rather than `O(total_rows)`.
 - Yield `RecordBatch` incrementally as stream items
 - Memory bounded to `O(batch_size + driver buffering)`, not `O(total_rows)`
 - Preserve existing query building, type mappings, error handling
-- Support all existing pushed predicates: watermark, filters, projection, limit
+- Support all existing pushed predicates: filters, projection, limit
 - Configurable `batch_size` (default 8192 rows)
 - Test with multiple batches, empty results, partial final batches
 
@@ -126,7 +133,7 @@ Ballista adds a scheduler and workers over DataFusion, using Arrow IPC for shuff
 DataFusion's version numbering.
 
 - Ballista deployment: scheduler, workers, and the distribution of source partitions across them
-- Serializable physical plans, including our `SourceScanExec`
+- Serializable physical plans, including our `PostgresExecutionPlan`
 - Connection-pool coordination so N workers do not collectively open N × pool_max connections to a
   production database — the constraint that matters most and the one Ballista knows nothing about
 
@@ -149,13 +156,16 @@ is the right second connector because it is *worse* at everything Postgres does 
 export, no exportable snapshot, opt-in histograms, unrepresentable values. If the SPI survives
 MySQL, it will survive anything.
 
-**NOT YET IMPLEMENTED.** MySQL connector per [its detailed plan](connectors/mysql.md), including:
+**Prototype only.** `src/connector/mysql/` is a walking skeleton (connect, `information_schema`
+schema reading, full-table extraction to typed Arrow — no pushdown, no parallel/distributed
+execution). The full connector per [its detailed plan](connectors/mysql.md) is not implemented,
+including:
   - Collation fidelity rules (binary vs. `utf8_unicode_ci` vs. `utf8mb4_general_ci`)
   - Zero-date handling (`0000-00-00` → NULL / error / custom mapping)
   - Replica lag bounding (GTIDs, `Seconds_Behind_Master` monitoring)
-  - Safe high watermark from `SHOW PROCESSLIST` instead of `pg_stat_activity`
   - Streaming LIMIT-OFFSET pagination instead of exported snapshots
   - Type mapping for MySQL-specific types (ENUM, SET, JSON, GEOMETRY)
+  - Watermark anchoring from `SHOW PROCESSLIST` (deferred with all watermark work)
 
 **Exit criteria (when implemented).** The MySQL differential correctness suite passes, including collation fidelity
 (`_ci`, `_cs`, `_bin`). Zero-date handling is correctly configurable. Replica lag is bounded and
@@ -184,6 +194,7 @@ not part of this project's scope:
 | --- | --- | --- |
 | [Python wrapper](python-bindings.md) | **NOT IMPLEMENTED** (placeholder design) | Not part of core extraction engine. Placeholder design exists so the Rust API stays bindable |
 | Cross-source joins | **NOT IMPLEMENTED** | Better handled by orchestrator or DataFusion, not part of extraction scope |
+| Watermark management, incremental state, backfill orchestration, CDC | **OUT OF SCOPE** | Orchestrator concern; expressed as caller-provided filter predicates via filtered extraction |
 | Log-based CDC ([Postgres](connectors/postgres.md#8-future-logical-replication-cdc), [MySQL](connectors/mysql.md#9-future-binlog-cdc)) | **NOT IMPLEMENTED** | Replication slots and binlog retention are operational footguns |
 | Aggregate and join pushdown | **NOT IMPLEMENTED** | High translation risk, low value for extraction workloads |
 | Additional connectors (ScyllaDB, MongoDB, SQL Server) | **NOT IMPLEMENTED** | Wait for second connector proof of concept (MySQL) first |

@@ -17,6 +17,11 @@ name: rbel-test
 services:
   postgres:
     image: postgres:17
+    # Hardcoded test budget (same rule as benchmark bench-pg): cores 4-5 + 2g RAM.
+    # A shared fixture must never change shape between runs.
+    #cpuset: '4-5' enable when benchmark
+    #cpus: 1
+    #mem_limit: 1g
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -36,6 +41,9 @@ services:
       retries: 90
   mysql:
     image: mysql:8.0
+    #cpuset: '4-5' enable when benchmark
+    #cpus: 1
+    #mem_limit: 1g
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: test

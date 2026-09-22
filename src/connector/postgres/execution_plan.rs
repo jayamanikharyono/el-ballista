@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
-use chrono::{DateTime, Utc};
 use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
@@ -36,8 +35,6 @@ pub struct PostgresExecutionPlanModel {
     pub table_metadata: TableMetadata,
     pub pushed_filters: Vec<Predicate>,
     pub pushed_limit: Option<usize>,
-    pub watermark_column: Option<String>,
-    pub window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub batch_size: usize,
     pub partitions: Vec<ScanPartition>,
     /// Debug identity for the SQL comment tag (see `connector::query_tag`) — carried across
@@ -62,8 +59,6 @@ pub struct PostgresExecutionPlan {
     properties: Arc<PlanProperties>,
     pushed_filters: Vec<Predicate>,
     pushed_limit: Option<usize>,
-    watermark_column: Option<String>,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     batch_size: usize,
     partitions: Vec<ScanPartition>,
     query_session: QuerySession,
@@ -77,8 +72,6 @@ impl PostgresExecutionPlan {
         schema: Arc<Schema>,
         pushed_filters: Vec<Predicate>,
         pushed_limit: Option<usize>,
-        watermark_column: Option<String>,
-        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
         batch_size: usize,
         partitions: Vec<ScanPartition>,
         run_id: String,
@@ -117,8 +110,6 @@ impl PostgresExecutionPlan {
             properties,
             pushed_filters,
             pushed_limit,
-            watermark_column,
-            window,
             batch_size,
             partitions,
             query_session,
@@ -138,8 +129,6 @@ impl PostgresExecutionPlan {
             table_metadata: self.table_metadata.clone(),
             pushed_filters: self.pushed_filters.clone(),
             pushed_limit: self.pushed_limit,
-            watermark_column: self.watermark_column.clone(),
-            window: self.window,
             batch_size: self.batch_size,
             partitions: self.partitions.clone(),
             run_id: self.query_session.run_id().to_string(),
@@ -156,8 +145,6 @@ impl PostgresExecutionPlan {
             schema,
             model.pushed_filters,
             model.pushed_limit,
-            model.watermark_column,
-            model.window,
             model.batch_size,
             model.partitions,
             model.run_id,
@@ -168,13 +155,13 @@ impl PostgresExecutionPlan {
     /// backend-neutral [`Predicate::render_to`] into a Postgres sink, which binds each literal
     /// at render position (sqlx `push_bind` appends `$n` inline, so text and numbering align
     /// by construction); a MySQL connector would render the same way into its own sink. The
-    /// watermark window is the half-open `[lo, hi]` from docs/incremental-extraction.md §2,
-    /// and the partition bounds (composed in parallel.rs from source min/max queries) are
-    /// inlined.
+    /// partition bounds (composed in parallel.rs from source min/max queries) are inlined.
+    /// Caller-provided filter ranges arrive as ordinary pushed predicates — the extraction
+    /// layer never manages watermarks itself.
     ///
     /// [`Predicate::render_to`]: crate::pushdown::Predicate::render_to
     pub(crate) fn build_query(&self, partition_idx: usize) -> QueryBuilder<Postgres> {
-        use crate::pushdown::dialect::{PostgresDialect, SqlDialect};
+        use crate::pushdown::dialect::PostgresDialect;
         use crate::pushdown::{PgParamSink, SqlParam, SqlSink};
 
         let dialect = PostgresDialect;
@@ -183,14 +170,10 @@ impl PostgresExecutionPlan {
         // (pg_stat_activity, pg_stat_statements, logs) without cross-referencing anything
         // in this process. `strategy` names the scan shape; `partition` (1-based) is
         // included only when this table is actually split across more than one scan.
-        let strategy = match (
-            self.watermark_column.is_some(),
-            self.pushed_filters.is_empty(),
-        ) {
-            (true, true) => "incremental",
-            (true, false) => "incremental+pushdown",
-            (false, true) => "full",
-            (false, false) => "full+pushdown",
+        let strategy = if self.pushed_filters.is_empty() {
+            "full"
+        } else {
+            "full+pushdown"
         };
         let mut tag = self.query_session.tag(strategy);
         if self.partitions.len() > 1 {
@@ -212,19 +195,6 @@ impl PostgresExecutionPlan {
         {
             let sink = &mut sink;
             let mut conditions = 0u8;
-
-            if let (Some(column), Some((lo, hi))) = (&self.watermark_column, self.window) {
-                sink.push_sql(" WHERE ");
-                conditions = 1;
-
-                sink.push_sql(&dialect.quote_ident(column));
-                sink.push_sql(" > ");
-                sink.push_param(SqlParam::Timestamp(lo));
-                sink.push_sql(" AND ");
-                sink.push_sql(&dialect.quote_ident(column));
-                sink.push_sql(" <= ");
-                sink.push_param(SqlParam::Timestamp(hi));
-            }
 
             for predicate in &self.pushed_filters {
                 if conditions == 0 {
@@ -274,11 +244,10 @@ impl DisplayAs for PostgresExecutionPlan {
             | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "PostgresExecutionPlan: table={} pushed_filters={} limit={:?} watermark={:?} partitions={}",
+                    "PostgresExecutionPlan: table={} pushed_filters={} limit={:?} partitions={}",
                     self.table_metadata.table_name,
                     self.pushed_filters.len(),
                     self.pushed_limit,
-                    self.watermark_column,
                     self.partitions.len(),
                 )
             }
@@ -404,8 +373,6 @@ mod tests {
 
     #[test]
     fn test_build_query_binds_in_placeholder_order() {
-        use chrono::TimeZone;
-
         let schema = Arc::new(Schema::empty());
         let table_metadata = TableMetadata {
             schema_name: "public".to_string(),
@@ -423,11 +390,6 @@ mod tests {
                 right: Box::new(Predicate::Literal(Literal::Text("PAID".to_string()))),
             }],
             Some(100),
-            Some("updated_at".to_string()),
-            Some((
-                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-                Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap(),
-            )),
             8192,
             vec![],
             "test-run".to_string(),
@@ -436,26 +398,20 @@ mod tests {
 
         let sql = plan.build_query(0).sql();
         let sql = sql.as_str();
-        // Window bounds first ($1, $2), then the pushed filter ($3), then the limit ($4):
+        // Pushed filter first ($1), then the limit ($2):
         // binds happen in exactly placeholder order, so `$n` always means `params[n - 1]`.
         assert!(
-            sql.contains(r#""updated_at" > $1 AND "updated_at" <= $2"#),
-            "window placeholders first, got: {sql}"
+            sql.contains(r#"("status" = $1)"#),
+            "filter placeholder first, got: {sql}"
         );
         assert!(
-            sql.contains(r#"("status" = $3)"#),
-            "filter placeholder third, got: {sql}"
-        );
-        assert!(
-            sql.contains("LIMIT $4"),
+            sql.contains("LIMIT $2"),
             "limit placeholder last, got: {sql}"
         );
     }
 
     #[test]
     fn test_build_query_is_tagged_with_debug_comment() {
-        use chrono::TimeZone;
-
         // The debug SQL comment tag (connector::query_tag) must actually be there, with the
         // right strategy/pipeline defaults, so it's visible in pg_stat_activity as intended
         // -- this isn't optional decoration, it was the whole point of adding it.
@@ -471,11 +427,6 @@ mod tests {
             schema,
             vec![],
             None,
-            Some("updated_at".to_string()),
-            Some((
-                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-                Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap(),
-            )),
             8192,
             vec![],
             "r_fixedtest".to_string(),
@@ -494,8 +445,8 @@ mod tests {
             "must carry the caller-supplied run_id, got: {sql}"
         );
         assert!(
-            sql.contains("strategy=incremental"),
-            "watermark set, no pushed filters, got: {sql}"
+            sql.contains("strategy=full"),
+            "no pushed filters means a full scan, got: {sql}"
         );
         assert!(
             !sql.contains("partition="),
@@ -531,8 +482,6 @@ mod tests {
             schema,
             vec![],
             None,
-            None,
-            None,
             8192,
             partitions,
             "r_fixedtest".to_string(),
@@ -542,6 +491,37 @@ mod tests {
         // 1-based partition index in the tag, out of the total partition count.
         assert!(plan.build_query(0).sql().as_str().contains("partition=1/2"));
         assert!(plan.build_query(1).sql().as_str().contains("partition=2/2"));
+    }
+
+    #[test]
+    fn test_empty_projection_selects_constant() {
+        // `COUNT(*)` prunes the scan to zero columns: the query must stay valid
+        // SQL (`SELECT 1`, not `SELECT  FROM`), with pushed filters/limits still
+        // applied. Row values are never read downstream — only row counts.
+        use crate::types::TableMetadata;
+        let schema = Arc::new(Schema::empty());
+        let table_metadata = TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "orders".to_string(),
+            columns: vec![],
+        };
+        let plan = PostgresExecutionPlan::try_new(
+            None,
+            table_metadata,
+            schema,
+            vec![],
+            None,
+            8192,
+            vec![],
+            "test-run".to_string(),
+        )
+        .unwrap();
+        let sql = plan.build_query(0).sql();
+        let sql = sql.as_str();
+        assert!(
+            sql.contains(r#"SELECT 1 FROM "public"."orders""#),
+            "empty projection must select a constant, got: {sql}"
+        );
     }
 
     #[test]
@@ -559,8 +539,6 @@ mod tests {
             schema,
             vec![],
             Some(10),
-            Some("updated_at".to_string()),
-            None,
             8192,
             vec![],
             "test-run".to_string(),
@@ -590,8 +568,6 @@ mod tests {
             schema.clone(),
             vec![],
             None,
-            None,
-            None,
             8192,
             vec![],
             "test-run".to_string(),
@@ -615,8 +591,6 @@ mod tests {
             table_metadata,
             schema,
             vec![],
-            None,
-            None,
             None,
             8192,
             partitions,

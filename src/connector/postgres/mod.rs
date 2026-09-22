@@ -11,7 +11,6 @@ pub mod table_provider;
 // Relocated under the Postgres connector (AGENTS.md: all Postgres code lives here).
 pub mod distributed;
 pub mod engine;
-pub mod incremental;
 pub mod pipeline;
 
 // Fluent extraction entry point: `PostgresConnector::from_config(cfg).extract().standalone()/.distributed()`.

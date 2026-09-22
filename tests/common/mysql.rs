@@ -78,7 +78,9 @@ impl MySqlTestDb {
         // Machine-generated identifier, safe by construction; assert it anyway so a future
         // refactor can't turn this into an injection sink.
         assert!(
-            db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            db_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "unsafe database name"
         );
         sqlx::query(sqlx::AssertSqlSafe(
@@ -102,7 +104,9 @@ impl MySqlTestDb {
             .acquire_timeout(Duration::from_secs(30))
             .connect_with(test_options)
             .await
-            .unwrap_or_else(|e| panic!("MySqlTestDb: cannot connect to per-test db {db_name}: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("MySqlTestDb: cannot connect to per-test db {db_name}: {e}")
+            });
 
         let db = Self {
             pool: test_pool,

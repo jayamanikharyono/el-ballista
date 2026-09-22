@@ -10,8 +10,8 @@ mod common;
 
 use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, ExtractionMode, IncrementalConfig, JobConfig,
-    ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
+    PushdownConfig, SinkConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::distributed::DistributedContext;
 
@@ -28,6 +28,7 @@ fn job_for(db: &TestDb, policy: &str) -> JobConfig {
         job_id: "pushdown_diff".to_string(),
         table: "hostile".to_string(),
         columns: None,
+        filters: Vec::new(),
         source: SourceConfig {
             host: db.host.clone(),
             port: db.port,
@@ -38,12 +39,6 @@ fn job_for(db: &TestDb, policy: &str) -> JobConfig {
             statement_timeout_ms: 300_000,
             application_name: "relex-test".to_string(),
             schema: db.schema.clone(),
-        },
-        mode: ExtractionMode::Incremental,
-        incremental: IncrementalConfig {
-            column: "updated_at".to_string(),
-            safety_lag_secs: 300,
-            max_window_secs: 21600,
         },
         sink: SinkConfig {
             path: "/tmp/relex_test_sink".to_string(),

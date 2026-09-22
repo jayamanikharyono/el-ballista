@@ -1,15 +1,15 @@
-//! Phase 2 DataFrame front end: the same job spec `rel run` uses, driven through
+//! DataFrame front end: the same job spec `rel run` uses, driven through
 //! `ExtractContext` instead of the CLI.
 //!
 //!   cargo run --example dataframe_extraction -- <config.json>
 //!
 //! Registers the table with a cost-aware provider (statistics + EXPLAIN cache feed the
-//! pushdown decisions), resolves the incremental window from the checkpoint store, and
-//! collects the filtered projection as Arrow RecordBatches.
+//! pushdown decisions) and collects the filtered projection as Arrow RecordBatches.
+//! Filtering is caller-provided — full extraction or explicit predicates, never watermarks.
 
 use datafusion::prelude::{col, lit};
 use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::engine::{ExtractContext, Watermark};
+use rust_ballista_extraction_layer::engine::ExtractContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,15 +21,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "examples/configs/extract.example.json".to_string());
     let config = JobConfig::from_file(&config_path)?;
-    let watermark_column = config.incremental.column.clone();
 
     let ctx = ExtractContext::from_config(config).await?;
 
-    // Same builder shape as docs/roadmap.md Phase 2.
+    // Same builder shape as docs/roadmap.md Phase 2, minus watermarks.
     let batches = ctx
         .source("postgres", "public.orders")
-        .await?
-        .incremental(Watermark::timestamp(&watermark_column))
         .await?
         .filter(col("status").eq(lit("PAID")))?
         .select(vec![col("order_id"), col("amount")])?

@@ -210,6 +210,8 @@ mod tests {
             deny: vec![],
             push: vec![],
             batch_size: 8192,
+            use_copy: false,
+            max_batch_bytes: 16 * 1024 * 1024,
             parallel_workers: 1,
             partition_column: None,
             strategy: crate::connector::postgres::parallel::ParallelStrategy::None,

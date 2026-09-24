@@ -149,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "table": table,
             "filter": filter_sql,
             "projection": projection,
+            "use_copy": config.execution.use_copy,
             "workers": workers,
             "rows": rows,
             "batches": n_batches,

@@ -120,6 +120,8 @@ mod tests {
             pushed_filters: vec![],
             pushed_limit: None,
             batch_size: 8192,
+            use_copy: false,
+            max_batch_bytes: 16 * 1024 * 1024,
             partitions: vec![],
             run_id: "r_test".to_string(),
         };

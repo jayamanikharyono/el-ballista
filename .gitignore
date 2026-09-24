@@ -53,3 +53,7 @@ benchmark/output/
 # benchmark/rust/bench-config.json template, which is tracked: the Docker build
 # fallback and the config file test both read it)
 benchmark/bench-config.json
+
+
+Claude outputs/
+scripts/verify-review.sh

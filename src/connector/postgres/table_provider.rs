@@ -23,6 +23,11 @@ use crate::types::TableMetadata;
 
 use super::{row_adapter::PostgresRowAdapter, schema_reader::PostgresSchemaReader};
 
+/// Default byte cap per flushed Arrow batch (16 MiB).
+fn default_provider_batch_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
 /// The serializable form of a `PostgresTableProvider` — what the codec embeds in the logical
 /// plan the `rel distribute` client sends to the scheduler (see `distributed::table_codec`).
 /// The scheduler and every executor rebuild the provider from this model; only the descriptor is
@@ -36,6 +41,12 @@ pub struct PostgresTableProviderModel {
     #[serde(default)]
     pub push: Vec<String>,
     pub batch_size: usize,
+    /// Byte cap per flushed Arrow batch. Defaults for old serialized plans.
+    #[serde(default = "default_provider_batch_bytes")]
+    pub max_batch_bytes: usize,
+    /// Prefer binary COPY over cursor SELECT when the scan shape allows it.
+    #[serde(default)]
+    pub use_copy: bool,
     pub parallel_workers: usize,
     pub partition_column: Option<String>,
     #[serde(default)]
@@ -78,6 +89,8 @@ pub struct PostgresTableProvider {
     /// they push everything translatable, preserving Phase 4 behavior.
     cost_enabled: bool,
     batch_size: usize,
+    max_batch_bytes: usize,
+    use_copy: bool,
     parallel_workers: usize,
     partition_column: Option<String>,
     strategy: ParallelStrategy,
@@ -160,6 +173,8 @@ impl PostgresTableProvider {
             estimator: Some(estimator),
             cost_enabled: true,
             batch_size,
+            max_batch_bytes: default_provider_batch_bytes(),
+            use_copy: false,
             parallel_workers: 1,
             partition_column: None,
             strategy: ParallelStrategy::None,
@@ -199,6 +214,8 @@ impl PostgresTableProvider {
             estimator: None,
             cost_enabled: false,
             batch_size: model.batch_size,
+            max_batch_bytes: model.max_batch_bytes.max(1),
+            use_copy: model.use_copy,
             parallel_workers: model.parallel_workers,
             partition_column: model.partition_column,
             strategy: model.strategy,
@@ -213,6 +230,8 @@ impl PostgresTableProvider {
             deny: self.deny.clone(),
             push: self.push.clone(),
             batch_size: self.batch_size,
+            max_batch_bytes: self.max_batch_bytes,
+            use_copy: self.use_copy,
             parallel_workers: self.parallel_workers,
             partition_column: self.partition_column.clone(),
             strategy: self.strategy,
@@ -244,6 +263,20 @@ impl PostgresTableProvider {
     /// are deferred — see `parallel.rs` — so prefer keyset for hot tables.
     pub fn with_parallel_strategy(mut self, strategy: ParallelStrategy) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Override the per-batch byte cap (from `execution.max_batch_bytes`). Builder-style
+    /// so `new()`'s signature stays stable.
+    pub fn with_max_batch_bytes(mut self, max_batch_bytes: usize) -> Self {
+        self.max_batch_bytes = max_batch_bytes.max(1);
+        self
+    }
+
+    /// Prefer binary COPY over cursor SELECT when the scan shape allows it
+    /// (from `execution.use_copy`). Builder-style, same stability rationale.
+    pub fn with_use_copy(mut self, use_copy: bool) -> Self {
+        self.use_copy = use_copy;
         self
     }
 
@@ -600,7 +633,11 @@ impl TableProvider for PostgresTableProvider {
             self.batch_size,
             partitions,
             crate::connector::query_tag::fresh_run_id(),
-        )?;
+        )
+        .map(|plan| {
+            plan.with_max_batch_bytes(self.max_batch_bytes)
+                .with_use_copy(self.use_copy)
+        })?;
 
         Ok(Arc::new(plan))
     }
@@ -646,6 +683,8 @@ mod tests {
             deny: vec![],
             push: vec![],
             batch_size: 8192,
+            use_copy: false,
+            max_batch_bytes: 16 * 1024 * 1024,
             parallel_workers: 1,
             partition_column: None,
             strategy: ParallelStrategy::None,

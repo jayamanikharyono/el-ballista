@@ -25,10 +25,23 @@ use crate::distributed::pool_registry::registry;
 use crate::pushdown::Predicate;
 use crate::types::table_metadata::TableMetadata;
 
+/// Default byte cap per Arrow batch flushed by executor tasks (16 MiB).
+pub(crate) const DEFAULT_EXEC_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+fn default_exec_batch_bytes() -> usize {
+    DEFAULT_EXEC_BATCH_BYTES
+}
+
 /// The serializable form of a `PostgresExecutionPlan` — what gets embedded in the Ballista
 /// physical plan sent from the scheduler to each executor (see `distributed::plan_codec`).
 /// Passwords never travel here: only the descriptor carries the password's environment
 /// variable name, resolved at pool-creation time in the executing process.
+///
+/// CHECKPOINT OWNERSHIP: executor tasks (this plan's `execute`) never touch any
+/// `CheckpointStore`. They stream `RecordBatch`es back to the driver; the driver alone
+/// aggregates per-partition status (rows / watermark) and persists checkpoints through
+/// its background, non-blocking writer (`checkpoint::progress`). This keeps exactly one
+/// writer per job and workers never block on file I/O.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresExecutionPlanModel {
     pub descriptor: PostgresConnectionDescriptor,
@@ -36,6 +49,13 @@ pub struct PostgresExecutionPlanModel {
     pub pushed_filters: Vec<Predicate>,
     pub pushed_limit: Option<usize>,
     pub batch_size: usize,
+    /// Byte cap per flushed batch. `#[serde(default)]` keeps old serialized plans readable.
+    #[serde(default = "default_exec_batch_bytes")]
+    pub max_batch_bytes: usize,
+    /// Prefer `COPY … TO STDOUT (FORMAT BINARY)` over cursor `SELECT` when the scan
+    /// shape allows it (no pushed filters). `#[serde(default)]` keeps old plans readable.
+    #[serde(default)]
+    pub use_copy: bool,
     pub partitions: Vec<ScanPartition>,
     /// Debug identity for the SQL comment tag (see `connector::query_tag`) — carried across
     /// the wire so every executor tags its partition's query with the *same* run_id the
@@ -60,8 +80,19 @@ pub struct PostgresExecutionPlan {
     pushed_filters: Vec<Predicate>,
     pushed_limit: Option<usize>,
     batch_size: usize,
+    max_batch_bytes: usize,
+    use_copy: bool,
     partitions: Vec<ScanPartition>,
     query_session: QuerySession,
+}
+
+/// How a `LIMIT` renders: bound (`$n`, for `SELECT`) or inlined (for `COPY`,
+/// which accepts no bind parameters — the value is a `usize` this crate computed,
+/// never user text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitRender {
+    Bind,
+    Inline,
 }
 
 impl PostgresExecutionPlan {
@@ -111,9 +142,25 @@ impl PostgresExecutionPlan {
             pushed_filters,
             pushed_limit,
             batch_size,
+            max_batch_bytes: DEFAULT_EXEC_BATCH_BYTES,
+            use_copy: false,
             partitions,
             query_session,
         })
+    }
+
+    /// Override the byte cap after construction (e.g. from `execution.max_batch_bytes`).
+    /// Builder-style so `try_new`'s signature — and every existing call site — stays stable.
+    pub fn with_max_batch_bytes(mut self, max_batch_bytes: usize) -> Self {
+        self.max_batch_bytes = max_batch_bytes.max(1);
+        self
+    }
+
+    /// Prefer binary `COPY` over cursor `SELECT` when the scan shape allows it.
+    /// Builder-style, same stability rationale as [`Self::with_max_batch_bytes`].
+    pub fn with_use_copy(mut self, use_copy: bool) -> Self {
+        self.use_copy = use_copy;
+        self
     }
 
     pub fn to_model(&self) -> DataFusionResult<PostgresExecutionPlanModel> {
@@ -130,6 +177,8 @@ impl PostgresExecutionPlan {
             pushed_filters: self.pushed_filters.clone(),
             pushed_limit: self.pushed_limit,
             batch_size: self.batch_size,
+            max_batch_bytes: self.max_batch_bytes,
+            use_copy: self.use_copy,
             partitions: self.partitions.clone(),
             run_id: self.query_session.run_id().to_string(),
         })
@@ -149,6 +198,10 @@ impl PostgresExecutionPlan {
             model.partitions,
             model.run_id,
         )
+        .map(|plan| {
+            plan.with_max_batch_bytes(model.max_batch_bytes)
+                .with_use_copy(model.use_copy)
+        })
     }
 
     /// Assembles the `WHERE`/`LIMIT` for one partition. Pushed predicates render through the
@@ -161,11 +214,41 @@ impl PostgresExecutionPlan {
     ///
     /// [`Predicate::render_to`]: crate::pushdown::Predicate::render_to
     pub(crate) fn build_query(&self, partition_idx: usize) -> QueryBuilder<Postgres> {
-        use crate::pushdown::dialect::PostgresDialect;
-        use crate::pushdown::{PgParamSink, SqlParam, SqlSink};
+        let mut qb = QueryBuilder::<Postgres>::new(self.tag_for(partition_idx).render());
+        self.push_select(&mut qb, partition_idx, LimitRender::Bind);
+        log::debug!(
+            "PostgresExecutionPlan partition {partition_idx}: {:?}",
+            qb.sql()
+        );
+        qb
+    }
 
-        let dialect = PostgresDialect;
+    /// `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` for one partition, or `None` when
+    /// COPY cannot run it: pushed filters render with bind parameters, which `COPY`
+    /// forbids, so any pushed filter falls back to `SELECT` (loudly logged by the
+    /// caller — benchmark comparisons must know which path executed). The projection
+    /// must also be binary-decodable ([`supports_binary_copy`](crate::connector::postgres::copy::supports_binary_copy)).
+    pub(crate) fn build_copy_sql(&self, partition_idx: usize) -> Option<String> {
+        use crate::connector::postgres::copy::supports_binary_copy;
 
+        if !self.pushed_filters.is_empty() {
+            return None;
+        }
+        if !supports_binary_copy(&self.table_metadata.columns) {
+            return None;
+        }
+        let mut inner = QueryBuilder::<Postgres>::new("");
+        self.push_select(&mut inner, partition_idx, LimitRender::Inline);
+        let inner_sql = inner.sql();
+        Some(format!(
+            "{}COPY ({}) TO STDOUT (FORMAT BINARY)",
+            self.tag_for(partition_idx).render(),
+            inner_sql.as_str()
+        ))
+    }
+
+    /// The debug SQL-comment tag for one partition (see `connector::query_tag`).
+    fn tag_for(&self, partition_idx: usize) -> crate::connector::query_tag::QueryTag {
         // Debug tag: identifies this exact statement on the Postgres instance itself
         // (pg_stat_activity, pg_stat_statements, logs) without cross-referencing anything
         // in this process. `strategy` names the scan shape; `partition` (1-based) is
@@ -179,19 +262,33 @@ impl PostgresExecutionPlan {
         if self.partitions.len() > 1 {
             tag = tag.with_partition(partition_idx + 1, self.partitions.len());
         }
+        tag
+    }
 
-        let mut qb = QueryBuilder::<Postgres>::new(tag.render());
+    /// The `SELECT … WHERE … LIMIT …` body shared by [`Self::build_query`] (`Bind`)
+    /// and [`Self::build_copy_sql`] (`Inline`).
+    fn push_select(
+        &self,
+        qb: &mut QueryBuilder<Postgres>,
+        partition_idx: usize,
+        limit_render: LimitRender,
+    ) {
+        use crate::pushdown::dialect::PostgresDialect;
+        use crate::pushdown::{PgParamSink, SqlParam, SqlSink};
+
+        let dialect = PostgresDialect;
+
         qb.push("SELECT ");
 
-        PostgresQueryBuilder::push_columns(&mut qb, &self.table_metadata);
+        PostgresQueryBuilder::push_columns(&mut *qb, &self.table_metadata);
 
         qb.push(" FROM ");
 
-        PostgresQueryBuilder::push_identifier(&mut qb, &self.table_metadata.schema_name);
+        PostgresQueryBuilder::push_identifier(&mut *qb, &self.table_metadata.schema_name);
         qb.push(".");
-        PostgresQueryBuilder::push_identifier(&mut qb, &self.table_metadata.table_name);
+        PostgresQueryBuilder::push_identifier(&mut *qb, &self.table_metadata.table_name);
 
-        let mut sink = PgParamSink::new(&mut qb);
+        let mut sink = PgParamSink::new(&mut *qb);
         {
             let sink = &mut sink;
             let mut conditions = 0u8;
@@ -220,19 +317,19 @@ impl PostgresExecutionPlan {
             }
 
             if let Some(limit) = self.pushed_limit {
-                sink.push_sql(" LIMIT ");
-                sink.push_param(SqlParam::Int(limit as i64));
+                match limit_render {
+                    LimitRender::Bind => {
+                        sink.push_sql(" LIMIT ");
+                        sink.push_param(SqlParam::Int(limit as i64));
+                    }
+                    LimitRender::Inline => {
+                        sink.push_sql(format!(" LIMIT {limit}").as_str());
+                    }
+                }
             }
         }
         // `PgParamSink` holds `&mut QueryBuilder`; dropping it only ends the borrow.
         // No explicit `drop` needed — let the borrow end naturally.
-
-        log::debug!(
-            "PostgresExecutionPlan partition {partition_idx}: {:?}",
-            qb.sql()
-        );
-
-        qb
     }
 }
 
@@ -304,14 +401,77 @@ impl ExecutionPlan for PostgresExecutionPlan {
         let table_metadata = self.table_metadata.clone();
         let schema = self.schema.clone();
         let batch_size = self.batch_size;
+        let max_batch_bytes = self.max_batch_bytes;
+        // Binary COPY when enabled and the scan shape allows it (no pushed filters,
+        // decodable projection); otherwise the cursor SELECT. The fallback is loud
+        // (warn) because benchmark comparisons must know which path executed.
+        let copy_sql = if self.use_copy {
+            self.build_copy_sql(partition)
+        } else {
+            None
+        };
+        if self.use_copy && copy_sql.is_none() {
+            log::warn!(
+                "PostgresExecutionPlan partition {partition}: use_copy requested but scan shape needs SELECT (pushed filters or unmapped type); falling back"
+            );
+        } else if let Some(sql) = &copy_sql {
+            log::info!("PostgresExecutionPlan partition {partition}: scanning via {sql}");
+        }
         let mut query = self.build_query(partition);
 
+        // NOTE: no checkpoint access here by design — see the model docs. This task
+        // streams batches; the driver persists progress.
         let stream = async_stream::stream! {
             use futures::TryStreamExt;
+            use sqlx::postgres::PgPoolCopyExt as _;
+
+            if let Some(copy_sql) = copy_sql {
+                let mut byte_stream = match pool.copy_out_raw(copy_sql.as_str()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield Err(DataFusionError::External(Box::new(ExtractorError::Sqlx(e))));
+                        return;
+                    }
+                };
+                // Drive the COPY byte stream through an owned decoder, yielding batches.
+                let mut copy_decoder = match crate::connector::postgres::copy::CopyBatchDecoder::new(&table_metadata, batch_size, max_batch_bytes) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        yield Err(DataFusionError::External(Box::new(e)));
+                        return;
+                    }
+                };
+                loop {
+                    let chunk = match byte_stream.try_next().await {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(e) => {
+                            yield Err(DataFusionError::External(Box::new(ExtractorError::Sqlx(e))));
+                            return;
+                        }
+                    };
+                    let batches = match copy_decoder.push_bytes(&chunk) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            yield Err(DataFusionError::External(Box::new(e)));
+                            return;
+                        }
+                    };
+                    for batch in batches {
+                        yield Ok(batch);
+                    }
+                }
+                match copy_decoder.finish() {
+                    Ok(Some(batch)) => yield Ok(batch),
+                    Ok(None) => {}
+                    Err(e) => yield Err(DataFusionError::External(Box::new(e))),
+                }
+                return;
+            }
 
             let mut rows = query.build().fetch(&pool);
 
-            let mut batch_builder = match row_adapter::RowBatchBuilder::new(&table_metadata) {
+            let mut batch_builder = match row_adapter::RowBatchBuilder::with_capacity(&table_metadata, batch_size) {
                 Ok(builder) => builder,
                 Err(e) => {
                     yield Err(DataFusionError::External(Box::new(e)));
@@ -334,7 +494,8 @@ impl ExecutionPlan for PostgresExecutionPlan {
                     return;
                 }
 
-                if batch_builder.row_count() >= batch_size {
+                // Flush on rows OR bytes; `finish()` reuses builders (capacity retained).
+                if batch_builder.should_flush(batch_size, max_batch_bytes) {
                     match batch_builder.finish() {
                         Ok(batch) => yield Ok(batch),
                         Err(e) => {
@@ -342,14 +503,6 @@ impl ExecutionPlan for PostgresExecutionPlan {
                             return;
                         }
                     }
-
-                    batch_builder = match row_adapter::RowBatchBuilder::new(&table_metadata) {
-                        Ok(builder) => builder,
-                        Err(e) => {
-                            yield Err(DataFusionError::External(Box::new(e)));
-                            return;
-                        }
-                    };
                 }
             }
 

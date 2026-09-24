@@ -39,6 +39,21 @@ Result format is requested as **text** via the extended query protocol; sqlx han
 text-encoded values into Rust types. Binary format is not used (the `tokio-postgres` binary
 decoder was removed when the COPY path was removed).
 
+### 2.2 Binary COPY for bulk loads (`execution.use_copy`)
+
+Full/keyset scans can instead run `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` when
+`execution.use_copy` is true (default false). One server round-trip streams the whole
+result in binary framing — no per-row parse/bind/portal overhead — decoded by
+`connector::postgres::copy` into the same Arrow batches the cursor path produces
+(differential-tested in `tests/pg_copy.rs`).
+
+Limits, by construction of `COPY` (no bind parameters) and of the decoder set:
+- only scans **without pushed filters** use COPY; anything with bound literals
+  falls back to the cursor/`SELECT` path with a loud warn log (never silent);
+- keyset bounds inline as `i64` literals (no quoting surface);
+- types mirror the cursor decoder exactly (`ArrowTypeMapper` gates both); anything
+  else is `UnsupportedType`, never silently wrong data.
+
 ---
 
 ## 3. Type mapping

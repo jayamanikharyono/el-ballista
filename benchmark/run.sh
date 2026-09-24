@@ -19,6 +19,7 @@
 #   benchmark/run.sh [--clean] [--skip-scale] [--repeat N] [--workers N] [--spark-partitions N]
 #                    [--spark-cores N] [--rust-partitions N] [--batch-size N] [--pull] [--no-build]
 #                    [--mode standalone|distributed|both] [--parallel-strategy keyset|ctid]
+#                    [--no-use-copy]
 #                    [--cpus N] [--cpuset-cpus RANGE] [--memory SIZE]
 #                    [--scheduler-memory SIZE] [--client-memory SIZE] [--worker-memory SIZE]
 #
@@ -86,7 +87,8 @@ PG_PASSWORD="${BENCH_PG_PASSWORD:-postgres}"
 # fixture never contends with the engines. A shared fixture must never change shape
 # between runs; override by editing here, never per invocation, so results stay
 # comparable.
-PG_CPU_FLAGS="--cpuset-cpus=4-5"
+#PG_CPU_FLAGS="--cpuset-cpus=4-5"
+PG_CPU_FLAGS="--cpus=4"
 PG_MEM_FLAGS="--memory=2g"
 WORKERS=4
 # Batch size is the input knob (empty = auto, each tool's own default); partition
@@ -101,6 +103,11 @@ RUST_PARTITIONS=""
 # 8192 applies) and BENCH_FETCHSIZE is left unset for Spark (JDBC default applies).
 # Set via --batch-size to force the same rows-per-batch on both engines.
 BATCH_SIZE=""
+# Rust source scan path: COPY (SELECT ...) TO STDOUT (FORMAT BINARY) when 1
+# (default), cursor FETCH when 0 (--no-use-copy). COPY skips per-row SQL
+# parse/bind/portal overhead; pushed-filter selective scans always use cursors
+# (COPY accepts no bind parameters) — logged loudly per partition either way.
+USE_COPY=1
 REPEAT=1
 SCALE=1
 CLEAN=0
@@ -144,6 +151,7 @@ while [ $# -gt 0 ]; do
     --spark-cores) SPARK_CORES="$2"; shift 2 ;;
     --rust-partitions) RUST_PARTITIONS="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+    --no-use-copy) USE_COPY=0; shift ;;
     --pull) PULL=1; shift ;;
     --no-build) NO_BUILD=1; shift ;;
     --skip-correctness) SKIP_CORRECTNESS=1; shift ;;
@@ -897,7 +905,9 @@ echo "partitions: rust=$RUST_PARTITIONS spark=$SPARK_PARTITIONS (ceil($EXPECTED_
 echo "compute: spark=local[${SPARK_CORES:-*}] rust-standalone=defaults rust-distributed=$WORKERS workers x ${BENCH_CONCURRENT_TASKS:-all-visible} slot(s)"
 
 # Omit batch_size in auto mode so the Rust code default (8192) applies.
-BATCH_JSON=""; [ -n "$BATCH_SIZE" ] && BATCH_JSON="\"batch_size\": $BATCH_SIZE"
+BATCH_JSON=""; [ -n "$BATCH_SIZE" ] && BATCH_JSON="\"batch_size\": $BATCH_SIZE,"
+COPY_JSON="\"use_copy\": true"; [ "$USE_COPY" = "0" ] && COPY_JSON="\"use_copy\": false"
+echo "source scan: rust $([ "$USE_COPY" = "0" ] && echo "cursor FETCH" || echo "COPY BINARY") (selective scans always cursor: COPY takes no bind params)"
 # Generate bench-config.json with the specified parallel strategy
 cat > "$BENCH_DIR/bench-config.json" <<EOF
 {
@@ -930,7 +940,7 @@ cat > "$BENCH_DIR/bench-config.json" <<EOF
     "partitions": $RUST_PARTITIONS,
     "partition_column": "order_id"
   },
-  "execution": { ${BATCH_JSON} },
+  "execution": { ${BATCH_JSON} ${COPY_JSON} },
   "distributed": {
     "scheduler_url": "",
     "workers": $WORKERS
@@ -1009,13 +1019,43 @@ for r in rows:
 EOF
 }
 
+summary_table() { # $1=results dir -> totals-only table on stdout: one row per test
+  # variant (engine x scenario) with elapsed time and summed memory. No rows,
+  # no per-component breakdown, no postgres usage — the at-a-glance headline.
+  python3 - "$1" <<'EOF'
+import glob, json, os, sys
+results = sys.argv[1]
+header = ["engine", "scenario", "elapsed_ms", "peak_rss_mib"]
+rows = []
+for pat in ("rust_*_full.json", "spark_full.json",
+            "rust_*_selective.json", "spark_selective.json"):
+    for path in sorted(glob.glob(os.path.join(results, pat))):
+        d = json.load(open(path))
+        rows.append([d["engine"], d["scenario"],
+                     str(d["elapsed_ms"]), str(d["peak_rss_mib"])])
+widths = [len(h) for h in header]
+for r in rows:
+    widths = [max(w, len(c)) for w, c in zip(widths, r)]
+def line(cells):
+    return "| " + " | ".join(c.ljust(w) for c, w in zip(cells, widths)) + " |"
+print(line(header))
+print("|-" + "-|-".join("-" * w for w in widths) + "-|")
+for r in rows:
+    print(line(r))
+EOF
+}
+
 {
   echo "# Benchmark: initial loads, public.orders"
   echo
-  echo "Full: SELECT * over all columns -> Snappy Parquet. Selective: WHERE $SELECTIVE_FILTER + projection ($SELECTIVE_COLUMNS). Rust standalone: in-process Ballista, $RUST_PARTITIONS keyset partitions. Rust distributed: scheduler + $WORKERS workers over the network (CPU/RSS summed across the cluster; per-container peaks below). Spark 3.5.4 local ($([ -n "$SPARK_CORES" ] && echo "$SPARK_CORES cores" || echo "all cores")): $SPARK_PARTITIONS JDBC partitions on order_id. Batch: $([ -n "$BATCH_SIZE" ] && echo "$BATCH_SIZE rows/batch both engines" || echo "tool defaults (rust 8192, spark driver default)"). Sequential runs, best of $REPEAT."
+  echo "Full: SELECT * over all columns -> Snappy Parquet. Selective: WHERE $SELECTIVE_FILTER + projection ($SELECTIVE_COLUMNS). Rust standalone: in-process Ballista, $RUST_PARTITIONS keyset partitions. Rust distributed: scheduler + $WORKERS workers over the network (CPU/RSS summed across the cluster; per-container peaks below). Spark 3.5.4 local ($([ -n "$SPARK_CORES" ] && echo "$SPARK_CORES cores" || echo "all cores")): $SPARK_PARTITIONS JDBC partitions on order_id. Batch: $([ -n "$BATCH_SIZE" ] && echo "$BATCH_SIZE rows/batch both engines" || echo "tool defaults (rust 8192, spark driver default)"). Rust source scan: $([ "$USE_COPY" = "0" ] && echo "cursor FETCH" || echo "COPY BINARY (full loads; selective falls back to cursor — see logs)"). Sequential runs, best of $REPEAT."
   echo "Spec: containers [$CPU_FLAGS ${MEM_SPARK:-unconstrained}] pg=[$PG_CPU_FLAGS $PG_MEM_FLAGS] mem sched/workers/client [$MEM_SCHED/${MEM_WORKER:-none}/${MEM_CLIENT:-none}] compute spark=local[${SPARK_CORES:-*}] rust-distributed=$WORKERS x ${BENCH_CONCURRENT_TASKS:-all-visible} slots."
   echo
   report_table "$RESULTS"
+  echo
+  echo "## Summary (engine totals only: elapsed time and summed peak memory per test variant)"
+  echo
+  summary_table "$RESULTS"
   echo
 } | tee "$RESULTS/summary.md"
 

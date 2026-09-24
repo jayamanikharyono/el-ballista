@@ -2,28 +2,25 @@
 //! extractor/postgres/extractor.rs
 //! Orchestrates PostgreSQL schema discovery, query execution,
 //! and conversion of PostgreSQL rows into Arrow `RecordBatch` values.
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
-use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
+use futures::TryStreamExt;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Connection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use arrow::array::{
-    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
-    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
-    StringBuilder, TimestampMicrosecondBuilder,
-};
-use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
 
 use crate::connector::postgres::{
-    arrow_type_mapper::ArrowTypeMapper, query_builder::PostgresQueryBuilder,
-    row_adapter::PostgresRowAdapter, schema_reader::PostgresSchemaReader,
+    query_builder::PostgresQueryBuilder, row_adapter::PostgresRowAdapter,
+    row_adapter::RowBatchBuilder, schema_reader::PostgresSchemaReader,
 };
 use crate::connector::query_tag::QuerySession;
 
 use crate::{connector::errors::ExtractorError, types::table_metadata::TableMetadata};
 
+/// Default byte cap per Arrow batch when callers only pass a row count (16 MiB).
+pub(crate) const DEFAULT_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
 pub struct PostgresExtractor {
     pool: PgPool,
     /// Debug SQL comment identity (see `connector::query_tag`): `pipeline` reuses
@@ -102,6 +99,121 @@ impl PostgresExtractor {
     fn tag(&self, strategy: &str) -> String {
         self.query_session.tag(strategy).render()
     }
+
+    /// Drive an open cursor to completion, invoking `on_batch` per flushed Arrow batch.
+    ///
+    /// Each `FETCH FORWARD` window streams rows via `fetch()` + `try_next()` (no intermediate
+    /// `Vec<PgRow>`), appends them into a capacity-preallocated [`RowBatchBuilder`], and
+    /// flushes on **rows OR bytes** so wide rows cannot blow memory before `batch_size`.
+    /// Callers must `DECLARE` before and `CLOSE` after; this helper never commits/rolls back.
+    async fn drive_cursor(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        tag: &str,
+        cursor_name: &str,
+        table_metadata: &TableMetadata,
+        batch_size: usize,
+        max_batch_bytes: usize,
+        on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    ) -> Result<u64, ExtractorError> {
+        let mut builder = RowBatchBuilder::with_capacity(table_metadata, batch_size)?;
+        let mut total_rows: u64 = 0;
+        loop {
+            let fetch_sql = format!("{tag}FETCH FORWARD {batch_size} FROM {cursor_name}");
+            let mut stream = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str())).fetch(&mut **tx);
+            let mut fetched = 0usize;
+            while let Some(row) = stream.try_next().await? {
+                fetched += 1;
+                builder.append_row(&row)?;
+                total_rows += 1;
+                if builder.should_flush(batch_size, max_batch_bytes) {
+                    on_batch(builder.finish()?)?;
+                }
+            }
+            if fetched == 0 {
+                break;
+            }
+        }
+        if !builder.is_empty() {
+            on_batch(builder.finish()?)?;
+        }
+        Ok(total_rows)
+    }
+
+    /// Declare a cursor for `select_sql` (already rendered, may carry `$1/$2` binds),
+    /// drive it to completion via [`Self::drive_cursor`], then `CLOSE` + commit/rollback.
+    /// `bind` applies the statement parameters at `DECLARE` time.
+    ///
+    /// The cursor is deliberately declared `WITHOUT HOLD`: the extraction layer is a
+    /// second-class citizen on the source — a `WITH HOLD` cursor forces the server to
+    /// materialize the result (temp space + I/O on a production instance), while a
+    /// plain cursor streams from the live snapshot with no server-side copy. If the DB
+    /// owner kills a scan that impacts production, only that partition's work is lost
+    /// and the split checkpoint lets the next run resume after it.
+    ///
+    /// Honest isolation semantics: the transaction stays open for the whole scan
+    /// (`WITHOUT HOLD` portals die with it), but under the default READ COMMITTED
+    /// isolation each `FETCH` takes a fresh snapshot — concurrent writes can duplicate
+    /// or skip rows across `FETCH` windows. No snapshot/consistency guarantee is
+    /// claimed; keyset ranges bound the damage to one partition, and the caller
+    /// decides whether the source is quiet enough for the job at hand. (A stall
+    /// longer than `idle_in_transaction_session_timeout` between `FETCH`es aborts the
+    /// scan — the checkpoint records the split as failed, not completed.)
+    #[allow(clippy::too_many_arguments)]
+    async fn extract_via_cursor_impl<F>(
+        &self,
+        table_metadata: &TableMetadata,
+        select_sql: &str,
+        strategy_tag: &str,
+        batch_size: usize,
+        max_batch_bytes: usize,
+        bind: F,
+        on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    ) -> Result<u64, ExtractorError>
+    where
+        F: FnOnce(
+            sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments>,
+        ) -> sqlx::query::Query<'_, Postgres, sqlx::postgres::PgArguments>,
+    {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
+        let tag = self.tag(strategy_tag);
+        let declare_sql =
+            format!("{tag}DECLARE {cursor_name} CURSOR WITHOUT HOLD FOR {select_sql}");
+        bind(sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str())))
+            .execute(&mut *tx)
+            .await?;
+
+        // Guarded drive so CLOSE runs even if decode/flush fails — otherwise the
+        // portal (and its open transaction) stays pinned on the pooled connection
+        // until session close.
+        let drive_result = Self::drive_cursor(
+            &mut tx,
+            &tag,
+            &cursor_name,
+            table_metadata,
+            batch_size,
+            max_batch_bytes,
+            on_batch,
+        )
+        .await;
+
+        let close_sql = format!("{tag}CLOSE {cursor_name}");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str()))
+            .execute(&mut *tx)
+            .await;
+        match drive_result {
+            Ok(total) => {
+                tx.commit().await?;
+                Ok(total)
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                Err(e)
+            }
+        }
+    }
+
     /// Extract keyset partition via cursor.
     pub async fn extract_keyset_partition_via_cursor(
         &self,
@@ -112,6 +224,62 @@ impl PostgresExtractor {
         hi: i64,
         batch_size: usize,
     ) -> Result<Vec<RecordBatch>, ExtractorError> {
+        self.extract_keyset_partition_via_cursor_with_limits(
+            table_name,
+            columns,
+            partition_column,
+            lo,
+            hi,
+            batch_size,
+            DEFAULT_MAX_BATCH_BYTES,
+        )
+        .await
+    }
+
+    /// Same as [`Self::extract_keyset_partition_via_cursor`] with an explicit byte cap.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn extract_keyset_partition_via_cursor_with_limits(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        partition_column: &str,
+        lo: i64,
+        hi: i64,
+        batch_size: usize,
+        max_batch_bytes: usize,
+    ) -> Result<Vec<RecordBatch>, ExtractorError> {
+        let mut batches = Vec::new();
+        self.extract_keyset_partition_for_each_batch(
+            table_name,
+            columns,
+            partition_column,
+            lo,
+            hi,
+            batch_size,
+            max_batch_bytes,
+            &mut |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(batches)
+    }
+
+    /// Bounded-memory keyset scan: invokes `on_batch` per flushed batch instead of
+    /// accumulating a `Vec`. Used by concurrent partition extraction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn extract_keyset_partition_for_each_batch(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        partition_column: &str,
+        lo: i64,
+        hi: i64,
+        batch_size: usize,
+        max_batch_bytes: usize,
+        on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    ) -> Result<u64, ExtractorError> {
         let schema_reader = PostgresSchemaReader::new(&self.pool);
         let table_metadata = schema_reader.get_table_metadata(table_name).await?;
         let table_metadata = table_metadata.select_columns(columns.as_deref());
@@ -124,71 +292,19 @@ impl PostgresExtractor {
             lo,
             hi,
         );
-        let sql_str = query_builder.sql();
-        let select_sql = sql_str.as_str();
+        let sql = query_builder.sql().as_str().to_string();
+        log::debug!("generated query [keyset_cursor]: {sql} (bind $1={lo}, $2={hi})");
 
-        let mut conn = self.pool.acquire().await?;
-        let mut tx = conn.begin().await?;
-
-        let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
-        let tag = self.tag("keyset_cursor");
-        log::debug!("generated query [keyset_cursor]: {select_sql} (bind $1={lo}, $2={hi})");
-        let declare_sql = format!(
-            "{tag}DECLARE {} CURSOR WITH HOLD FOR {}",
-            cursor_name, select_sql
-        );
-        // build_keyset_partition emits $1/$2 placeholders — bind lo/hi here.
-        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
-            .bind(lo)
-            .bind(hi)
-            .execute(&mut *tx)
-            .await?;
-
-        let mut batches = Vec::new();
-        let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
-
-        let fetch_result: Result<(), ExtractorError> = async {
-            loop {
-                let fetch_sql = format!("{tag}FETCH FORWARD {} FROM {}", batch_size, cursor_name);
-                let rows = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str()))
-                    .fetch_all(&mut *tx)
-                    .await?;
-
-                if rows.is_empty() {
-                    break;
-                }
-
-                for row in rows {
-                    batch_builder.append_row(&row, &table_metadata)?;
-
-                    if batch_builder.row_count() >= batch_size {
-                        let batch = batch_builder.finish()?;
-                        batches.push(batch);
-                        batch_builder = CursorBatchBuilder::new(&table_metadata)?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        let close_sql = format!("{tag}CLOSE {}", cursor_name);
-        let _ = sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str()))
-            .execute(&mut *tx)
-            .await;
-        match fetch_result {
-            Ok(()) => {
-                tx.commit().await?;
-                if !batch_builder.is_empty() {
-                    batches.push(batch_builder.finish()?);
-                }
-                Ok(batches)
-            }
-            Err(e) => {
-                let _ = tx.rollback().await;
-                Err(e)
-            }
-        }
+        self.extract_via_cursor_impl(
+            &table_metadata,
+            &sql,
+            "keyset_cursor",
+            batch_size,
+            max_batch_bytes,
+            |q| q.bind(lo).bind(hi),
+            on_batch,
+        )
+        .await
     }
 
     /// Extract all rows from a table without filtering.
@@ -227,12 +343,54 @@ impl PostgresExtractor {
         Ok(combined)
     }
 
-    async fn extract_full_table_via_cursor_batches(
+    pub(crate) async fn extract_full_table_via_cursor_batches(
         &self,
         table_name: &str,
         columns: Option<Vec<&str>>,
         batch_size: usize,
     ) -> Result<Vec<RecordBatch>, ExtractorError> {
+        self.extract_full_table_via_cursor_with_limits(
+            table_name,
+            columns,
+            batch_size,
+            DEFAULT_MAX_BATCH_BYTES,
+        )
+        .await
+    }
+
+    /// Same as [`Self::extract_full_table_via_cursor_batches`] with an explicit byte cap.
+    pub(crate) async fn extract_full_table_via_cursor_with_limits(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        batch_size: usize,
+        max_batch_bytes: usize,
+    ) -> Result<Vec<RecordBatch>, ExtractorError> {
+        let mut batches = Vec::new();
+        self.extract_full_table_for_each_batch(
+            table_name,
+            columns,
+            batch_size,
+            max_batch_bytes,
+            &mut |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(batches)
+    }
+
+    /// Bounded-memory full scan: invokes `on_batch` per flushed batch instead of
+    /// accumulating a `Vec`. Operational (`run`) paths should prefer this.
+    pub async fn extract_full_table_for_each_batch(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        batch_size: usize,
+        max_batch_bytes: usize,
+        on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    ) -> Result<u64, ExtractorError> {
         let schema_reader = PostgresSchemaReader::new(&self.pool);
         let table_metadata = schema_reader
             .get_table_metadata(table_name)
@@ -241,68 +399,175 @@ impl PostgresExtractor {
 
         let mut query_builder = QueryBuilder::<Postgres>::new("");
         PostgresQueryBuilder::build_full_table(&mut query_builder, &table_metadata);
-        let sql_str = query_builder.sql();
-        let select_sql = sql_str.as_str();
+        let sql = query_builder.sql().as_str().to_string();
+        log::debug!("generated query [full]: {sql}");
 
-        let mut conn = self.pool.acquire().await?;
-        let mut tx = conn.begin().await?;
+        self.extract_via_cursor_impl(
+            &table_metadata,
+            &sql,
+            "full",
+            batch_size,
+            max_batch_bytes,
+            |q| q,
+            on_batch,
+        )
+        .await
+    }
 
-        let cursor_name = format!("extract_cur_{}", Uuid::new_v4().simple());
-        let tag = self.tag("full");
-        log::debug!("generated query [full]: {select_sql}");
-        let declare_sql = format!(
-            "{tag}DECLARE {} CURSOR WITH HOLD FOR {}",
-            cursor_name, select_sql
-        );
-        sqlx::query(sqlx::AssertSqlSafe(declare_sql.as_str()))
-            .execute(&mut *tx)
-            .await?;
+    /// Bounded-memory full scan over `COPY (SELECT …) TO STDOUT (FORMAT BINARY)`.
+    /// Same rows as [`Self::extract_full_table_for_each_batch`] with less per-row
+    /// protocol overhead. Errors [`ExtractorError::UnsupportedType`] when the
+    /// projection contains a type with no binary decoder — the support set mirrors
+    /// the cursor decoder exactly, so opt out with `use_copy = false` for such tables.
+    pub async fn extract_full_table_via_copy_for_each_batch(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        batch_size: usize,
+        max_batch_bytes: usize,
+        on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    ) -> Result<u64, ExtractorError> {
+        use sqlx::postgres::PgPoolCopyExt as _;
 
+        let schema_reader = PostgresSchemaReader::new(&self.pool);
+        let table_metadata = schema_reader
+            .get_table_metadata(table_name)
+            .await?
+            .select_columns(columns.as_deref());
+
+        let mut query_builder = QueryBuilder::<Postgres>::new("");
+        PostgresQueryBuilder::build_full_table(&mut query_builder, &table_metadata);
+        let select = query_builder.sql().as_str().to_string();
+
+        if !crate::connector::postgres::copy::supports_binary_copy(&table_metadata.columns) {
+            return Err(ExtractorError::UnsupportedType(
+                "binary COPY has no decoder for a column in this projection".into(),
+            ));
+        }
+
+        let tag = self.tag("full_copy");
+        log::debug!("generated query [full_copy]: COPY ({select}) TO STDOUT (FORMAT BINARY)");
+        let copy_sql = format!("{tag}COPY ({select}) TO STDOUT (FORMAT BINARY)");
+
+        // One pooled connection for the whole COPY (the pool checks it out
+        // exclusively); no transaction needed — a single statement, own snapshot.
+        let mut byte_stream = self.pool.copy_out_raw(copy_sql.as_str()).await?;
+        crate::connector::postgres::copy::drive_copy_stream(
+            &mut byte_stream,
+            &table_metadata,
+            batch_size,
+            max_batch_bytes,
+            on_batch,
+        )
+        .await
+    }
+
+    /// Same as [`Self::extract_full_table_via_copy_for_each_batch`] collecting to a
+    /// `Vec` (for `extract()`-style callers; operational paths prefer the callback).
+    pub(crate) async fn extract_full_table_via_copy_with_limits(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        batch_size: usize,
+        max_batch_bytes: usize,
+    ) -> Result<Vec<RecordBatch>, ExtractorError> {
         let mut batches = Vec::new();
-        let mut batch_builder = CursorBatchBuilder::new(&table_metadata)?;
+        self.extract_full_table_via_copy_for_each_batch(
+            table_name,
+            columns,
+            batch_size,
+            max_batch_bytes,
+            &mut |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(batches)
+    }
 
-        let fetch_result: Result<(), ExtractorError> = async {
-            loop {
-                let fetch_sql = format!("{tag}FETCH FORWARD {} FROM {}", batch_size, cursor_name);
-                let rows = sqlx::query(sqlx::AssertSqlSafe(fetch_sql.as_str()))
-                    .fetch_all(&mut *tx)
-                    .await?;
+    /// Bounded-memory keyset scan over `COPY (SELECT … WHERE col >= lo AND col < hi)`.
+    /// Bounds inline as integer literals — `COPY` accepts no bind parameters, and
+    /// `i64` rendering has no quoting surface. Same strict-support contract as the
+    /// full-table variant above.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn extract_keyset_partition_via_copy_for_each_batch(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        partition_column: &str,
+        lo: i64,
+        hi: i64,
+        batch_size: usize,
+        max_batch_bytes: usize,
+        on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    ) -> Result<u64, ExtractorError> {
+        use sqlx::postgres::PgPoolCopyExt as _;
 
-                if rows.is_empty() {
-                    break;
-                }
+        let schema_reader = PostgresSchemaReader::new(&self.pool);
+        let table_metadata = schema_reader.get_table_metadata(table_name).await?;
+        let table_metadata = table_metadata.select_columns(columns.as_deref());
 
-                for row in rows {
-                    batch_builder.append_row(&row, &table_metadata)?;
+        let mut query_builder = QueryBuilder::<Postgres>::new("");
+        PostgresQueryBuilder::build_keyset_partition_inline(
+            &mut query_builder,
+            &table_metadata,
+            partition_column,
+            lo,
+            hi,
+        );
+        let select = query_builder.sql().as_str().to_string();
 
-                    if batch_builder.row_count() >= batch_size {
-                        let batch = batch_builder.finish()?;
-                        batches.push(batch);
-                        batch_builder = CursorBatchBuilder::new(&table_metadata)?;
-                    }
-                }
-            }
-            Ok(())
+        if !crate::connector::postgres::copy::supports_binary_copy(&table_metadata.columns) {
+            return Err(ExtractorError::UnsupportedType(
+                "binary COPY has no decoder for a column in this projection".into(),
+            ));
         }
-        .await;
 
-        let close_sql = format!("{tag}CLOSE {}", cursor_name);
-        let _ = sqlx::query(sqlx::AssertSqlSafe(close_sql.as_str()))
-            .execute(&mut *tx)
-            .await;
-        match fetch_result {
-            Ok(()) => {
-                tx.commit().await?;
-                if !batch_builder.is_empty() {
-                    batches.push(batch_builder.finish()?);
-                }
-                Ok(batches)
-            }
-            Err(e) => {
-                let _ = tx.rollback().await;
-                Err(e)
-            }
-        }
+        let tag = self.tag("keyset_copy");
+        log::debug!("generated query [keyset_copy]: COPY ({select}) TO STDOUT (FORMAT BINARY)");
+
+        let copy_sql = format!("{tag}COPY ({select}) TO STDOUT (FORMAT BINARY)");
+        let mut byte_stream = self.pool.copy_out_raw(copy_sql.as_str()).await?;
+        crate::connector::postgres::copy::drive_copy_stream(
+            &mut byte_stream,
+            &table_metadata,
+            batch_size,
+            max_batch_bytes,
+            on_batch,
+        )
+        .await
+    }
+
+    /// Same as [`Self::extract_keyset_partition_via_copy_for_each_batch`] collecting
+    /// to a `Vec` (for `extract()`-style callers; operational paths prefer the callback).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn extract_keyset_partition_via_copy_with_limits(
+        &self,
+        table_name: &str,
+        columns: Option<Vec<&str>>,
+        partition_column: &str,
+        lo: i64,
+        hi: i64,
+        batch_size: usize,
+        max_batch_bytes: usize,
+    ) -> Result<Vec<RecordBatch>, ExtractorError> {
+        let mut batches = Vec::new();
+        self.extract_keyset_partition_via_copy_for_each_batch(
+            table_name,
+            columns,
+            partition_column,
+            lo,
+            hi,
+            batch_size,
+            max_batch_bytes,
+            &mut |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(batches)
     }
 
     /// Extract a keyset partition: rows where `partition_column` is in range [lo, hi).
@@ -356,250 +621,5 @@ impl PostgresExtractor {
         }
         let combined = arrow::compute::concat_batches(&arrow_schema, &batches)?;
         Ok(combined)
-    }
-}
-
-/// Batch builder for cursor-based streaming extraction.
-struct CursorBatchBuilder {
-    schema: Arc<Schema>,
-    table_metadata: TableMetadata,
-    builders: Vec<Box<dyn ArrayBuilder>>,
-    row_count: usize,
-}
-
-impl CursorBatchBuilder {
-    fn new(table_metadata: &TableMetadata) -> Result<Self, ExtractorError> {
-        let schema = PostgresRowAdapter::build_arrow_schema(table_metadata)?;
-        let mut builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
-        for column in &table_metadata.columns {
-            let data_type = ArrowTypeMapper::map(column)?;
-            builders.push(PostgresRowAdapter::new_builder(&data_type));
-        }
-        Ok(Self {
-            schema,
-            table_metadata: table_metadata.clone(),
-            builders,
-            row_count: 0,
-        })
-    }
-
-    fn append_row(
-        &mut self,
-        row: &PgRow,
-        table_metadata: &TableMetadata,
-    ) -> Result<(), ExtractorError> {
-        for (idx, column) in table_metadata.columns.iter().enumerate() {
-            self.append_value_to_builder(idx, row, column)?;
-        }
-        self.row_count += 1;
-        Ok(())
-    }
-
-    fn append_value_to_builder(
-        &mut self,
-        builder_idx: usize,
-        row: &PgRow,
-        column: &crate::types::ColumnMetadata,
-    ) -> Result<(), ExtractorError> {
-        let builder = &mut self.builders[builder_idx];
-        match column.data_type.as_str() {
-            "smallint" => {
-                let value: Option<i16> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Int16Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Int16Builder".into()))?;
-                b.append_option(value);
-            }
-            "integer" => {
-                let value: Option<i32> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Int32Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Int32Builder".into()))?;
-                b.append_option(value);
-            }
-            "bigint" => {
-                let value: Option<i64> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Int64Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Int64Builder".into()))?;
-                b.append_option(value);
-            }
-            "real" => {
-                let value: Option<f32> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Float32Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Float32Builder".into()))?;
-                b.append_option(value);
-            }
-            "double precision" => {
-                let value: Option<f64> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Float64Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Float64Builder".into()))?;
-                b.append_option(value);
-            }
-            "numeric" => {
-                let value: Option<bigdecimal::BigDecimal> =
-                    row.try_get(column.column_name.as_str())?;
-                let scale = column.numeric_scale.unwrap_or(10) as i64;
-                let i128_value = value
-                    .map(|d| {
-                        crate::connector::postgres::arrow_type_mapper::decimal_to_unscaled(d, scale)
-                    })
-                    .transpose()?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Decimal128Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Decimal128Builder".into()))?;
-                b.append_option(i128_value);
-            }
-            "boolean" => {
-                let value: Option<bool> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<BooleanBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast BooleanBuilder".into()))?;
-                b.append_option(value);
-            }
-            "text" | "character varying" | "character" => {
-                let value: Option<String> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast StringBuilder".into()))?;
-                b.append_option(value);
-            }
-            "USER-DEFINED" => {
-                let value: Option<String> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast StringBuilder".into()))?;
-                b.append_option(value);
-            }
-            "timestamp with time zone" => {
-                let value: Option<DateTime<Utc>> = row.try_get(column.column_name.as_str())?;
-                let micros = value.map(|dt| dt.timestamp_micros());
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<TimestampMicrosecondBuilder>()
-                    .ok_or_else(|| {
-                        ExtractorError::Internal("downcast TimestampMicrosecondBuilder".into())
-                    })?;
-                b.append_option(micros);
-            }
-            "timestamp without time zone" => {
-                let value: Option<NaiveDateTime> = row.try_get(column.column_name.as_str())?;
-                let micros = value.map(|dt| dt.and_utc().timestamp_micros());
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<TimestampMicrosecondBuilder>()
-                    .ok_or_else(|| {
-                        ExtractorError::Internal("downcast TimestampMicrosecondBuilder".into())
-                    })?;
-                b.append_option(micros);
-            }
-            "date" => {
-                let value: Option<NaiveDate> = row.try_get(column.column_name.as_str())?;
-                let days = value
-                    .map(|d| (d - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32);
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<Date32Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Date32Builder".into()))?;
-                b.append_option(days);
-            }
-            "uuid" => {
-                let value: Option<uuid::Uuid> = row.try_get(column.column_name.as_str())?;
-                let s = value.map(|u| u.to_string());
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast StringBuilder".into()))?;
-                b.append_option(s);
-            }
-            "bytea" => {
-                let value: Option<Vec<u8>> = row.try_get(column.column_name.as_str())?;
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<BinaryBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast BinaryBuilder".into()))?;
-                b.append_option(value);
-            }
-            "jsonb" | "json" => {
-                let value: Option<serde_json::Value> = row.try_get(column.column_name.as_str())?;
-                let s = value.map(|v| v.to_string());
-                let b = builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast StringBuilder".into()))?;
-                b.append_option(s);
-            }
-            "ARRAY" => match column.udt_name.as_deref() {
-                Some("_text") => {
-                    let value: Option<Vec<Option<String>>> =
-                        row.try_get(column.column_name.as_str())?;
-                    let b = builder
-                        .as_any_mut()
-                        .downcast_mut::<ListBuilder<StringBuilder>>()
-                        .ok_or_else(|| ExtractorError::Internal("downcast ListBuilder".into()))?;
-                    PostgresRowAdapter::append_text_array_option(b, value);
-                }
-                other => {
-                    return Err(ExtractorError::UnsupportedType(format!(
-                        "array element type {:?} for column '{}' (only text[] arrays are supported)",
-                        other, column.column_name
-                    )));
-                }
-            },
-            _ => {
-                return Err(ExtractorError::UnsupportedType(column.data_type.clone()));
-            }
-        }
-        Ok(())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.row_count == 0
-    }
-    fn row_count(&self) -> usize {
-        self.row_count
-    }
-
-    fn finish(&mut self) -> Result<RecordBatch, ExtractorError> {
-        let mut arrays: Vec<ArrayRef> = Vec::new();
-        for (idx, builder) in self.builders.iter_mut().enumerate() {
-            let column = &self.table_metadata.columns[idx];
-            let data_type = ArrowTypeMapper::map(column)?;
-            let array: ArrayRef = if matches!(data_type, DataType::Decimal128(_, _)) {
-                let precision = column.numeric_precision.unwrap_or(38) as u8;
-                let scale = column.numeric_scale.unwrap_or(10) as i8;
-                let arr = builder
-                    .as_any_mut()
-                    .downcast_mut::<Decimal128Builder>()
-                    .ok_or_else(|| ExtractorError::Internal("downcast Decimal128".into()))?
-                    .finish();
-                Arc::new(
-                    arr.with_precision_and_scale(precision, scale)
-                        .map_err(|e| ExtractorError::Internal(e.to_string()))?,
-                )
-            } else {
-                Arc::new(builder.finish())
-            };
-            arrays.push(array);
-        }
-        self.row_count = 0;
-        // Rebuild builders for reuse
-        for (idx, builder) in self.builders.iter_mut().enumerate() {
-            let column = &self.table_metadata.columns[idx];
-            let data_type = ArrowTypeMapper::map(column)?;
-            *builder = PostgresRowAdapter::new_builder(&data_type);
-        }
-        Ok(RecordBatch::try_new(self.schema.clone(), arrays)?)
     }
 }

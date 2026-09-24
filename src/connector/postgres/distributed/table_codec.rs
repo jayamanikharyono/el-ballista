@@ -141,6 +141,8 @@ mod tests {
             deny: vec!["secret".to_string()],
             push: vec![],
             batch_size: 1024,
+            use_copy: false,
+            max_batch_bytes: 16 * 1024 * 1024,
             parallel_workers: 4,
             partition_column: Some("order_id".to_string()),
             strategy: crate::connector::postgres::parallel::ParallelStrategy::Keyset,

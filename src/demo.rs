@@ -206,7 +206,7 @@ pub async fn run() -> Result<(), AppError> {
             partitions: 1,
             partition_column: "order_id".to_string(),
         },
-        execution: ExecutionConfig { batch_size: 8192 },
+        execution: ExecutionConfig::default(),
         distributed: DistributedConfig::default(),
     };
 

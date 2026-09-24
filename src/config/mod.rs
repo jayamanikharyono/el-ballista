@@ -60,16 +60,33 @@ pub struct CheckpointConfig {
     /// see docs/phase-one-implementation-plan.md §4 for why a Postgres-backed store is deferred.
     #[serde(default = "default_checkpoint_dir")]
     pub dir: String,
+    /// Background progress flush cadence for the driver-owned progress file. The extraction
+    /// loop never blocks on these writes (fire-and-forget `try_send` + debounced writer).
+    #[serde(default = "default_checkpoint_flush_secs")]
+    pub flush_interval_secs: u64,
+    /// Flush progress at least every this many rows even if the time interval has not elapsed.
+    #[serde(default = "default_checkpoint_flush_rows")]
+    pub flush_rows: u64,
 }
 
 fn default_checkpoint_dir() -> String {
     ".checkpoints".to_string()
 }
 
+fn default_checkpoint_flush_secs() -> u64 {
+    5
+}
+
+fn default_checkpoint_flush_rows() -> u64 {
+    100_000
+}
+
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
             dir: default_checkpoint_dir(),
+            flush_interval_secs: default_checkpoint_flush_secs(),
+            flush_rows: default_checkpoint_flush_rows(),
         }
     }
 }
@@ -127,16 +144,45 @@ impl Default for PushdownConfig {
 pub struct ExecutionConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Byte cap per Arrow batch. Flushes early on wide rows (text/json/bytea) so peak
+    /// memory stays bounded even when `batch_size` rows are very wide.
+    #[serde(default = "default_max_batch_bytes")]
+    pub max_batch_bytes: usize,
+    /// Upper bound on concurrent single-node partition scans. The source pool still
+    /// caps connections; this only bounds task fan-out.
+    #[serde(default = "default_concurrent_partitions")]
+    pub concurrent_partitions: usize,
+    /// Use `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` instead of cursor `FETCH`
+    /// for full/keyset scans. Same rows, less per-row protocol overhead. Falls back
+    /// to cursors automatically when the shape is unsupported (pushed filters with
+    /// bound literals, unmapped types) — the fallback is logged, never silent.
+    #[serde(default = "default_use_copy")]
+    pub use_copy: bool,
 }
 
 fn default_batch_size() -> usize {
     8192
 }
 
+fn default_max_batch_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_concurrent_partitions() -> usize {
+    4
+}
+
+fn default_use_copy() -> bool {
+    false
+}
+
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             batch_size: default_batch_size(),
+            max_batch_bytes: default_max_batch_bytes(),
+            concurrent_partitions: default_concurrent_partitions(),
+            use_copy: default_use_copy(),
         }
     }
 }
@@ -364,6 +410,18 @@ impl JobConfig {
                 self.execution.batch_size
             ));
         }
+        if self.execution.max_batch_bytes < 1 {
+            bad.push(format!(
+                "execution.max_batch_bytes must be >= 1 (got {})",
+                self.execution.max_batch_bytes
+            ));
+        }
+        if self.execution.concurrent_partitions < 1 {
+            bad.push(format!(
+                "execution.concurrent_partitions must be >= 1 (got {})",
+                self.execution.concurrent_partitions
+            ));
+        }
         if self.parallel_scan.partitions < 1 {
             bad.push(format!(
                 "parallel_scan.partitions must be >= 1 (got {})",
@@ -429,6 +487,11 @@ mod tests {
         assert_eq!(config.pushdown.push, Vec::<String>::new());
         assert_eq!(config.distributed.workers, 2);
         assert_eq!(config.execution.batch_size, 8192);
+        assert_eq!(config.execution.max_batch_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.execution.concurrent_partitions, 4);
+        assert!(!config.execution.use_copy);
+        assert_eq!(config.checkpoint.flush_interval_secs, 5);
+        assert_eq!(config.checkpoint.flush_rows, 100_000);
         assert_eq!(config.parallel_scan.partition_column, "order_id");
     }
 

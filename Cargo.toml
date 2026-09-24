@@ -18,6 +18,7 @@ ballista-core = "54.1.0"
 ballista-executor = { version = "54.1.0", default-features = false, features = ["arrow-ipc-optimizations"] }
 ballista-scheduler = { version = "54.1.0", default-features = false, features = ["rest-api", "tracing"] }
 bigdecimal = "0.4.10"
+bytes = "1"
 chrono = { version = "0.4.45", features = ["serde"] }
 datafusion = "54.1.0"
 datafusion-proto = "54.1.0"

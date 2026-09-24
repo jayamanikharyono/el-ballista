@@ -1,4 +1,5 @@
 pub mod arrow_type_mapper;
+pub mod copy;
 pub mod dialect;
 pub mod execution_plan;
 pub mod extractor;

@@ -55,6 +55,7 @@ fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
                 .join(format!("relex_paths_{}", db.schema))
                 .to_string_lossy()
                 .to_string(),
+            ..CheckpointConfig::default()
         },
         pushdown: PushdownConfig::default(),
         parallel_scan: ParallelScanConfig::default(),

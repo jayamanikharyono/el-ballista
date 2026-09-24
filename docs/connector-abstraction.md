@@ -36,7 +36,7 @@ Stays connector-specific (never shared):
   identifier quoting (`"..."` vs `` `...` ``).
 - Catalog + statistics + EXPLAIN queries (`pg_stats`/`pg_read_all_stats`/EXPLAIN vs MySQL).
 - Type mapping to Arrow and row decoding.
-- Cursor/streaming mechanics (`DECLARE ... WITH HOLD` is Postgres-only).
+- Cursor/streaming mechanics (`DECLARE ... CURSOR WITHOUT HOLD` + `FETCH` is Postgres-only).
 - Parallel strategy: `ctid` is Postgres-physical; MySQL is keyset-only.
 - Ballista logical/physical codecs (each serializes its own `TableProvider`/`ExecutionPlan`).
 

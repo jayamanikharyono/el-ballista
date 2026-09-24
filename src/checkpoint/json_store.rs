@@ -35,14 +35,17 @@ impl JsonCheckpointStore {
         self.dir.join(format!("{}.json", sanitize(&key.job_id)))
     }
 
-    fn read_file(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError> {
+    /// Async, non-blocking read. Uses `tokio::fs` throughout so checkpoint I/O never
+    /// parks a Tokio worker thread (the old `std::fs` calls did).
+    async fn read_file(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError> {
         let path = self.path_for(key);
 
-        if !path.exists() {
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(None);
         }
 
-        let text = fs::read_to_string(&path)
+        let text = tokio::fs::read_to_string(&path)
+            .await
             .map_err(|e| AppError::Checkpoint(format!("cannot read {}: {e}", path.display())))?;
 
         let checkpoint: JobCheckpoint = serde_json::from_str(&text).map_err(|e| {
@@ -52,7 +55,10 @@ impl JsonCheckpointStore {
         Ok(Some(checkpoint))
     }
 
-    fn write_file(&self, key: &JobKey, checkpoint: &JobCheckpoint) -> Result<(), AppError> {
+    /// Async, non-blocking atomic write (tmp + rename). File `fsync` is awaited via
+    /// `tokio::fs`; directory `fsync` runs in `spawn_blocking` (best-effort) so the
+    /// async executor is never blocked on a directory sync.
+    async fn write_file(&self, key: &JobKey, checkpoint: &JobCheckpoint) -> Result<(), AppError> {
         let path = self.path_for(key);
         // Unique tmp avoids last-writer-wins collision when concurrent `write_file` calls
         // race on the same job (last `rename` wins, but no torn JSON). `fsync` + dir `fsync`
@@ -70,25 +76,32 @@ impl JsonCheckpointStore {
         let text = serde_json::to_string_pretty(checkpoint)
             .map_err(|e| AppError::Checkpoint(format!("cannot serialize checkpoint: {e}")))?;
 
-        fs::write(&tmp_path, &text).map_err(|e| {
-            AppError::Checkpoint(format!("cannot write {}: {e}", tmp_path.display()))
-        })?;
+        tokio::fs::write(&tmp_path, text.as_bytes())
+            .await
+            .map_err(|e| {
+                AppError::Checkpoint(format!("cannot write {}: {e}", tmp_path.display()))
+            })?;
 
-        // Durability: sync file contents before rename.
-        if let Ok(f) = std::fs::OpenOptions::new().read(true).open(&tmp_path) {
-            let _ = f.sync_all();
+        // Durability: sync file contents before rename (async).
+        if let Ok(f) = tokio::fs::File::open(&tmp_path).await {
+            let _ = f.sync_all().await;
         }
 
-        fs::rename(&tmp_path, &path).map_err(|e| {
-            // Best-effort cleanup of orphaned tmp on cross-device rename failure.
-            let _ = fs::remove_file(&tmp_path);
+        tokio::fs::rename(&tmp_path, &path).await.map_err(|e| {
             AppError::Checkpoint(format!("cannot finalize {}: {e}", path.display()))
         })?;
 
         // Durability: sync directory entry so rename survives crash on ext4.
-        if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(&self.dir) {
-            let _ = dir.sync_all();
-        }
+        // `spawn_blocking` keeps the async executor unblocked; the rename itself is
+        // already done, so a crash before the dir sync only risks losing the latest
+        // commit on filesystems without journaled renames.
+        let dir = self.dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(d) = std::fs::OpenOptions::new().read(true).open(&dir) {
+                let _ = d.sync_all();
+            }
+        })
+        .await;
 
         Ok(())
     }
@@ -110,7 +123,7 @@ fn sanitize(s: &str) -> String {
 impl CheckpointStore for JsonCheckpointStore {
     async fn begin(&self, key: &JobKey, split_ids: &[String]) -> Result<JobCheckpoint, AppError> {
         let now = Utc::now();
-        let existing = self.read_file(key)?;
+        let existing = self.read_file(key).await?;
 
         let mut splits: Vec<SplitStatus> = Vec::with_capacity(split_ids.len());
         for split_id in split_ids {
@@ -142,12 +155,12 @@ impl CheckpointStore for JsonCheckpointStore {
             splits,
             updated_at: now,
         };
-        self.write_file(key, &checkpoint)?;
+        self.write_file(key, &checkpoint).await?;
         Ok(checkpoint)
     }
 
     async fn mark_running(&self, key: &JobKey, split_id: &str) -> Result<(), AppError> {
-        let mut checkpoint = self.read_file(key)?.ok_or_else(|| {
+        let mut checkpoint = self.read_file(key).await?.ok_or_else(|| {
             AppError::Checkpoint(format!("no checkpoint begun for job '{}'", key.job_id))
         })?;
         let now = Utc::now();
@@ -164,7 +177,7 @@ impl CheckpointStore for JsonCheckpointStore {
         split.state = SplitState::Running;
         split.updated_at = now;
         checkpoint.updated_at = now;
-        self.write_file(key, &checkpoint)
+        self.write_file(key, &checkpoint).await
     }
 
     async fn mark_completed(
@@ -173,7 +186,7 @@ impl CheckpointStore for JsonCheckpointStore {
         split_id: &str,
         rows_extracted: u64,
     ) -> Result<(), AppError> {
-        let mut checkpoint = self.read_file(key)?.ok_or_else(|| {
+        let mut checkpoint = self.read_file(key).await?.ok_or_else(|| {
             AppError::Checkpoint(format!("no checkpoint begun for job '{}'", key.job_id))
         })?;
         let now = Utc::now();
@@ -196,11 +209,11 @@ impl CheckpointStore for JsonCheckpointStore {
             "job '{}' split '{split_id}' completed (rows_extracted={rows_extracted})",
             key.job_id,
         );
-        self.write_file(key, &checkpoint)
+        self.write_file(key, &checkpoint).await
     }
 
     async fn mark_failed(&self, key: &JobKey, split_id: &str, err: &str) -> Result<(), AppError> {
-        let mut checkpoint = match self.read_file(key)? {
+        let mut checkpoint = match self.read_file(key).await? {
             Some(current) => current,
             None => return Ok(()),
         };
@@ -215,19 +228,19 @@ impl CheckpointStore for JsonCheckpointStore {
             split.error = Some(err.to_string());
             split.updated_at = now;
             checkpoint.updated_at = now;
-            self.write_file(key, &checkpoint)?;
+            self.write_file(key, &checkpoint).await?;
         }
         Ok(())
     }
 
     async fn read(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError> {
-        self.read_file(key)
+        self.read_file(key).await
     }
 
     async fn reset(&self, key: &JobKey) -> Result<(), AppError> {
         let path = self.path_for(key);
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| {
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            tokio::fs::remove_file(&path).await.map_err(|e| {
                 AppError::Checkpoint(format!("cannot reset {}: {e}", path.display()))
             })?;
         }

@@ -83,6 +83,42 @@ impl PostgresQueryBuilder {
         query.push_bind(hi);
     }
 
+    /// Builds `SELECT <cols> FROM <table> WHERE <partition_col> >= lo AND <partition_col> < hi`
+    /// with the bounds **inlined as integer literals** instead of `$1/$2` binds.
+    /// `COPY (SELECT …)` accepts no bind parameters, so the COPY path renders bounds
+    /// this way; `lo`/`hi` are `i64` values this crate computed itself (MIN/MAX math),
+    /// never user text — the same trust level as the inlined partition predicates in
+    /// `PostgresExecutionPlan::build_query`.
+    pub fn build_keyset_partition_inline(
+        query: &mut QueryBuilder<Postgres>,
+        table: &TableMetadata,
+        partition_column: &str,
+        lo: i64,
+        hi: i64,
+    ) {
+        query.push("SELECT ");
+
+        Self::push_columns(query, table);
+
+        query.push(" FROM ");
+
+        Self::push_identifier(query, &table.schema_name);
+
+        query.push(".");
+
+        Self::push_identifier(query, &table.table_name);
+
+        query.push(" WHERE ");
+
+        Self::push_identifier(query, partition_column);
+
+        query.push(format!(" >= {lo} AND "));
+
+        Self::push_identifier(query, partition_column);
+
+        query.push(format!(" < {hi}"));
+    }
+
     pub(crate) fn push_identifier(query: &mut QueryBuilder<Postgres>, identifier: &str) {
         query.push("\"");
         query.push(identifier.replace('"', "\"\""));
@@ -159,6 +195,23 @@ mod tests {
             sql.contains(r#"WHERE "order_id" >= $1 AND "order_id" < $2"#),
             "unexpected keyset SQL: {sql}"
         );
+    }
+
+    #[test]
+    fn test_build_keyset_partition_inline_inlines_integer_bounds() {
+        let table = orders_metadata();
+        let mut qb = QueryBuilder::<Postgres>::new("");
+        PostgresQueryBuilder::build_keyset_partition_inline(&mut qb, &table, "order_id", 1, 25001);
+
+        let sql = qb.sql();
+        let sql = sql.as_str();
+        // Integer bounds inlined: COPY accepts no bind parameters, and i64
+        // rendering is total (no quoting/escaping surface at all).
+        assert!(
+            sql.contains(r#"WHERE "order_id" >= 1 AND "order_id" < 25001"#),
+            "unexpected inline keyset SQL: {sql}"
+        );
+        assert!(!sql.contains('$'), "inline form must bind nothing: {sql}");
     }
 
     #[test]

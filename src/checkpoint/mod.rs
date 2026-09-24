@@ -18,6 +18,7 @@
 //! cross-machine compare-and-swap lease.
 
 pub mod json_store;
+pub mod progress;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

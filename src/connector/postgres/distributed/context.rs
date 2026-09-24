@@ -40,6 +40,15 @@ pub struct DistributedContext {
 }
 
 impl DistributedContext {
+    /// Base config for driver/executor sessions: carries the job's `batch_size` (so
+    /// DataFusion-side batching matches the source `FETCH`/flush size) and
+    /// `target_partitions` (so local parallelism matches the worker budget).
+    fn session_config_for(config: &JobConfig, workers: usize) -> SessionConfig {
+        SessionConfig::new()
+            .with_batch_size(config.execution.batch_size.max(1))
+            .with_target_partitions(workers.max(1))
+    }
+
     fn session_state(config: &SessionConfig) -> SessionState {
         let config = config
             .clone()
@@ -65,15 +74,15 @@ impl DistributedContext {
     /// registry) and it becomes the keyset partition count.
     pub async fn standalone(config: &JobConfig, workers: usize) -> Result<Self, AppError> {
         log::info!("starting standalone Ballista scheduler + executor in this process");
-        let session =
-            SessionContext::standalone_with_state(Self::session_state(&SessionConfig::new()))
-                .await?;
-
         let workers = if workers > 0 {
             workers
         } else {
             config.distributed.workers.max(1)
         };
+        let session = SessionContext::standalone_with_state(Self::session_state(
+            &Self::session_config_for(config, workers),
+        ))
+        .await?;
 
         Ok(Self::from_session(
             session,
@@ -92,17 +101,16 @@ impl DistributedContext {
         workers: usize,
     ) -> Result<Self, AppError> {
         log::info!("connecting to Ballista scheduler at {scheduler_url}");
-        let session = SessionContext::remote_with_state(
-            scheduler_url,
-            Self::session_state(&SessionConfig::new()),
-        )
-        .await?;
-
         let workers = if workers > 0 {
             workers
         } else {
             config.distributed.workers.max(1)
         };
+        let session = SessionContext::remote_with_state(
+            scheduler_url,
+            Self::session_state(&Self::session_config_for(config, workers)),
+        )
+        .await?;
 
         Ok(Self::from_session(
             session,
@@ -156,6 +164,8 @@ impl DistributedContext {
 
         let provider = provider
             .with_parallel_workers(partitions, self.partition_column.clone())
+            .with_max_batch_bytes(config.execution.max_batch_bytes)
+            .with_use_copy(config.execution.use_copy)
             .with_parallel_strategy(
                 crate::connector::postgres::parallel::ParallelStrategy::parse(
                     &config.parallel_scan.strategy,

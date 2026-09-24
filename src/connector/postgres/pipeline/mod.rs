@@ -28,8 +28,10 @@ use datafusion::datasource::TableProvider;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::prelude::{SessionContext, col, lit};
+use futures::StreamExt;
 
 use crate::checkpoint::json_store::JsonCheckpointStore;
+use crate::checkpoint::progress::{PartitionStatus, ProgressFlusher};
 use crate::checkpoint::{CheckpointStore, JobKey};
 use crate::config::{FilterEntry, FilterInput, FilterOp, FilterSpec, JobConfig};
 use crate::connector::postgres::PostgresExtractor;
@@ -77,6 +79,9 @@ pub struct FilterDecision {
     /// Human-readable reason (same text `rel plan` prints).
     pub reason: String,
 }
+
+/// One finished keyset partition: id, its Arrow batches, and its row count.
+type PartitionBatches = (usize, Vec<RecordBatch>, u64);
 
 /// A runnable extraction job built from a [`JobConfig`].
 pub struct Pipeline {
@@ -295,64 +300,148 @@ impl Pipeline {
     }
 
     /// Full extraction honoring `parallel_scan`. Returns the batches and the row count.
+    ///
+    /// Partitions scan **concurrently** (bounded by `execution.concurrent_partitions`;
+    /// the source pool still caps connections). Each partition streams cursor `FETCH`
+    /// windows — or one `COPY … TO STDOUT (FORMAT BINARY)` stream when
+    /// `execution.use_copy` — through a byte-capped builder, so peak memory is
+    /// `O(concurrency × batch)` instead of `O(table)`. Results are re-sorted by
+    /// partition id for deterministic batch order.
     async fn extract_full(
         &self,
         extractor: &PostgresExtractor,
     ) -> Result<(Vec<RecordBatch>, u64), AppError> {
         let table = self.config.resolved_table();
         let batch_size = self.config.execution.batch_size;
+        let max_batch_bytes = self.config.execution.max_batch_bytes;
+        let use_copy = self.config.execution.use_copy;
         let partition_column = &self.config.parallel_scan.partition_column;
         let strategy = ParallelStrategy::parse(&self.config.parallel_scan.strategy);
         let scan_partitions = self.compute_scan_partitions(extractor).await?;
 
         log::info!(
-            "job '{}': full extraction of {} (strategy {:?}, partitions {}, batch_size {})",
+            "job '{}': full extraction of {} (strategy {:?}, partitions {}, batch_size {}, max_batch_bytes {}, {})",
             self.config.job_id,
             table,
             strategy,
             scan_partitions.len().max(1),
-            batch_size
+            batch_size,
+            max_batch_bytes,
+            if use_copy { "COPY" } else { "cursor" }
         );
 
+        if scan_partitions.is_empty() {
+            let batches = if use_copy {
+                extractor
+                    .extract_full_table_via_copy_with_limits(
+                        &table,
+                        self.columns(),
+                        batch_size,
+                        max_batch_bytes,
+                    )
+                    .await?
+            } else {
+                extractor
+                    .extract_full_table_via_cursor_with_limits(
+                        &table,
+                        self.columns(),
+                        batch_size,
+                        max_batch_bytes,
+                    )
+                    .await?
+            };
+            let rows_extracted: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+            return Ok((batches, rows_extracted));
+        }
+
+        // Owned per-partition inputs so concurrent tasks share nothing but the pool.
+        let columns_owned: Option<Vec<String>> = self.config.columns.clone();
+        let concurrency = self
+            .config
+            .execution
+            .concurrent_partitions
+            .max(1)
+            .min(scan_partitions.len());
+
+        let results: Vec<Result<PartitionBatches, AppError>> =
+            futures::stream::iter(scan_partitions.iter().map(|part| {
+                let extractor = extractor.clone();
+                let table = table.clone();
+                let columns_owned = columns_owned.clone();
+                let partition_column = partition_column.clone();
+                let part = part.clone();
+                async move {
+                    let columns: Option<Vec<&str>> = columns_owned
+                        .as_ref()
+                        .map(|c| c.iter().map(String::as_str).collect());
+                    let batches = match (part.lo, part.hi) {
+                        (Some(lo), Some(hi)) => {
+                            if use_copy {
+                                extractor
+                                    .extract_keyset_partition_via_copy_with_limits(
+                                        &table,
+                                        columns,
+                                        &partition_column,
+                                        lo,
+                                        hi,
+                                        batch_size,
+                                        max_batch_bytes,
+                                    )
+                                    .await?
+                            } else {
+                                extractor
+                                    .extract_keyset_partition_via_cursor_with_limits(
+                                        &table,
+                                        columns,
+                                        &partition_column,
+                                        lo,
+                                        hi,
+                                        batch_size,
+                                        max_batch_bytes,
+                                    )
+                                    .await?
+                            }
+                        }
+                        _ => {
+                            if use_copy {
+                                extractor
+                                    .extract_full_table_via_copy_with_limits(
+                                        &table,
+                                        columns,
+                                        batch_size,
+                                        max_batch_bytes,
+                                    )
+                                    .await?
+                            } else {
+                                extractor
+                                    .extract_full_table_via_cursor_with_limits(
+                                        &table,
+                                        columns,
+                                        batch_size,
+                                        max_batch_bytes,
+                                    )
+                                    .await?
+                            }
+                        }
+                    };
+                    let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                    log::info!("partition {} extracted {} row(s)", part.partition_id, rows);
+                    Ok((part.partition_id, batches, rows))
+                }
+            }))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        // Deterministic order regardless of completion order.
+        let mut results = results;
+        results.sort_by_key(|r| r.as_ref().map(|(id, _, _)| *id).unwrap_or(usize::MAX));
         let mut batches = Vec::new();
         let mut rows_extracted: u64 = 0;
-
-        if scan_partitions.is_empty() {
-            let batch = extractor
-                .extract_full_table_with_batch_size(&table, self.columns(), batch_size)
-                .await?;
-            rows_extracted += batch.num_rows() as u64;
-            batches.push(batch);
-        } else {
-            for part in &scan_partitions {
-                let batch = match (part.lo, part.hi) {
-                    (Some(lo), Some(hi)) => {
-                        extractor
-                            .extract_keyset_partition_with_batch_size(
-                                &table,
-                                self.columns(),
-                                partition_column,
-                                lo,
-                                hi,
-                                batch_size,
-                            )
-                            .await?
-                    }
-                    _ => {
-                        extractor
-                            .extract_full_table_with_batch_size(&table, self.columns(), batch_size)
-                            .await?
-                    }
-                };
-                log::info!(
-                    "job '{}': partition {} extracted {} row(s)",
-                    self.config.job_id,
-                    part.partition_id,
-                    batch.num_rows()
-                );
-                rows_extracted += batch.num_rows() as u64;
-                batches.push(batch);
-            }
+        for result in results {
+            let (_, mut part_batches, rows) = result?;
+            rows_extracted += rows;
+            batches.append(&mut part_batches);
         }
 
         Ok((batches, rows_extracted))
@@ -372,6 +461,12 @@ impl Pipeline {
 
     /// Operational full extraction with per-split checkpointing. Each keyset partition
     /// is one split; completed splits are skipped on retry.
+    ///
+    /// Bounded memory: each split streams cursor batches through `for_each_batch`,
+    /// counting rows and dropping batches immediately — the split's row count (not its
+    /// data) is what reaches `mark_completed`. Split state transitions are unchanged:
+    /// completed splits are never re-scanned, failures record the split without
+    /// touching completed ones.
     async fn run_full_with_splits(&self) -> Result<RunOutcome, AppError> {
         let extractor = self.connect().await?;
         let scan_partitions = self.compute_scan_partitions(&extractor).await?;
@@ -381,8 +476,22 @@ impl Pipeline {
         let key = JobKey::new(self.config.job_id.clone());
         let checkpoint = store.begin(&key, &split_ids).await?;
 
+        // Driver-owned progress: per-split completion reports flow through a
+        // non-blocking channel to a background writer; the checkpoint file stays the
+        // commit point. Workers never touch either.
+        let flusher = ProgressFlusher::start(
+            self.config.checkpoint.dir.clone(),
+            self.config.job_id.clone(),
+            split_ids.len().max(1),
+            std::time::Duration::from_secs(self.config.checkpoint.flush_interval_secs.max(1)),
+            self.config.checkpoint.flush_rows.max(1),
+        );
+        let reporter = flusher.reporter();
+
         let table = self.config.resolved_table();
         let batch_size = self.config.execution.batch_size;
+        let max_batch_bytes = self.config.execution.max_batch_bytes;
+        let use_copy = self.config.execution.use_copy;
         let partition_column = self.config.parallel_scan.partition_column.clone();
 
         let mut rows_extracted: u64 = 0;
@@ -401,26 +510,68 @@ impl Pipeline {
                     .expect("checked");
                 rows_extracted += prev.rows_extracted;
                 splits_completed += 1;
+                reporter.try_report(PartitionStatus::completed(
+                    0,
+                    split_id.clone(),
+                    prev.rows_extracted,
+                ));
                 log::info!(
                     "job '{}': {split_id} already completed, skipping",
                     self.config.job_id
                 );
             } else {
                 store.mark_running(&key, split_id).await?;
-                let batch = match extractor
-                    .extract_full_table_with_batch_size(&table, self.columns(), batch_size)
-                    .await
-                {
-                    Ok(batch) => batch,
+                let columns_owned = self.config.columns.clone();
+                let columns: Option<Vec<&str>> = columns_owned
+                    .as_ref()
+                    .map(|c| c.iter().map(String::as_str).collect());
+                let mut rows: u64 = 0;
+                let scan = if use_copy {
+                    extractor
+                        .extract_full_table_via_copy_for_each_batch(
+                            &table,
+                            columns,
+                            batch_size,
+                            max_batch_bytes,
+                            &mut |batch| {
+                                rows += batch.num_rows() as u64;
+                                Ok(())
+                            },
+                        )
+                        .await
+                } else {
+                    extractor
+                        .extract_full_table_for_each_batch(
+                            &table,
+                            columns,
+                            batch_size,
+                            max_batch_bytes,
+                            &mut |batch| {
+                                rows += batch.num_rows() as u64;
+                                Ok(())
+                            },
+                        )
+                        .await
+                };
+                match scan {
+                    Ok(_) => {
+                        store.mark_completed(&key, split_id, rows).await?;
+                        reporter.try_report(PartitionStatus::completed(0, split_id.clone(), rows));
+                        rows_extracted += rows;
+                        splits_completed += 1;
+                    }
                     Err(e) => {
+                        reporter.try_report(PartitionStatus::failed(
+                            0,
+                            split_id.clone(),
+                            rows,
+                            e.to_string(),
+                        ));
+                        flusher.shutdown().await;
                         let _ = store.mark_failed(&key, split_id, &e.to_string()).await;
                         return Err(AppError::Extractor(e));
                     }
-                };
-                let rows = batch.num_rows() as u64;
-                store.mark_completed(&key, split_id, rows).await?;
-                rows_extracted += rows;
-                splits_completed += 1;
+                }
             }
         } else {
             for part in &scan_partitions {
@@ -436,6 +587,11 @@ impl Pipeline {
                         .expect("checked");
                     rows_extracted += prev.rows_extracted;
                     splits_completed += 1;
+                    reporter.try_report(PartitionStatus::completed(
+                        part.partition_id,
+                        split_id.clone(),
+                        prev.rows_extracted,
+                    ));
                     log::info!(
                         "job '{}': {split_id} already completed, skipping",
                         self.config.job_id
@@ -443,33 +599,96 @@ impl Pipeline {
                     continue;
                 }
                 store.mark_running(&key, &split_id).await?;
-                let batch = match (part.lo, part.hi) {
+                let columns_owned = self.config.columns.clone();
+                let columns: Option<Vec<&str>> = columns_owned
+                    .as_ref()
+                    .map(|c| c.iter().map(String::as_str).collect());
+                let mut rows: u64 = 0;
+                let scan = match (part.lo, part.hi) {
                     (Some(lo), Some(hi)) => {
-                        extractor
-                            .extract_keyset_partition_with_batch_size(
-                                &table,
-                                self.columns(),
-                                &partition_column,
-                                lo,
-                                hi,
-                                batch_size,
-                            )
-                            .await
+                        if use_copy {
+                            extractor
+                                .extract_keyset_partition_via_copy_for_each_batch(
+                                    &table,
+                                    columns,
+                                    &partition_column,
+                                    lo,
+                                    hi,
+                                    batch_size,
+                                    max_batch_bytes,
+                                    &mut |batch| {
+                                        rows += batch.num_rows() as u64;
+                                        Ok(())
+                                    },
+                                )
+                                .await
+                        } else {
+                            extractor
+                                .extract_keyset_partition_for_each_batch(
+                                    &table,
+                                    columns,
+                                    &partition_column,
+                                    lo,
+                                    hi,
+                                    batch_size,
+                                    max_batch_bytes,
+                                    &mut |batch| {
+                                        rows += batch.num_rows() as u64;
+                                        Ok(())
+                                    },
+                                )
+                                .await
+                        }
                     }
                     _ => {
-                        extractor
-                            .extract_full_table_with_batch_size(&table, self.columns(), batch_size)
-                            .await
+                        if use_copy {
+                            extractor
+                                .extract_full_table_via_copy_for_each_batch(
+                                    &table,
+                                    columns,
+                                    batch_size,
+                                    max_batch_bytes,
+                                    &mut |batch| {
+                                        rows += batch.num_rows() as u64;
+                                        Ok(())
+                                    },
+                                )
+                                .await
+                        } else {
+                            extractor
+                                .extract_full_table_for_each_batch(
+                                    &table,
+                                    columns,
+                                    batch_size,
+                                    max_batch_bytes,
+                                    &mut |batch| {
+                                        rows += batch.num_rows() as u64;
+                                        Ok(())
+                                    },
+                                )
+                                .await
+                        }
                     }
                 };
-                match batch {
-                    Ok(batch) => {
-                        let rows = batch.num_rows() as u64;
+                match scan {
+                    Ok(_) => {
                         store.mark_completed(&key, &split_id, rows).await?;
+                        reporter.try_report(PartitionStatus::completed(
+                            part.partition_id,
+                            split_id.clone(),
+                            rows,
+                        ));
                         rows_extracted += rows;
                         splits_completed += 1;
                     }
                     Err(e) => {
+                        reporter.try_report(PartitionStatus::failed(
+                            part.partition_id,
+                            split_id.clone(),
+                            rows,
+                            e.to_string(),
+                        ));
+                        flusher.shutdown().await;
                         let _ = store.mark_failed(&key, &split_id, &e.to_string()).await;
                         return Err(AppError::Extractor(e));
                     }
@@ -477,6 +696,7 @@ impl Pipeline {
             }
         }
 
+        flusher.shutdown().await;
         Ok(RunOutcome {
             rows_extracted,
             splits_completed,
@@ -493,6 +713,9 @@ impl Pipeline {
     }
 
     /// Operational filtered extraction: one logical split tracked in the checkpoint store.
+    ///
+    /// Bounded memory: the DataFrame streams (`execute_stream`) with per-batch counting —
+    /// the split's row count (not its data) is what reaches `mark_completed`.
     async fn run_filtered_with_splits(&self) -> Result<RunOutcome, AppError> {
         let store = JsonCheckpointStore::new(&self.config.checkpoint.dir)?;
         let key = JobKey::new(self.config.job_id.clone());
@@ -522,17 +745,34 @@ impl Pipeline {
         }
 
         store.mark_running(&key, "split-0").await?;
-        let batches = match self.extract_filtered_local().await {
-            Ok(batches) => batches,
+        let df = match self.filtered_dataframe_local().await {
+            Ok(df) => df,
             Err(e) => {
                 let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
                 return Err(e);
             }
         };
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        store.mark_completed(&key, "split-0", rows as u64).await?;
+        let mut rows: u64 = 0;
+        let mut stream = match df.execute_stream().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
+                return Err(AppError::DataFusion(e));
+            }
+        };
+        use futures::StreamExt as _;
+        while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => rows += batch.num_rows() as u64,
+                Err(e) => {
+                    let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
+                    return Err(AppError::DataFusion(e));
+                }
+            }
+        }
+        store.mark_completed(&key, "split-0", rows).await?;
         Ok(RunOutcome {
-            rows_extracted: rows as u64,
+            rows_extracted: rows,
             splits_completed: 1,
             splits_total: 1,
             workers: None,
@@ -563,7 +803,10 @@ impl Pipeline {
         .map_err(AppError::Extractor)?;
 
         let strategy = ParallelStrategy::parse(&self.config.parallel_scan.strategy);
-        Ok(provider.with_parallel_strategy(strategy))
+        Ok(provider
+            .with_parallel_strategy(strategy)
+            .with_max_batch_bytes(self.config.execution.max_batch_bytes)
+            .with_use_copy(self.config.execution.use_copy))
     }
 
     /// Build the local filtered DataFrame: register a cost-aware provider and apply the
@@ -615,6 +858,9 @@ impl Pipeline {
     /// Run the operational distributed job with split checkpointing. The distributed scan
     /// is one logical split executed by the cluster (`workers` recorded in the outcome);
     /// per-task execution lives in Ballista.
+    ///
+    /// Bounded memory: the cluster result streams (`execute_stream`) with per-batch
+    /// counting and driver-side progress reporting — batches are dropped immediately.
     pub async fn run_distributed(
         &self,
         workers: Option<usize>,
@@ -650,9 +896,24 @@ impl Pipeline {
         store.mark_running(&key, "split-0").await?;
         let ctx = self.make_distributed_ctx(workers, scheduler_url).await?;
         let ctx_workers = ctx.workers;
+
+        // Driver-owned progress: executor tasks stream batches back; the driver counts
+        // rows and its background task persists advisory progress. Workers never touch
+        // the checkpoint dir and never wait for a progress write.
+        let flusher = ProgressFlusher::start(
+            self.config.checkpoint.dir.clone(),
+            self.config.job_id.clone(),
+            1,
+            std::time::Duration::from_secs(self.config.checkpoint.flush_interval_secs.max(1)),
+            self.config.checkpoint.flush_rows.max(1),
+        );
+        let reporter = flusher.reporter();
+        let report_every = self.config.checkpoint.flush_rows.max(1);
+
         let mut df = match ctx.session.table(&self.config.table).await {
             Ok(df) => df,
             Err(e) => {
+                flusher.shutdown().await;
                 let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
                 return Err(AppError::DataFusion(e));
             }
@@ -661,6 +922,7 @@ impl Pipeline {
         let exprs = match self.filter_exprs_with_schema(&schema) {
             Ok(exprs) => exprs,
             Err(e) => {
+                flusher.shutdown().await;
                 let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
                 return Err(e);
             }
@@ -669,6 +931,7 @@ impl Pipeline {
             match df.filter(expr) {
                 Ok(next) => df = next,
                 Err(e) => {
+                    flusher.shutdown().await;
                     let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
                     return Err(AppError::DataFusion(e));
                 }
@@ -679,24 +942,52 @@ impl Pipeline {
             match df.select(exprs) {
                 Ok(next) => df = next,
                 Err(e) => {
+                    flusher.shutdown().await;
                     let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
                     return Err(AppError::DataFusion(e));
                 }
             }
         }
-        let batches = match df.collect().await {
-            Ok(batches) => batches,
+        let mut stream = match df.execute_stream().await {
+            Ok(stream) => stream,
             Err(e) => {
+                flusher.shutdown().await;
                 // Release the split so the next run retries it instead of wedging.
                 let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
                 return Err(AppError::DataFusion(e));
             }
         };
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        store.mark_completed(&key, "split-0", rows as u64).await?;
+        let mut rows: u64 = 0;
+        let mut since_report: u64 = 0;
+        use futures::StreamExt as _;
+        while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => {
+                    let n = batch.num_rows() as u64;
+                    rows += n;
+                    since_report += n;
+                    if since_report >= report_every {
+                        reporter.try_add_rows(since_report);
+                        since_report = 0;
+                    }
+                }
+                Err(e) => {
+                    flusher.shutdown().await;
+                    // Release the split so the next run retries it instead of wedging.
+                    let _ = store.mark_failed(&key, "split-0", &e.to_string()).await;
+                    return Err(AppError::DataFusion(e));
+                }
+            }
+        }
+        if since_report > 0 {
+            reporter.try_add_rows(since_report);
+        }
+        store.mark_completed(&key, "split-0", rows).await?;
+        reporter.try_report(PartitionStatus::completed(0, "split-0", rows));
+        flusher.shutdown().await;
 
         Ok(RunOutcome {
-            rows_extracted: rows as u64,
+            rows_extracted: rows,
             splits_completed: 1,
             splits_total: 1,
             workers: Some(ctx_workers),

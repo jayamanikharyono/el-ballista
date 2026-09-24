@@ -124,7 +124,10 @@ impl ExtractContext {
         .map_err(AppError::Extractor)?;
 
         let strategy = ParallelStrategy::parse(&self.config.parallel_scan.strategy);
-        let provider = provider.with_parallel_strategy(strategy);
+        let provider = provider
+            .with_parallel_strategy(strategy)
+            .with_max_batch_bytes(self.config.execution.max_batch_bytes)
+            .with_use_copy(self.config.execution.use_copy);
 
         self.session_ctx
             .register_table(table_name, Arc::new(provider))

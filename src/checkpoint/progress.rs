@@ -6,7 +6,7 @@
 //! `RecordBatch`es back; the driver derives per-partition status from those batches (or
 //! from its own single-node partition loops) and reports it here.
 //!
-//! Design: the extraction loop holds a [`ProgressReporter`] and calls [`ProgressReporter::try_report`]
+//! Design: the extraction loop holds a [`ProgressReporter`] and calls `ProgressReporter::try_report`
 //! per finished partition (or per N rows on merged Ballista streams). `try_report` is
 //! lock-free and never awaits — a full channel degrades to a dropped counter, never to
 //! backpressure on the scan. A background [`ProgressFlusher`] task aggregates reports and
@@ -27,6 +27,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::types::JobId;
+
 /// Per-partition status reported by driver-side scan loops (or derived from streamed batches).
 #[derive(Debug, Clone)]
 pub struct PartitionStatus {
@@ -38,13 +40,13 @@ pub struct PartitionStatus {
     pub rows: u64,
     /// True when the partition scan finished without error.
     pub done: bool,
-    /// Set when the partition scan failed (still reported so the driver can abandon fast).
+    /// Set when the partition scan failed (recorded in the advisory snapshot).
     pub error: Option<String>,
 }
 
 impl PartitionStatus {
     /// Convenience for a finished partition.
-    pub fn completed(partition_id: usize, split_id: impl Into<String>, rows: u64) -> Self {
+    pub(crate) fn completed(partition_id: usize, split_id: impl Into<String>, rows: u64) -> Self {
         Self {
             partition_id,
             split_id: split_id.into(),
@@ -55,7 +57,7 @@ impl PartitionStatus {
     }
 
     /// Convenience for a failed partition.
-    pub fn failed(
+    pub(crate) fn failed(
         partition_id: usize,
         split_id: impl Into<String>,
         rows: u64,
@@ -118,14 +120,14 @@ impl ProgressReporter {
     /// Report one partition status. Never blocks or awaits: uses `try_send` and counts
     /// a drop if the background task is behind. Progress is advisory, so a drop only
     /// delays the snapshot — correctness (split commits) is unaffected.
-    pub fn try_report(&self, status: PartitionStatus) {
+    pub(crate) fn try_report(&self, status: PartitionStatus) {
         if self.tx.try_send(ProgressMsg::Partition(status)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Add aggregate rows (merged-stream path). Same non-blocking guarantee.
-    pub fn try_add_rows(&self, rows: u64) {
+    pub(crate) fn try_add_rows(&self, rows: u64) {
         if rows == 0 {
             return;
         }
@@ -135,7 +137,7 @@ impl ProgressReporter {
     }
 
     /// How many reports were dropped due to a full channel.
-    pub fn dropped_reports(&self) -> u64 {
+    pub(crate) fn dropped_reports(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -149,16 +151,18 @@ pub struct ProgressFlusher {
 
 impl ProgressFlusher {
     /// Start the background task. `dir` is the checkpoint dir; the snapshot lands at
-    /// `<dir>/<job_id>.progress.json` (sanitized like the checkpoint files).
-    pub fn start(
+    /// `<dir>/<stem>.progress.json`, named like the checkpoint file
+    /// ([`file_stem`](super::file_stem)).
+    pub(crate) fn start(
         dir: impl Into<PathBuf>,
-        job_id: impl Into<String>,
+        job_id: &JobId,
         partitions_total: usize,
         flush_interval: Duration,
         flush_rows: u64,
     ) -> Self {
         let dir: PathBuf = dir.into();
-        let job_id: String = job_id.into();
+        let file_name = format!("{}.progress.json", super::file_stem(job_id));
+        let job_id: String = job_id.to_string();
         let (tx, rx) = mpsc::channel::<ProgressMsg>(1024);
         let dropped = Arc::new(AtomicU64::new(0));
         let reporter = ProgressReporter {
@@ -171,22 +175,19 @@ impl ProgressFlusher {
             let mut rx = rx;
             let mut states: HashMap<String, PartitionState> = HashMap::new();
             let mut aggregate_rows: u64 = 0;
-            let rows_extracted: u64 = 0;
             let mut rows_since_flush: u64 = 0;
             let mut ticker = tokio::time::interval(flush_interval);
             // First tick fires immediately; skip it so we don't write an empty snapshot.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
 
-            let snapshot = |states: &HashMap<String, PartitionState>,
-                            rows_extracted: u64,
-                            aggregate_rows: u64| {
+            let snapshot = |states: &HashMap<String, PartitionState>, aggregate_rows: u64| {
                 let partitions_done = states.values().filter(|s| s.done).count();
                 let partition_rows: u64 = states.values().map(|s| s.rows).sum();
                 ProgressSnapshot {
                     job_id: job_id.clone(),
                     updated_at: Utc::now(),
-                    rows_extracted: rows_extracted + partition_rows + aggregate_rows,
+                    rows_extracted: partition_rows + aggregate_rows,
                     partitions_total,
                     partitions_done,
                     partitions: states.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -197,9 +198,8 @@ impl ProgressFlusher {
             let write_snapshot = |snap: &ProgressSnapshot| {
                 let dir = dir.clone();
                 let snap = snap.clone();
+                let path = dir.join(&file_name);
                 async move {
-                    let name = format!("{}.progress.json", sanitize(&snap.job_id));
-                    let path = dir.join(name);
                     // Best-effort: progress is advisory. Never fail the run on it.
                     if tokio::fs::create_dir_all(&dir).await.is_err() {
                         return;
@@ -231,7 +231,7 @@ impl ProgressFlusher {
                                 });
                                 if rows_since_flush >= flush_rows {
                                     rows_since_flush = 0;
-                                    let snap = snapshot(&states, rows_extracted, aggregate_rows);
+                                    let snap = snapshot(&states, aggregate_rows);
                                     write_snapshot(&snap).await;
                                 }
                             }
@@ -240,7 +240,7 @@ impl ProgressFlusher {
                                 rows_since_flush += rows;
                                 if rows_since_flush >= flush_rows {
                                     rows_since_flush = 0;
-                                    let snap = snapshot(&states, rows_extracted, aggregate_rows);
+                                    let snap = snapshot(&states, aggregate_rows);
                                     write_snapshot(&snap).await;
                                 }
                             }
@@ -251,12 +251,12 @@ impl ProgressFlusher {
                         // Periodic flush only if something changed since last write.
                         if rows_since_flush > 0 || aggregate_rows > 0 || !states.is_empty() {
                             rows_since_flush = 0;
-                            let snap = snapshot(&states, rows_extracted, aggregate_rows);
+                            let snap = snapshot(&states, aggregate_rows);
                             write_snapshot(&snap).await;
                         }
                     }
                     reply = &mut shutdown_rx => {
-                        let snap = snapshot(&states, rows_extracted, aggregate_rows);
+                        let snap = snapshot(&states, aggregate_rows);
                         write_snapshot(&snap).await;
                         if let Ok(reply) = reply {
                             let _ = reply.send(snap.clone());
@@ -265,7 +265,7 @@ impl ProgressFlusher {
                     }
                 }
             }
-            snapshot(&states, rows_extracted, aggregate_rows)
+            snapshot(&states, aggregate_rows)
         });
 
         Self {
@@ -276,13 +276,13 @@ impl ProgressFlusher {
     }
 
     /// Non-blocking reporter to hand to driver-side scan loops.
-    pub fn reporter(&self) -> ProgressReporter {
+    pub(crate) fn reporter(&self) -> ProgressReporter {
         self.reporter.clone()
     }
 
     /// Stop the background task and return the final snapshot. Performs one last
     /// (awaited) progress write; the caller then proceeds to commit split states.
-    pub async fn shutdown(mut self) -> ProgressSnapshot {
+    pub(crate) async fn shutdown(mut self) -> ProgressSnapshot {
         let (reply_tx, reply_rx) = oneshot::channel();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(reply_tx);
@@ -315,18 +315,6 @@ impl ProgressFlusher {
     }
 }
 
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,7 +326,13 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
-        let flusher = ProgressFlusher::start(&dir, "job1", 2, Duration::from_secs(60), 1_000_000);
+        let flusher = ProgressFlusher::start(
+            &dir,
+            &JobId::new("job1").unwrap(),
+            2,
+            Duration::from_secs(60),
+            1_000_000,
+        );
         let reporter = flusher.reporter();
         reporter.try_report(PartitionStatus::completed(0, "split-0", 10));
         reporter.try_add_rows(5);
@@ -355,8 +349,13 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
-        let flusher =
-            ProgressFlusher::start(&dir, "job-load", 1, Duration::from_secs(60), u64::MAX);
+        let flusher = ProgressFlusher::start(
+            &dir,
+            &JobId::new("job-load").unwrap(),
+            1,
+            Duration::from_secs(60),
+            u64::MAX,
+        );
         let reporter = flusher.reporter();
         for i in 0..2000 {
             reporter.try_report(PartitionStatus::completed(0, "split-0", i));

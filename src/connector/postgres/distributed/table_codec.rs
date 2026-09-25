@@ -35,6 +35,20 @@ impl Default for PostgresLogicalCodec {
 }
 
 impl PostgresLogicalCodec {
+    /// A codec that carries `PostgresTableProvider` as JSON and delegates every other node and
+    /// provider to Ballista's default logical codec.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion_proto::logical_plan::LogicalExtensionCodec;
+    /// use rust_ballista_extraction_layer::connector::postgres::distributed::PostgresLogicalCodec;
+    ///
+    /// // Handed to Ballista (scheduler/executor config) in place of its default codec.
+    /// let codec: Arc<dyn LogicalExtensionCodec> = Arc::new(PostgresLogicalCodec::new());
+    /// # let _ = codec;
+    /// ```
     pub fn new() -> Self {
         Self {
             default: BallistaLogicalExtensionCodec::default(),
@@ -114,7 +128,7 @@ impl LogicalExtensionCodec for PostgresLogicalCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distributed::connection::PostgresConnectionDescriptor;
+    use crate::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
     use crate::types::table_metadata::TableMetadata;
     use datafusion::common::TableReference;
 
@@ -142,11 +156,14 @@ mod tests {
             push: vec![],
             batch_size: 1024,
             use_copy: false,
+            copy_statement_timeout_ms: None,
             max_batch_bytes: 16 * 1024 * 1024,
             parallel_workers: 4,
             partition_column: Some("order_id".to_string()),
             strategy: crate::connector::postgres::parallel::ParallelStrategy::Keyset,
             enum_columns: vec!["status".to_string()],
+            server_utf8: true,
+            fixed_partitions: None,
         }
     }
 

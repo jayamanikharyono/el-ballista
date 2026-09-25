@@ -9,7 +9,7 @@
 
 use datafusion::prelude::{col, lit};
 use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::engine::ExtractContext;
+use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

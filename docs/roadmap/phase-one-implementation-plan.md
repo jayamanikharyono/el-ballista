@@ -1,6 +1,8 @@
 # Phase 1 Implementation Plan — Single-Node PostgreSQL Extractor
 
-Status reference: [roadmap.md](../roadmap.md#phase-1--single-node-postgresql-extractor). This plan
+> **Historical plan.** File paths and module names below predate the Postgres connector modularization: code now lives under `src/connector/postgres/` (e.g. `connector::postgres::{pipeline, engine, distributed}`), `src/pushdown/` is connector-agnostic, the `SourceAwarePushdownRule` optimizer rule and the `sink` config were removed, and `run()` is a diagnostic (`run_with` is the checkpointed API). See [architecture](../architecture.md) for the current layout.
+
+Status reference: [roadmap.md](../roadmap.md#phase-1--single-node-postgresql-extraction). This plan
 takes the current code in `../../src` (a single-binary proof of concept: schema read → hardcoded window
 query → Arrow decode → optional `TableProvider` registration) to the Phase 1 exit criteria:
 

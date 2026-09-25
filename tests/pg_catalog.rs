@@ -10,7 +10,7 @@
 mod common;
 
 use common::TestDb;
-use rust_ballista_extraction_layer::pushdown::explain::ExplainEstimator;
+use rust_ballista_extraction_layer::connector::postgres::explain::ExplainEstimator;
 use rust_ballista_extraction_layer::pushdown::stats::TableStatsSource;
 use std::sync::Arc;
 
@@ -27,31 +27,41 @@ async fn table_statistics_reports_real_row_and_column_data()
     let db = live!();
     let stats = db.pool.table_statistics(&db.schema, "hostile").await?;
     assert_eq!(stats.table_name, "hostile");
-    // 8 rows were inserted by the fixture and ANALYZE was run, so pg_class.reltuples
+    // The fixture inserts `HOSTILE_ROWS` rows and runs ANALYZE, so pg_class.reltuples
     // should reflect that (not the empty-stats zero this function reports for an
-    // unreachable source).
-    assert!(
-        stats.row_count_estimate > 0.0,
-        "expected a nonzero row estimate after ANALYZE"
+    // unreachable source). ANALYZE on a table this small samples every row, so reltuples
+    // is exact.
+    assert_eq!(
+        stats.row_count_estimate,
+        common::HOSTILE_ROWS as f64,
+        "expected the fixture's {} rows after ANALYZE",
+        common::HOSTILE_ROWS
     );
-    assert!(stats.table_size_bytes > 0, "expected a nonzero table size");
+    // pg_total_relation_size: at least one 8 KiB heap page, and nowhere near a MiB for a
+    // handful of rows.
+    assert!(
+        (8192..1024 * 1024).contains(&stats.table_size_bytes),
+        "implausible size for a {}-row table: {}",
+        common::HOSTILE_ROWS,
+        stats.table_size_bytes
+    );
     assert!(
         !stats.columns.is_empty(),
         "expected pg_stats rows for at least one column"
     );
     // The primary key column should show up with a highly distinct value.
     let id_stats = stats.columns.get("id").expect("id column stats present");
-    assert!(id_stats.null_frac < 0.5, "id is never null in the fixture");
+    assert_eq!(id_stats.null_frac, 0.0, "id is never null in the fixture");
     Ok(())
 }
 
 #[tokio::test]
-async fn table_statistics_unknown_table_errors_rather_than_returning_empty()
+async fn table_statistics_unknown_table_returns_zeroed_stats()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
-    // A typo'd table name must surface as a caller-visible failure path (or, per the
-    // current implementation, a zeroed/empty result the caller can distinguish from a
-    // real table) -- either way this must not panic.
+    // Current behaviour, pinned: a typo'd table name is NOT an error — it returns a zeroed,
+    // column-less result the caller can distinguish from a real (analyzed) table. If this is
+    // changed to an error, rename the test and flip the assertions.
     let stats = db
         .pool
         .table_statistics(&db.schema, "table_that_does_not_exist")
@@ -114,8 +124,18 @@ async fn explain_estimator_reports_a_plan_for_a_real_predicate()
     let estimate = estimator
         .estimate_cost("hostile", &db.schema, "id = 1")
         .await?;
-    assert!(estimate.total_cost >= 0.0);
-    assert!(estimate.plan_rows >= 0.0);
+    // Known fixture: 13 analyzed rows, `id` is the primary key → the planner expects ~1 row
+    // (never more than the table), at a small but nonzero cost.
+    let total_cost = estimate.total_cost.expect("EXPLAIN reports Total Cost");
+    let plan_rows = estimate.plan_rows.expect("EXPLAIN reports Plan Rows");
+    assert!(
+        total_cost > 0.0 && total_cost < 100.0,
+        "implausible cost for a PK lookup on 13 rows: {total_cost}"
+    );
+    assert!(
+        (1.0..=common::HOSTILE_ROWS as f64).contains(&plan_rows),
+        "implausible row estimate for id = 1: {plan_rows}"
+    );
     Ok(())
 }
 

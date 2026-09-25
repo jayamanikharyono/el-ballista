@@ -1,5 +1,7 @@
 # Phase 3 Implementation Plan — True Streaming Execution
 
+> **Historical plan.** File paths and module names below predate the Postgres connector modularization: code now lives under `src/connector/postgres/` (e.g. `connector::postgres::{pipeline, engine, distributed}`), `src/pushdown/` is connector-agnostic, the `SourceAwarePushdownRule` optimizer rule and the `sink` config were removed, and `run()` is a diagnostic (`run_with` is the checkpointed API). See [architecture](../architecture.md) for the current layout.
+
 **Status**: ✓ COMPLETE (as of September 10, 2026)
 
 This document outlines the evolution from Phase 2 (cost-based pushdown with materialized results) to Phase 3 (true incremental streaming with bounded memory).

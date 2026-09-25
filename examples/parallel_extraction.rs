@@ -14,7 +14,7 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run --example parallel_extraction
+//! PGPASSWORD=... cargo run --example parallel_extraction
 //! ```
 
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
@@ -25,6 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
     rust_ballista_extraction_layer::logging::init_from_env_and_args();
+
+    // Never hard-code credentials: the password comes from the environment.
+    let password = std::env::var("PGPASSWORD")
+        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/app")?;
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Parallel Extraction Example");
@@ -38,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "localhost",
         5432,
         "postgres",
-        "postgres",
+        &password,
         "app",
         10, // Increased pool size for parallel extraction
         30000,
@@ -106,12 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let partition_id = partition.partition_id;
         let lo = partition.lo;
         let hi = partition.hi;
+        let partition = partition.clone();
 
         let extractor_clone = PostgresExtractor::connect(
             "localhost",
             5432,
             "postgres",
-            "postgres",
+            &password,
             "app",
             5,
             30000,
@@ -121,33 +126,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Spawn task for this partition
         let task = tokio::spawn(async move {
-            let batch_result = if let (Some(lo_val), Some(hi_val)) = (lo, hi) {
-                println!(
-                    "  [Partition {}] Extracting key range: {} <= {} < {}",
-                    partition_id, lo_val, partition_column_clone, hi_val
-                );
-
-                // Extract keyset partition with non-overlapping range
-                extractor_clone
-                    .extract_keyset_partition(
-                        &table_name_clone,
-                        columns_clone,
-                        &partition_column_clone,
-                        lo_val,
-                        hi_val,
-                    )
-                    .await
-            } else {
-                println!(
-                    "  [Partition {}] Extracting full table (no partitioning)",
-                    partition_id
-                );
-
-                // Single partition case - extract all data
-                extractor_clone
-                    .extract_full_table(&table_name_clone, columns_clone)
-                    .await
-            };
+            // Each computed partition carries its own predicate: the first one also
+            // holds NULL keys and the last one is open-ended, so together they cover
+            // every row exactly once.
+            println!(
+                "  [Partition {}] Extracting {} in [{:?}, {:?}) ({})",
+                partition_id,
+                partition_column_clone,
+                lo,
+                hi,
+                partition.predicate.as_deref().unwrap_or("whole table")
+            );
+            let batch_result = extractor_clone
+                .extract_partition(&table_name_clone, columns_clone, &partition)
+                .await;
 
             match batch_result {
                 Ok(b) => {
@@ -263,7 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 13. Implementation details
     println!("\n► Step 13: Implementation details");
-    println!("  ✓ Uses extract_keyset_partition() method");
+    println!("  ✓ Uses extract_partition() per computed partition (NULL keys + open tail covered)");
     println!("    Keyset partitioning with non-overlapping ranges:");
     println!("      • Partition 0: WHERE order_id >= 0 AND order_id < 250");
     println!("      • Partition 1: WHERE order_id >= 250 AND order_id < 500");

@@ -2,33 +2,24 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
   RUST_LOG: warn
   CARGO_BUILD_JOBS: 2
   RUSTFLAGS: "-C debuginfo=0"
-  # On CI we use a containerized Postgres; locally tests use the Docker compose
-  # stack (see tests/docker/compose.yaml and tests/common/mod.rs).
+  # Both databases come from the compose stack (tests/docker/compose.yaml: Postgres 17 + MySQL 8,
+  # seeded from tests/data) — the same stack developers run locally. These are the harness
+  # defaults, spelled out so the job is explicit about what it connects to.
   DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/test
+  MYSQL_URL: mysql://root:password@127.0.0.1:3306/test
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d test"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 30
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -48,30 +39,39 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # Style/lint checks are informational for now (the codebase predates a formatting/lint
-      # pass) — they must not block CI on cosmetic issues, only tests and the build are
-      # allowed to fail the job. Flip `continue-on-error` off once the codebase is clean.
+      # Blocking gates: formatting and lints must be clean.
       - name: cargo fmt --check
-        continue-on-error: true
         run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: cargo build (lib, bin, all examples)
         run: cargo build --workspace --all-targets
 
-      - name: cargo clippy
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
       - name: cargo test — unit tests (no DB)
         run: cargo test --lib --bins
 
-      - name: cargo test — integration + e2e (containerized Postgres)
-        timeout-minutes: 20
+      - name: cargo test — doc tests (no DB)
+        run: cargo test --doc
+
+      # Start + seed both engines; `--wait` returns only once both healthchecks pass (they use
+      # TCP, which only answers after the init/seed scripts have finished).
+      - name: Start test databases (compose)
+        timeout-minutes: 10
+        run: docker compose -f tests/docker/compose.yaml up -d --wait
+
+      # Every integration test file (tests/*.rs), serially: the fixtures share one server each.
+      - name: cargo test — all integration tests (compose stack)
+        timeout-minutes: 40
         env:
           CARGO_BUILD_JOBS: 1
-        run: |
-          pg_isready -h 127.0.0.1 -p 5432 -U postgres -d test
-          for t in pg_catalog pg_distributed pg_edge pg_numeric pg_pushdown e2e; do
-            echo "=== cargo test --test $t ==="
-            cargo test --test $t -- --test-threads=1 --nocapture
-          done
+        run: cargo test --tests -- --test-threads=1
+
+      - name: Database logs (on failure)
+        if: failure()
+        run: docker compose -f tests/docker/compose.yaml logs --no-color --tail=200
+
+      - name: Tear down test databases
+        if: always()
+        run: docker compose -f tests/docker/compose.yaml down -v

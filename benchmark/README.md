@@ -32,11 +32,11 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 |---|---|---|
 | Engine | Standalone Ballista or scheduler+workers (see below) | PySpark 3.5.4, `local[*]` |
 | Read fan-out | `--rust-partitions` keyset partitions, derived by default as ceil(table_rows / `--batch-size`) (`parallel_scan.partitions`; `workers` only divides the pool budget and fills in when `partitions <= 1`) | `--spark-partitions` JDBC partitions on `order_id`, same derivation by default |
-| Fetch | Streaming portal (batch size controlled by DataFusion, not explicit config) | JDBC `fetchsize` = `--batch-size` when set, else omitted (Spark default 0 = driver default, which buffers each partition fully) |
-| Sink | `parquet::arrow::ArrowWriter`, Snappy, single file | `df.write.parquet`, Snappy |
+| Fetch | Binary `COPY … TO STDOUT` by default (`--no-use-copy`: cursor `FETCH`), `execution.batch_size` rows per Arrow batch / `FETCH` window — `run.sh` writes `--batch-size` into the generated job spec when set, else the code default 8192 applies | JDBC `fetchsize` = `--batch-size` when set, else omitted (Spark default 0 = driver default, which buffers each partition fully) |
+| Output writer | `parquet::arrow::ArrowWriter` in the bench binary, Snappy, single file | `df.write.parquet`, Snappy |
 | Timed | Schema discovery + scan + collect + encode (`scan_ms` + `write_ms` split in JSON) | Bounds query excluded; read + write + read-back count |
 
-Batch size (`--batch-size`) is optional and only affects Spark's JDBC `fetchsize`. **Auto run** (flag absent): Spark uses driver default (buffers each partition fully); Rust batch size is controlled by DataFusion's streaming. **Manual run** (`--batch-size 64000`): Spark streams that many rows per batch. Partition counts derive from the 64000 reference as ceil(table_rows / 64000) — 157 partitions at 10M rows — so an auto run and a manual run differ only in Spark's per-batch streaming, never in fan-out. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
+Batch size (`--batch-size`) is optional and applies to **both** engines: Spark's JDBC `fetchsize` and the Rust job spec's `execution.batch_size` (rows per Arrow batch and per cursor `FETCH`; `run.sh` writes it into the generated `bench-config.json`). **Auto run** (flag absent): Spark uses the driver default (buffers each partition fully); Rust uses its code default of 8192 rows per batch. **Manual run** (`--batch-size 64000`): both engines use that many rows per batch. Partition counts derive from the 64000 reference as ceil(table_rows / 64000) — 157 partitions at 10M rows — so an auto run and a manual run differ only in per-batch size, never in fan-out. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
 
 CPU/MEM for distributed runs aggregates the whole cluster (scheduler + workers + client
 summed per tick), comparable to single-container runs. bench-pg is profiled on the same
@@ -76,8 +76,10 @@ benchmark/run.sh --skip-scale --repeat 1
 
 # Tiny host (~1GB RAM) smoke test: shrink everything to fit, stay on the 20k seed.
 # Adjust --cpuset-cpus to the cores you actually have (the default 0-3 fails fast
-# otherwise). Explicit small slices bypass the floors — your risk. Smoke ONLY:
-# different data scale means different spec, never quote these numbers.
+# otherwise). bench-pg's hardcoded 4-5 pin also needs >= 6 cores: on a smaller host edit
+# PG_CPUSET in run.sh for the smoke run (the script refuses to start otherwise).
+# Explicit small slices bypass the floors — your risk. Smoke ONLY: different data
+# scale means different spec, never quote these numbers.
 benchmark/run.sh --skip-scale --repeat 1 --mode standalone \
   --cpuset-cpus 0-1 --memory 1g --workers 1 \
   --scheduler-memory 128m --client-memory 128m --worker-memory 256m
@@ -94,13 +96,17 @@ benchmark/run.sh --clean
 ```
 
 Every container the script starts defaults to a hard pin on cores 0-3
-(`--cpuset-cpus 0-3`, overridable; a host with fewer than 4 cores fails fast instead
-of benchmarking the wrong budget) and `--memory 4g`. Memory is a per-deployment
+(`--cpuset-cpus 0-3`, overridable; `run.sh` checks the Docker host's core count against
+every pin before starting anything, so a host with fewer cores than the pins name — 6 in
+the default layout — fails fast instead of benchmarking the wrong budget) and `--memory 4g`. Memory is a per-deployment
 budget: Spark and the standalone Rust client each get the full 4g, while
 the distributed deployment shares it — 512m scheduler + 512m client + the rest split
 evenly across workers (768m each at `--workers 4`). Postgres is fixed outside this
-budget at cores 4-5 + 2g RAM (hardcoded in `run.sh` and both compose files, clear of
-the engine pin) so the shared fixture never changes shape. Tune with `--cpus N` (replaces
+budget: `run.sh` pins bench-pg to cores 4-5 + 2g RAM (`PG_CPUSET` / `PG_MEM`, hardcoded,
+clear of the engine pin, and checked with `docker inspect` on every run) so the shared
+fixture never changes shape. (The compose files — `benchmark/PostgresDB/compose.yaml` and
+`tests/docker/compose.yaml` — are not the benchmark fixture: they use a `cpus: 2` quota +
+2g, no pin.) Tune with `--cpus N` (replaces
 the pin with a quota), `--cpuset-cpus RANGE`, `--memory SIZE`, `--scheduler-memory`
 / `--client-memory` / `--worker-memory` (or `CPUS` / `MEMORY` / `CPUSET_CPUS` /
 `SCHEDULER_MEMORY` / `CLIENT_MEMORY` / `WORKER_MEMORY` env; empty lifts the default).
@@ -127,7 +133,8 @@ unset for headline runs; it is a diagnostic knob, not a spec knob.
 ## What you get
 
 `results/summary.md` (one row per engine × scenario × mode) plus per-run JSONs with peaks
-baked in (`avg_cpu_pct`, `peak_cpu_pct`, `peak_rss_mib`), raw 100ms CPU/MEM series
+baked in (`cpu_seconds`, `avg_cpu_pct`, `peak_cpu_pct`, `peak_rss_mib`, `peak_mem_mib`,
+`mem_peak_exact_mib`), raw 100ms CPU/MEM series
 (`*_cluster.csv` totals plus `*_c_<container>.csv` per container), and `correctness.json`.
 
 ### Monitoring: totals + per-container breakdown
@@ -140,45 +147,67 @@ the scan or one idled. The JSON carries both levels:
 
 ```json
 {
-  "avg_cpu_pct": 124.2, "peak_cpu_pct": 137.1, "peak_rss_mib": 1390,
+  "elapsed_ms": 9120, "t_start_epoch_ms": 1790000000000, "t_end_epoch_ms": 1790000009120,
+  "stats_window": "timed section",
+  "cpu_seconds": 11.33, "avg_cpu_pct": 124.2, "peak_cpu_pct": 181.0,
+  "peak_rss_mib": 1102, "peak_mem_mib": 1390, "mem_peak_exact_mib": 2950,
   "containers": {
-    "bench-scheduler":   { "avg_cpu_pct": 3.1,  "peak_cpu_pct": 5.0,   "peak_rss_mib": 62 },
-    "bench-worker-1":    { "avg_cpu_pct": 60.5, "peak_cpu_pct": 70.2,  "peak_rss_mib": 664 },
-    "bench-worker-2":    { "avg_cpu_pct": 60.6, "peak_cpu_pct": 69.8,  "peak_rss_mib": 664 },
-    "bench-rust-dist":   { "avg_cpu_pct": 0.0,  "peak_cpu_pct": 0.4,   "peak_rss_mib": 12 }
-  }
+    "bench-scheduler": { "cpu_seconds": 0.28, "avg_cpu_pct": 3.1,  "peak_cpu_pct": 6.0,  "peak_rss_mib": 48,  "peak_mem_mib": 62,  "mem_peak_exact_mib": 70 },
+    "bench-worker-1":  { "cpu_seconds": 5.52, "avg_cpu_pct": 60.5, "peak_cpu_pct": 92.3, "peak_rss_mib": 527, "peak_mem_mib": 664, "mem_peak_exact_mib": 1420 },
+    "bench-worker-2":  { "cpu_seconds": 5.53, "avg_cpu_pct": 60.6, "peak_cpu_pct": 90.8, "peak_rss_mib": 527, "peak_mem_mib": 664, "mem_peak_exact_mib": 1440 },
+    "bench-rust-dist": { "cpu_seconds": 0.00, "avg_cpu_pct": 0.0,  "peak_cpu_pct": 0.4,  "peak_rss_mib": 9,   "peak_mem_mib": 12,  "mem_peak_exact_mib": 20 }
+  },
+  "pg": { "cpu_seconds": 7.9, "avg_cpu_pct": 86.6, "peak_cpu_pct": 140.2, "peak_rss_mib": 180, "peak_mem_mib": 610 }
 }
 ```
+(Illustrative values.) `mem_peak_exact_mib` is absent on cgroup v1 hosts (no `memory.peak`).
 
 and the summary prints per-container sub-rows under each distributed row, plus a
 `postgres` sub-row per engine run: bench-pg is sampled on the same ticks into
 `<prefix>_pg.csv` (never summed into engine totals) so every run also shows what the
 source database cost — the way to tell a pushdown win (low PG CPU) from a fast scan.
-`mem_mib` everywhere is cgroup `usage` (RSS **plus page cache**): engine outputs and
-the PG buffer pool both inflate it, so read it as total footprint, not pure process
-memory. CPU% sums across
-cores *and* containers (200% on 2 cores fully lit is normal); RSS sums the high-water marks
-(processes don't share Arrow buffers, so the sum is the true cluster footprint). Series are
-100ms Engine-API polls (`BENCH_SAMPLE_INTERVAL` to change): each tick differences the
-daemon's cumulative CPU counters, so per-interval CPU is exact — short bursts can no
-longer hide between polls the way they did under the old `docker stats` CLI loop
-(which once reported a 1.2s selective run as 0.0% CPU). A tail sample after client
-exit catches compute that finished on the last tick. Reported peaks are maxes over a
-500ms rolling mean, not raw single ticks: counter-granularity mismatch between the
-container and system counters can spike one 100ms tick above anything physical
-(observed 643% on a 4-core pin, whose ceiling is 400%) — a real sustained burst
-survives the smoothing, a one-tick artifact does not. The smoothed peak is then
-capped at the run's CPU budget × 100 (`PIN_MAX_PCT` from the pin/quota): the pin is
-kernel-enforced, so no true peak can exceed it and the cap only removes artifact. A single hot container (usually
-Spark, whose GC/stage boundaries make its usage spikier tick-to-tick) can still print
-a peak above the pin ceiling while the distributed sum — six series diluting one
-another's spikes — stays nearer it. That gap is measurement noise, not an engine
-property: compare averages, which cancel it. `run.sh` also verifies the pin itself
+
+**How CPU and memory are measured.** Series are 100 ms Engine-API polls
+(`BENCH_SAMPLE_INTERVAL` to change). Every statistic in the JSON and the tables is
+restricted to the engine's **timed section** — each engine prints `t_start_epoch_ms` /
+`t_end_epoch_ms`, the same window as `elapsed_ms` — so container start-up (JVM boot,
+Ballista start, source registration) is excluded; `stats_window` in the JSON says which
+window was used (older engine JSON without the bounds falls back to the container lifetime).
+
+- **CPU.** Each interval's CPU% is Δ(container CPU ns) / Δ(daemon read time ns) × 100
+  (100% = one full core; sums across cores *and* containers, so 200% on 2 fully lit cores
+  is normal). Both counters are nanosecond-precise, so there are no granularity artifacts —
+  the old denominator (`system_cpu_usage`, 10 ms jiffies) produced impossible one-tick
+  spikes above the pin and needed smoothing and capping; peaks are now raw per-interval
+  maxima. `cpu_seconds` is the exact CPU work in the window, read from the
+  cumulative counter (independent of sampling), and `avg_cpu_pct` = `cpu_seconds` ÷
+  window.
+- **Memory.** `peak_rss_mib` is process memory proper: the cgroup's anonymous pages
+  (`anon`, cgroup v1 `total_rss`). `peak_mem_mib` is the working set, `usage −
+  inactive_file`, i.e. what `docker stats` shows. Neither counts inactive page cache — the
+  old figure (raw `usage`) did, so writing a 2.4 GB Parquet inflated it toward the
+  container limit. Both are 100 ms samples; distributed totals are the peak of the per-sample
+  sum across containers (not a sum of per-container peaks). `mem_peak_exact_mib` is the
+  exact cgroup high-water mark (`memory.peak`, cgroup v2), **including** page cache — the
+  figure a `--memory` limit / OOM kill applies to, immune to sampling gaps. Engine
+  containers read their own at the end of the run; for the long-lived scheduler/workers
+  `run.sh` reads it after each client run, so those are lifetime peaks and the distributed
+  total is a sum of per-container peaks (an upper bound).
+- **Postgres** is sampled on the same ticks into `<prefix>_pg.csv` and reported as a
+  `postgres` sub-row, never summed into engine totals.
+
+A tail sample after client exit catches compute that finished on the last tick. Containers
+are polled one after another within a tick, so summed samples are not exactly simultaneous
+(harmless for `cpu_seconds`/averages; slightly blurs summed peaks). Timed sections are not
+identical across engines: Spark's includes a read-back `count()` of its output; Rust's
+excludes Ballista start-up and source registration/schema discovery (done before the timer).
+
+`run.sh` also verifies the pin itself
 (`docker inspect` on every started container, `pin: <name> -> [0-3]` per run, WARN
 otherwise — a stale `bench-pg` reused from an unpinned run would otherwise silently
-benchmark a different spec). Memory is instantaneous per
-sample, so sub-100ms RSS spikes can still hide; size conclusions on averages and
-peaks, not single samples. One lifecycle asymmetry to read correctly: the distributed
+benchmark a different spec). Sampled memory (`peak_rss_mib`, `peak_mem_mib`) can still
+miss sub-100ms spikes; `mem_peak_exact_mib` cannot, so use it for "does it fit in the
+limit" questions and the sampled peaks for "how much does the process itself hold". One lifecycle asymmetry to read correctly: the distributed
 cluster (scheduler + workers) starts once per mode and serves `full` then `selective`,
 while the standalone/Spark clients start fresh per scenario — so selective worker RSS
 carries retained memory from the earlier full scan (allocator arenas and pools don't
@@ -191,12 +220,15 @@ selective worker RSS is not comparable to the cold-start standalone/Spark number
 After the gate, `run.sh` runs `benchmark/correctness.py` — a DuckDB read of the actual
 Parquet files, sharing no code with either engine:
 
-- every file re-counted from disk,
-- all engines' outputs row-identical per scenario (order-insensitive set equality),
+- every file re-counted from disk and compared against the source's `count(*)` for its
+  scenario (full / selective),
+- all engines' outputs row-identical per scenario: order-insensitive **multiset**
+  equality (`EXCEPT ALL` in both directions plus equal counts), so a duplicated row
+  (e.g. overlapping partitions) fails,
 - selective files satisfy the predicate and carry exactly the projected columns,
 - selective ⊆ full per engine,
-- `metadata` jsonb compared semantically (key order differs: our side sorts keys,
-  pgjdbc preserves storage order — raw string compare would false-fail),
+- `metadata` jsonb compared semantically, by extracted fields (the two engines' text
+  renderings need not be byte-identical — raw string compare could false-fail),
 - timestamps compared as instants (UTC-annotated vs naive can't false-fail).
 
 Needs the `duckdb` python package (`pip install duckdb`) or `--skip-correctness`.
@@ -211,8 +243,12 @@ engine budget the run uses — 1664m at 2g, 3712m at 4g, 7447m at 8g; explicit
 `SPARK_DRIVER_MEM` always wins, and the effective heap prints in every run's budget
 line, so heap is never a hidden variable.
 
-All runs below: 10M rows, best of 3, tool-default batching, pin 0-3, pg 4-5 + 2g,
-157/157 fan-out. The only variable across the three tables is the engine memory
+All runs below: 10M rows, best of 3, tool-default batching, pin 0-3, 157/157 fan-out.
+**Caveat:** these tables were recorded while `run.sh` started bench-pg under a
+`--cpus=4` CFS quota instead of the documented 4-5 pin (the pin line was commented out;
+restored since). The source database was therefore not confined to cores 4-5 and could
+share cores with the pinned engines, so the numbers may include source/engine
+contention. Re-run `benchmark/run.sh --repeat 3` before quoting them. The only variable across the three tables is the engine memory
 budget (2g/4g/8g). `postgres` sub-rows show source-database cost during that engine's
 run (same ticks, never summed into engine totals).
 

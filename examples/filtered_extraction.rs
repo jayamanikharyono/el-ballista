@@ -14,6 +14,7 @@
 //! cargo run --example filtered_extraction
 //! ```
 
+use futures::TryStreamExt;
 use rust_ballista_extraction_layer::config::JobConfig;
 use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
@@ -40,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Preview pushdown decisions before extracting.
     println!("\n► Step 2: Preview pushdown decisions");
-    let connector = PostgresConnector::from_config(config);
+    let connector = PostgresConnector::from_config(config)?;
     for decision in connector.pipeline().explain_filters().await? {
         println!(
             "  filter {:<12} -> pushed_to_source={} ({})",
@@ -58,12 +59,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         batches.len()
     );
 
-    // 4. Operational run with split checkpointing.
+    // 4. Operational run with split checkpointing: every split's stream goes to the
+    // consumer, and a split is recorded completed only after the consumer returns Ok.
+    // (Here it just counts; a real consumer writes each split somewhere durable.)
     println!("\n► Step 4: Operational run (split checkpointing)");
-    let outcome = connector.extract().standalone().run().await?;
+    let outcome = connector
+        .extract()
+        .standalone()
+        .run_with(|split, mut stream| async move {
+            let mut rows = 0usize;
+            while let Some(batch) = stream.try_next().await? {
+                rows += batch.num_rows();
+            }
+            println!("    {}: {rows} row(s) consumed", split.split_id);
+            Ok(())
+        })
+        .await?;
     println!(
-        "  ✓ Run outcome: {} row(s), splits {}/{}",
-        outcome.rows_extracted, outcome.splits_completed, outcome.splits_total
+        "  ✓ Run outcome: {} row(s) delivered, splits {}/{} ({} skipped from an earlier run)",
+        outcome.rows_delivered,
+        outcome.splits_completed,
+        outcome.splits_total,
+        outcome.splits_skipped
     );
 
     println!("\n═══════════════════════════════════════════════════════════");

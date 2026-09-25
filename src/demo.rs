@@ -3,11 +3,16 @@
 //! Demonstrates:
 //! - Full extraction with schema support
 //! - Filtered extraction (caller-provided predicates)
-//! - Collation-aware pushdown, statistics collection, cost-based decisions,
+//! - Column-kind-aware pushdown translation, statistics collection, cost-based decisions,
 //!   parallel scan configuration, and the DataFrame builder API concepts.
 //!
 //! This is a smoke test / illustration of the pieces wired together with DataFusion doing
-//! the in-memory transform work, not a production entry point.
+//! the in-memory transform work, not a production entry point. Run it with `rel demo`; it
+//! connects to `postgres@localhost:5432/app` with the password from the environment variable
+//! named by [`DEMO_PASSWORD_ENV`] (never a hard-coded password).
+
+/// Environment variable holding the demo database password.
+pub const DEMO_PASSWORD_ENV: &str = "PGPASSWORD";
 
 use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::prelude::*;
@@ -15,16 +20,24 @@ use std::sync::Arc;
 
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
-    ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
+    JobId, ParallelScanConfig, ParallelStrategy, PushdownConfig, PushdownPolicy, SourceConfig,
 };
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+use rust_ballista_extraction_layer::connector::postgres::dialect::PostgresDialect;
+use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
+use rust_ballista_extraction_layer::connector::postgres::stats::StatisticsCollector;
 use rust_ballista_extraction_layer::errors::AppError;
-use rust_ballista_extraction_layer::pushdown::dialect::{PostgresDialect, SqlDialect};
-use rust_ballista_extraction_layer::pushdown::stats::StatisticsCollector;
-use rust_ballista_extraction_layer::types::ColumnMetadata;
+use rust_ballista_extraction_layer::pushdown::dialect::SqlDialect;
+use rust_ballista_extraction_layer::pushdown::{ColumnKind, ColumnKinds, translate_with};
 
-pub async fn run() -> Result<(), AppError> {
+pub(crate) async fn run() -> Result<(), AppError> {
     println!("\n=== Extraction Feature Demonstration ===\n");
+
+    let password = std::env::var(DEMO_PASSWORD_ENV).map_err(|_| {
+        AppError::Config(format!(
+            "`rel demo` reads the database password from ${DEMO_PASSWORD_ENV}; set it first"
+        ))
+    })?;
 
     // Full extraction with schema support
     println!("► Extraction with schema support");
@@ -32,13 +45,17 @@ pub async fn run() -> Result<(), AppError> {
         "localhost",
         5432,
         "postgres",
-        "postgres",
+        &password,
         "app",
         4,
         30_000,
         "rust-extract-layer-demo",
     )
-    .await?;
+    .await
+    .map_err(|source| AppError::SourceConnect {
+        target: "localhost:5432/app".to_string(),
+        source,
+    })?;
 
     let batch = extractor
         .extract_full_table(
@@ -60,41 +77,30 @@ pub async fn run() -> Result<(), AppError> {
         num_rows_extracted
     );
 
-    // Phase 2: Demonstrate SqlDialect (collation-aware fidelity)
-    println!("\n► SqlDialect and collation-aware fidelity");
+    // Pushdown translation: how a filter reaches the source
+    println!("\n► Pushdown translation (column-kind aware)");
     let dialect = PostgresDialect;
-
-    let text_col_c = ColumnMetadata {
-        column_name: "status".to_string(),
-        data_type: "text".to_string(),
-        is_nullable: true,
-        numeric_precision: None,
-        numeric_scale: None,
-        udt_name: None,
-        collation_name: Some("C".to_string()),
-    };
-
-    let text_col_citext = ColumnMetadata {
-        column_name: "email".to_string(),
-        data_type: "citext".to_string(),
-        is_nullable: true,
-        numeric_precision: None,
-        numeric_scale: None,
-        udt_name: None,
-        collation_name: Some("en_US".to_string()),
-    };
-
-    let fidelity_c = dialect.column_literal_fidelity(&text_col_c, true, false);
-    let fidelity_citext = dialect.column_literal_fidelity(&text_col_citext, true, false);
-
-    println!(
-        "  ✓ C-collation string comparison: {:?} (Exact)",
-        fidelity_c
-    );
-    println!(
-        "  ✓ citext string comparison: {:?} (Inexact)",
-        fidelity_citext
-    );
+    let kinds = ColumnKinds::from([
+        (
+            "status".to_string(),
+            ColumnKind::Text {
+                bytewise_collation: false,
+            },
+        ),
+        ("amount".to_string(), ColumnKind::Float),
+    ]);
+    for (label, expr) in [
+        ("status = 'PAID'", col("status").eq(lit("PAID"))),
+        ("amount = 10.0", col("amount").eq(lit(10.0_f64))),
+        ("amount < 10.0", col("amount").lt(lit(10.0_f64))),
+    ] {
+        match translate_with(&expr, &kinds) {
+            Some((fidelity, predicate)) => {
+                println!("  ✓ {label}: {fidelity:?} -> {}", predicate.render_inline())
+            }
+            None => println!("  ✓ {label}: kept in Arrow (no exact or superset source form)"),
+        }
+    }
     println!(
         "  ✓ Identifier quoting: {}",
         dialect.quote_ident("my_column")
@@ -172,7 +178,7 @@ pub async fn run() -> Result<(), AppError> {
     // Demonstrate config framework
     println!("\n► Configuration framework");
     let _config = JobConfig {
-        job_id: "demo_orders".to_string(),
+        job_id: JobId::new("demo_orders")?,
         table: "orders".to_string(),
         columns: None,
         filters: vec![FilterEntry::Single(FilterInput::Shorthand(
@@ -182,19 +188,16 @@ pub async fn run() -> Result<(), AppError> {
             host: "localhost".to_string(),
             port: 5432,
             user: "postgres".to_string(),
-            password_env: "PGPASSWORD".to_string(),
+            password_env: DEMO_PASSWORD_ENV.to_string(),
             database: "app".to_string(),
             pool_max: 8,
             statement_timeout_ms: 300_000,
             application_name: "rust-extract-layer".to_string(),
             schema: "public".to_string(),
         },
-        sink: SinkConfig {
-            path: "./demo_output".to_string(),
-        },
         checkpoint: CheckpointConfig::default(),
         pushdown: PushdownConfig {
-            policy: "cost_based".to_string(),
+            policy: PushdownPolicy::CostBased,
             deny: vec![],
             push: vec![],
             max_source_cost: 50_000,
@@ -202,7 +205,7 @@ pub async fn run() -> Result<(), AppError> {
             statistics_ttl_secs: 900,
         },
         parallel_scan: ParallelScanConfig {
-            strategy: "none".to_string(),
+            strategy: ParallelStrategy::None,
             partitions: 1,
             partition_column: "order_id".to_string(),
         },

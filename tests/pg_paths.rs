@@ -12,7 +12,7 @@ mod common;
 use common::{TEST_PASSWORD_ENV, TestDb};
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
-    PushdownConfig, SinkConfig, SourceConfig,
+    PushdownConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
@@ -32,7 +32,7 @@ fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
         .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))
         .collect();
     JobConfig {
-        job_id: format!("paths-{}", db.schema),
+        job_id: format!("paths-{}", db.schema).parse().unwrap(),
         table: "hostile".to_string(),
         columns: None,
         filters,
@@ -46,9 +46,6 @@ fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
             statement_timeout_ms: 300_000,
             application_name: "relex-test".to_string(),
             schema: db.schema.clone(),
-        },
-        sink: SinkConfig {
-            path: "/tmp/relex_test_sink".to_string(),
         },
         checkpoint: CheckpointConfig {
             dir: std::env::temp_dir()
@@ -83,7 +80,7 @@ async fn full_keyset_and_filtered_agree() -> Result<(), Box<dyn std::error::Erro
     .await?;
 
     let full = ex.extract_full_table(&db.table(), None).await?;
-    assert_eq!(full.num_rows(), 8);
+    assert_eq!(full.num_rows(), common::HOSTILE_ROWS);
 
     // Keyset partitions tiling the id space union to the full scan (metamorphic oracle).
     let a = ex
@@ -102,7 +99,7 @@ async fn full_keyset_and_filtered_agree() -> Result<(), Box<dyn std::error::Erro
         .extract_keyset_partition_via_cursor(&db.table(), None, "id", 0, 1_000_000, 3)
         .await?;
     let cursor_rows: usize = cursor_batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(cursor_rows, 8);
+    assert_eq!(cursor_rows, common::HOSTILE_ROWS);
 
     // Same data through every path: ids and exact decimal amounts agree.
     let full_ids = common::int64_col(&full, "id");
@@ -116,6 +113,7 @@ async fn full_keyset_and_filtered_agree() -> Result<(), Box<dyn std::error::Erro
     // Filtered extraction (caller-provided predicate) matches direct SQL
     // (differential oracle: pushed filter vs database ground truth).
     let batches = PostgresConnector::from_config(filtered_job(&db, vec!["id>3".to_string()]))
+        .expect("valid job config")
         .extract()
         .standalone()
         .collect()

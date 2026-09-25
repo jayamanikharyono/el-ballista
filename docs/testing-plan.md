@@ -1,207 +1,163 @@
-# Testing Plan — Unit + Integration Tests
+# Testing
 
-**Status (September 2026): all four original phases are done.** Unit coverage (Phase A),
-the self-provisioning integration harness (Phase B), the per-bug integration suites (Phase
-C, minus one item — see §7), and CI (Phase D) are all implemented and green. This document
-describes what actually exists today, not a forward-looking plan; §7 lists what's still
-open.
+What the test suite contains today, how each part decides pass/fail (its **oracle**, AGENTS.md
+§7), and how to run it. Counts below come from `cargo test … -- --list` and a full run on
+2026-09-24 (against Postgres 16 and MySQL 8.0 seeded exactly like the compose stack, whose
+Postgres image is 17); re-run those commands rather than trusting the numbers after changes.
 
-The single most important property of the current suite: **nothing skips, and nothing is
-hidden behind manual setup.** `cargo test` alone — no `DATABASE_URL`, no Docker, no running
-Ballista cluster — runs the full unit + integration + e2e suite on a clean checkout. A test
-that cannot reach what it needs fails loudly (`panic!` with a specific message), never
-silently reports green or "skipped." That single change surfaced two real, previously
-invisible bugs while this suite was being wired up for real (a stale test assertion in
-`pg_paths.rs` that assumed the wrong window boundary, and a genuine EXPLAIN-JSON decode bug
-in `pushdown::explain`) — both fixed, both now regression-tested.
+**Rule of the suite: nothing skips.** Unit tests never touch a database. Every integration test
+needs the live databases from `tests/docker/compose.yaml` and **panics** (fails) with a message
+pointing at the stack when they are unreachable — a broken harness is a failure, never a silent
+"skipped" or green.
 
 ## 0. Running the tests
 
 ```bash
-# Bring up the databases first (integration/e2e tests never self-provision).
+# 1. Databases: Postgres + MySQL, both seeded with the dvdrental dataset from tests/data/.
 docker compose -f tests/docker/compose.yaml up -d --wait
 
-# Everything — unit, integration, e2e.
-cargo test
-
-# Or: scripts/e2e.sh brings the stack up, runs the suite, and tears it down.
-scripts/e2e.sh
-
-# Optional: point every integration/e2e test at a specific server instead of the
-# compose default (still Docker either way; this just changes which Postgres).
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/app cargo test
-
-# Unit tests only (no database touched at all, milliseconds).
+# 2. Unit tests (no database, ~seconds once built).
 cargo test --lib --bins
 
-# One integration file at a time.
-cargo test --test pg_pushdown
-cargo test --test pg_catalog
-cargo test --test e2e
+# 3. Doc tests (the `# Examples` blocks; most are `no_run`, i.e. compile-checked).
+cargo test --doc
+
+# 4. Every integration file, serially (the fixtures share one server per engine).
+cargo test --tests -- --test-threads=1
+
+# One file at a time:
+cargo test --test pg_pushdown -- --test-threads=1
+
+# Tear down (data lives on tmpfs; the next `up` re-seeds from scratch).
+docker compose -f tests/docker/compose.yaml down -v
 ```
 
-## 1. Two layers, different jobs
+- `scripts/e2e.sh` does steps 1 + 4 + teardown in one go (`cargo test --all -- --test-threads=1`).
+- `scripts/verify-review.sh [--full] [--up]` runs `tests/review_repro.rs` and prints
+  `FIXED (passes)` / `REGRESSED (fails)` per review finding; `--full` also runs every other
+  integration file under a 600 s watchdog and reports leftover `test_*` schemas.
+- Endpoints default to the compose services: Postgres
+  `postgres://postgres:postgres@127.0.0.1:5432/test`, MySQL
+  `mysql://root:password@127.0.0.1:3306/test`. `DATABASE_URL` / `MYSQL_URL` point the suites
+  at another server (it still has to be seeded like the compose stack for the dvdrental suites).
 
-| | Unit (`src/**/tests`) | Integration + e2e (`tests/*.rs`) |
-|---|---|---|
-| Needs a database | Never | Always — the Docker compose stack, see §3 |
-| Speed | Milliseconds | Seconds (compose Postgres + queries); e2e is ~15-75s per file because it also spins up an in-process Ballista scheduler+executor |
-| Job | Pure logic: predicate translation, filter parsing/lowering, cost/policy decisions, split state machines, schema/type maps, SQL-string shapes | Everything that actually touches Postgres or a cluster: decode fidelity, catalog reads, checkpoint durability, pushdown correctness, distributed execution |
-| Rule | If it needs a pool, it doesn't belong here | If it can be a fixture, it doesn't belong here |
-| Skip behavior | N/A | **None.** Every test gets a real database or fails |
+## 1. Counts (measured)
 
-## 2. Unit tests — 129 tests across 24 modules, zero database access
-
-All of these run under plain `cargo test --lib` in milliseconds; none opens a network
-connection. Breakdown by module (counts from `cargo test --lib -- --list`):
-
-| File | Tests | What it covers |
+| Target | Tests | How counted / run |
 |---|---:|---|
-| `pushdown/mod.rs` | 13 | Predicate translation matrix (6 comparators × 5 literal types), AND/OR/NOT/IS NULL, policy matrix (`always`/`never`/`cost_based`/`hinted`/`strict`), enum-column normalization, dialect-neutral rendering |
-| `config/mod.rs` | 13 | Config parsing against the checked-in example JSON (incl. structured `filters`), filter value typing, `is_null` without value, unknown-op rejection at load, validation rejections, password resolution |
-| `connector/postgres/row_adapter.rs` | 11 | Arrow schema/array building per Postgres type, including the historical `TEXT[]` and timestamptz-timezone bug classes |
-| `connector/postgres/pipeline/mod.rs` | 11 | Shorthand/structured filter lowering equivalence, JSON value typing, null/misuse rejections, timestamp/date coercion with schema (RFC3339 + `%Y-%m-%d`), example config filter parsing |
-| `connector/postgres/parallel.rs` | 10 | Pure keyset/ctid partition math (`keyset_partitions_from_bounds`, `ctid_partitions_from_relpages`) — even splits, degenerate ranges (min≥max, zero/negative page counts), off-by-one boundary and inversion checks |
-| `pushdown/optimizer_rule.rs` | 9 | DataFusion optimizer rule: conjunct splitting, push/keep decisions, filter reconstruction (single/multiple/empty), enum-aware decisions |
-| `pushdown/explain.rs` | 9 | EXPLAIN JSON parsing: access-method mapping, cost/row extraction, and failure paths (invalid JSON, empty plan array, missing `Plan` key, missing fields default conservatively, `Plans Rows` key variant) |
-| `pushdown/cost_model.rs` | 9 | Cost-based push/keep decisions: index shortcut (incl. OR-branch requirement), selectivity gate, cost-budget gate, each exercised through `decide_push` itself (not hand-built enum literals) |
-| `connector/query_tag.rs` | 6 | Debug SQL comment tag rendering (see §6), including a `*/`-injection defense test |
-| `logging.rs` | 5 | CLI/env log-option resolution |
-| `connector/postgres/execution_plan.rs` | 5 | Placeholder bind order, `DisplayAs`, partition count, and the debug-tag rendering (fields present, partition index included only when split) |
-| `connector/postgres/dialect.rs` | 4 | Identifier quoting / dialect rendering |
-| `checkpoint/json_store.rs` | 4 | Split begin/run/complete/fail cycle, retry preserves completed splits, unknown split errors, reset clears |
-| `connector/postgres/query_builder.rs` | 3 | Full/keyset SQL string shapes, `USER-DEFINED → ::text AS` cast |
-| `distributed/pool_registry.rs` | 3 | Budgeted-pool-per-descriptor registry behavior |
-| `pushdown/stats.rs` | 2 | `SourceStatistics::empty()` invariants (no column entries, no cross-table aliasing) |
-| `connector/postgres/distributed/table_codec.rs` | 2 | Logical codec round-trip, non-magic-bytes delegation |
-| `connector/postgres/api.rs` | 2 | Distributed scheduler default + overrides |
-| `connector/mysql/type_mapper.rs` | 2 | MySQL type → Arrow mapping |
-| `connector/mysql/dialect.rs` | 2 | MySQL quoting/placeholder rendering |
-| `connector/postgres/table_provider.rs` | 1 | Scan pushes a normalized enum predicate |
-| `connector/postgres/distributed/plan_codec.rs` | 1 | Physical codec round-trip (see also the model change note in §6) |
-| `connector/postgres/arrow_type_mapper.rs` | 1 | Postgres type → Arrow type mapping |
-| `connector/mysql/query_builder.rs` | 1 | MySQL query shapes |
+| Unit (`src/**`, lib target) | 215 | `cargo test --lib -- --list`; all pass |
+| Binary target (`src/main.rs`) | 0 | `cargo test --bins -- --list` (the bin is a thin wrapper over the lib) |
+| Doc tests | 48 | `cargo test --doc`: 47 pass, 1 `ignore`d (`Predicate::render_to`'s sketch) |
+| Integration (`tests/*.rs`, 15 files) | 88 | `cargo test --tests -- --list`; all pass with `--test-threads=1` |
 
-Devil's-advocate note: several of these were rewritten from an earlier pass that only
-constructed a struct and asserted its own fields back (a tautology — it can't fail). The
-cost-model, catalog-stats, optimizer-rule, explain-parsing, and partition-math tests above
-were all replaced with tests that exercise the real function and its failure paths, and in
-`parallel.rs`'s case the partition math was extracted into pure functions specifically so
-it could be unit-tested at all (it previously required a live pool).
+The full `cargo test --tests -- --test-threads=1` run (which also re-runs the 215 unit tests)
+took 87 s wall clock on a 2-CPU dev machine with the test binaries already built — about 82 s of
+it in the test binaries themselves (per-file times in §4, as reported by libtest).
 
-## 3. Integration harness — `tests/common/mod.rs`
+## 2. Unit tests — no database
 
-`TestDb::connect() -> TestDb` (no `Option`, never skips):
+Pure logic, in `#[cfg(test)] mod tests` next to the code. Per module (from `--list`):
 
-- Uses `DATABASE_URL` if set; otherwise connects to the compose stack's default endpoint
-  (`postgres://postgres:postgres@127.0.0.1:5432/test`). The stack must be up
-  (`docker compose -f tests/docker/compose.yaml up -d --wait`, or `scripts/e2e.sh`
-  which handles it automatically) — there is no embedded fallback and no silent skip.
-- Any failure to connect or provision — bad URL, connection refused (is the stack up?),
-  fixture setup failure — is a `panic!` with a specific message. A broken harness
-  is a **test failure**, not a silent skip.
-- Per test: `CREATE SCHEMA test_<pid>_<counter>`, builds the hostile fixture inside it,
-  hands out the schema name; `Drop` runs `DROP SCHEMA ... CASCADE` (best-effort, via a
-  spawned thread with its own runtime since `Drop` has no async context). Schema isolation
-  (not database isolation) keeps setup to milliseconds and lets tests run in parallel
-  against one server.
-- **Hostile fixture** (one `hostile` table, every decode edge in ~8 deterministic rows):
-  NULLs, empty strings, mixed-case + accented text, `NaN`/`±Infinity` floats,
-  `INT_MIN`/`INT_MAX`, high-precision `numeric(30,15)`, `text[]` with NULL elements and
-  empty arrays, `jsonb`, `uuid`, `date`, `timestamptz` + naive timestamps, a true Postgres
-  **enum** type (`mood`), `bpchar`. `updated_at` is spread over 2024-01-01..08 so window
-  queries can slice it. This fixture is the shared input to every integration/e2e suite.
-
-No test-only dev-dependencies: integration/e2e tests run against the Docker compose
-stack (`tests/docker/compose.yaml`).
-
-## 4. Integration + e2e suites — 24 tests across 7 files
-
-Every file below follows the same pattern: a `live!()` macro that just calls
-`TestDb::connect().await` (kept as a macro purely so call sites didn't need editing when
-skip support was removed).
-
-| File | Tests | Proves |
+| Module | Tests | What it covers (oracle: hand-written expected values unless noted) |
 |---|---:|---|
-| `pg_numeric.rs` | 1 | Numeric columns decode with exact magnitude end to end (the historical truncation bug: `123.45` scale 2 must decode to unscaled `12345`, not `123`) |
-| `pg_paths.rs` | 1 | `extract_full_table`, keyset partitions, and filtered extraction return identical data (differential: pushed filter vs direct SQL) |
-| `pg_edge.rs` | 5 | Duplicate timestamps all extracted, empty filter returns an empty stream that still carries the schema, keyset cursor batching respects boundaries, projection returns only requested columns, date/timestamp/timezone fidelity round-trips |
-| `pg_pushdown.rs` | 1 | `always` vs `never` pushdown policy return byte-identical row sets, including the OR-mixing-indexed-and-unindexed-column regression case |
-| `pg_distributed.rs` | 1 | `DistributedContext::standalone` + `register_source` + `collect` against the hostile table exercises codecs, keyset partitioning, and budgeted pools with zero external processes; also pins exact decimal fidelity through the distributed path |
-| `pg_catalog.rs` | 11 | DB-facing functions with no unit coverage: `table_statistics`/`table_indexes`/`table_enum_columns` (real data, and the not-fabricated-for-unknown-table case), `ExplainEstimator::estimate_cost`/`cached_estimate` (real plan, TTL caching, rejects a nonexistent table) |
-| `e2e.rs` | 5 | Full/filtered/selective/distributed extraction, entirely in-process (Ballista scheduler + executor run standalone in the test process — no external cluster), plus split-checkpoint retry (second run skips completed splits, same row count). Oracles are always live Postgres queries |
+| `config` | 22 | Strict job-spec parsing (`deny_unknown_fields`: a `sink` / `watermark` block is a load error), lowercase `strategy` / `policy` enums, validation, password resolution, every checked-in example config, `benchmark/rust/bench-config.json` and the job spec `benchmark/run.sh` generates |
+| `connector::postgres::parallel` | 15 | Keyset / ctid partition math in `i128`: even splits, degenerate ranges, first partition takes `IS NULL`, last is open-ended |
+| `connector::postgres::pipeline::filters` | 14 | Shorthand vs structured filter lowering equivalence, value typing, schema-coerced timestamp/date literals |
+| `pushdown::cost_model` | 12 | Push/keep decisions through `decide_push`: index shortcut, selectivity and cost gates |
+| `connector::postgres::copy` | 11 | Binary COPY decoding: bad signature / truncation fail loudly, typed values and NULLs, Postgres-epoch timestamps, `±infinity` and NUMERIC `NaN` / overscale as typed errors, empty results keep the schema, zero-column projections |
+| `checkpoint::json_store` | 10 | Split state machine, plan fingerprint / `PlanMismatch`, stored bounds, atomic writes, collision-free file names, orphan tmp cleanup |
+| `pushdown::translate` | 9 | `Expr` → `Predicate` fidelity: `COLLATE "C"` text (Exact), float `=` Inexact / ranges not pushed, `NOT` only over Exact, uuid/json `=`/`<>` via `::text` |
+| `connector::postgres::row_adapter` | 9 | Per-column binary decoders, `±infinity` / NUMERIC overflow as typed errors |
+| `connector::postgres::explain` | 8 | `EXPLAIN (FORMAT JSON)` parsing and its failure paths |
+| `connector::postgres::execution_plan` | 8 | Bind order, COPY vs cursor SQL shapes, partition count, debug tags |
+| `connector::postgres::query_builder` | 7 | Full / keyset SQL shapes, `::text` casts for json/jsonb/uuid/enum |
+| `connector::postgres::distributed::pool_registry` | 7 | Budgeted pool per descriptor (`pool_max / workers`), key covers budget + session settings, acquire timeout ≥ statement timeout, `close_all` |
+| `pushdown::policy` | 6 | Policy matrix (`always`/`never`/`cost_based`/`strict`/`hinted`) |
+| `connector::postgres::table_provider` | 6 | Scan pushes what `supports_filters_pushdown` accepted and rejects an untranslatable filter; a decoded (scheduler-side) provider decides identically; `COUNT(*)` empty projection |
+| `connector::postgres::arrow_type_mapper` | 6 | Postgres type → Arrow type |
+| `logging` | 5 | CLI/env log option resolution |
+| `connector::query_tag` | 5 | SQL comment tag rendering, `*/` injection defence |
+| `connector::mysql::type_mapper` | 5 | MySQL type → Arrow (unsigned, `tinyint(1)`, `YEAR`, `TIME`) |
+| `checkpoint::lock` | 5 | Per-job `O_EXCL` lock, heartbeat, TTL takeover, RAII release |
+| others (20 modules) | 45 | `pipeline::splits` 4, `inline_sql` 4, `mysql::row_adapter` 4, `types::table_metadata` 3, `pushdown::ir` 3, `postgres::dialect` 3, `postgres::api` 3, `checkpoint::fingerprint` 3, `pushdown::stats` 2, `errors` 2, `table_codec` 2, `mysql::dialect` 2, `checkpoint::progress` 2, and one each in `types::job_id`, `pushdown::explain`, `pushdown`, `postgres::stats`, `postgres::engine`, `plan_codec`, `mysql::query_builder`, `checkpoint` |
 
-Historical note: `e2e.rs` used to require `E2E_SCHEDULER_URL` and skip entirely without an
-externally-running cluster — which is exactly why its filtered-extraction test carries
-a wrong assertion for a long time without anyone noticing. Removing the skip path is what
-caught it.
+## 3. Integration harness and fixtures
+
+- **Postgres — `tests/common/postgres.rs` (`TestDb`).** Connects to `DATABASE_URL` or the
+  compose default, creates a private schema `test_<pid>_<n>`, and loads the **hostile fixture**
+  from `tests/data/hostile.sql` (the single source of truth; its `__SCHEMA__` token is replaced
+  with the schema name). Teardown drops the schema over a fresh connection with a 10 s bound
+  (`Drop`), or explicitly with `TestDb::cleanup().await`.
+- **Hostile fixture** (`hostile`, 13 rows, ids 1..13): NULL in every nullable column, `''` vs
+  NULL, mixed-case / accented text, `varchar` / `bpchar`, `numeric(12,2)` and `numeric(30,15)`,
+  `INT4`/`INT8` MIN/MAX, `NaN` / `±Infinity` floats, `text[]` with NULL and `''` elements, `jsonb`,
+  `uuid`, a real enum, `bytea` with `0x00` / `0xFF` bytes, an empty `bytea` and NULLs, dates and
+  timestamps at 1970-01-01, epoch − 1 µs, a leap day, 2038-01-19 03:14:07/08 and
+  9999-12-31 23:59:59.999999, and a **5-row tie** on `updated_at` (ids 9..13). Rows 1..8 have
+  `updated_at` 2024-01-01..08, one per day. `±infinity` lives in a separate `hostile_infinity`
+  table because extracting it must fail by design.
+- **MySQL — `tests/common/mysql.rs` (`MySqlTestDb`).** Same rules; a private database per test
+  with its own 8-row hostile table.
+- **dvdrental.** Both compose engines are seeded from the same `.dat` files
+  (`tests/data/dvdrental`; MySQL through `tests/data/dvdrental_mysql.sql`), so the matrix and
+  cross-engine suites compare real, identical data.
+- Self-contained suites (`pg_decode.rs`, `review_repro.rs`) create their own schemas/tables and
+  clean up explicitly instead of using `TestDb`.
+
+## 4. Integration suites — `tests/*.rs`
+
+| File | Tests | Time | What it proves | Oracle |
+|---|---:|---:|---|---|
+| `pg_edge.rs` | 7 | 5.4 s | 5-row timestamp tie all extracted (filter on the tied `updated_at`); empty filter still carries the schema; cursor batch boundaries (13 rows at 3 → 3,3,3,3,1); projection; date/timestamp fidelity for every row incl. 2038/9999/epoch − 1 µs; bytea round trip; `hostile_infinity` fails with a typed error naming the column on cursor and COPY | reference (direct SQL, `extract(epoch …)`, `encode(bin,'hex')`) + trivial |
+| `pg_matrix.rs` | 4 | 5.6 s | 1 vs 3 in-process Ballista workers return the same rows; multi-batch (`batch_size` 7) through the provider, cursor and COPY; `collect()` vs `stream()` (standalone and distributed); full empty-result schema (names, types, timezones, precision, nullability) | metamorphic + reference (direct SQL ids) + trivial (hand-written schema, `build_arrow_schema`) |
+| `pg_decode.rs` | 8 | 21.0 s | `±infinity` typed errors, extreme finite timestamps, NUMERIC exact-or-error, json/jsonb/uuid text, keyset partitions cover NULL / i64 MIN/MAX keys exactly once, strict inputs, dropping a stream stops the source query | reference (Postgres `::text`, `extract`), differential (cursor vs COPY) |
+| `pg_copy.rs` | 3 | 2.0 s | Binary COPY returns the same whole rows as the cursor path (full + keyset ranges); unsupported types fail loudly | differential (whole-row, not per-column) |
+| `pg_numeric.rs` | 1 | 0.7 s | Exact decimal magnitudes (`123.45` scale 2 → `12345`) | trivial |
+| `pg_paths.rs` | 1 | 1.2 s | Full scan, keyset partitions, cursor batching and filtered extraction agree | metamorphic + reference |
+| `pg_pushdown.rs` | 3 | 7.4 s | `always` vs `never` return identical rows over a hazard table (ICU collation ranges, `NOT` under a nondeterministic collation, `-0.0`/`NaN`, `(NOT flag) IS NULL`, enum `OR`, uuid/jsonb, backslashes) and each case asserts whether it was pushed; statistics refresh after TTL | differential + non-vacuity check on the plan |
+| `pg_catalog.rs` | 8 | 3.3 s | `table_statistics` / `table_indexes` / `table_enum_columns`, `ExplainEstimator` (real plan, TTL cache, missing table) | reference (the fixture's known shape) |
+| `pg_distributed.rs` | 2 | 2.4 s | In-process Ballista over the hostile table (codecs, keyset partitions, budgeted pools, exact decimals); distributed `run_with` checkpoints one split and skips it on retry | trivial + checkpoint state |
+| `pg_checkpoint.rs` | 5 | 3.2 s | Stored bounds reused after the table grew; changed filter → `PlanMismatch`; a failed split does not block others; concurrent run → `LockHeld`; an undrained stream does not complete a split | reference (direct SQL) + typed errors + checkpoint state |
+| `e2e.rs` | 7 | 6.6 s | Full / filtered / selective / distributed extraction in-process; retry skips completed splits (counted via consumer calls); crash recovery after a consumer failure and after a cancelled run mid-split — no gap, no duplicate | reference (direct SQL) + checkpoint state |
+| `mysql.rs` | 13 | 3.3 s | MySQL prototype: schema, type mapping, typed extraction, NULL vs `''`, projection, empty tables, streamed batches union to the full scan, typed errors, lossless unsigned / bool / YEAR / TIME / BIT, URL-metacharacter passwords, DataFusion over the batches | reference (direct SQL) + trivial |
+| `extraction_matrix.rs` | 3 | 5.0 s | Every dvdrental table and column through both connectors vs direct `CAST(… AS text)`, and Postgres vs MySQL; Postgres filtered + keyset paths | reference + cross-engine differential |
+| `dvdrental_cross_engine.rs` | 4 | 1.5 s | Row counts vs the known dvdrental counts on both engines, directly and through the connectors; identical category names and staff picture bytes | reference (published counts) + cross-engine |
+| `review_repro.rs` | 19 | 11.9 s | One reproduction per review finding (`b1_…`, `c9_…`); each asserts the correct behaviour, so all pass now and a failure is a regression | differential / reference / trivial, named per test |
 
 ## 5. CI — `.github/workflows/ci.yml`
 
-Runs on every push and PR, `ubuntu-latest`, with a `services:` Postgres container
-(`DATABASE_URL` points the suites at it; locally the same role is played by
-`tests/docker/compose.yaml`):
+Runs on pull requests and on pushes to `master`, `ubuntu-latest`, 75-minute job timeout:
 
-1. `cargo fmt --check` — informational (`continue-on-error: true`); the codebase predates
-   a formatting pass.
-2. `cargo build --workspace --all-targets`.
-3. `cargo clippy --workspace --all-targets -- -D warnings` — also informational for now,
-   same reason.
+1. `cargo fmt --all -- --check` — blocking.
+2. `cargo clippy --all-targets --all-features -- -D warnings` — blocking.
+3. `cargo build --workspace --all-targets` (lib, bin, all examples).
 4. `cargo test --lib --bins` — unit tests.
-5. `cargo test --tests` — integration + e2e against the compose Postgres/MySQL stack
-   (the CI job provides them as service containers; locally bring up
-   `tests/docker/compose.yaml` or run `scripts/e2e.sh`).
+5. `docker compose -f tests/docker/compose.yaml up -d --wait` — the same stack as local runs.
+6. `cargo test --tests -- --test-threads=1` — every integration file.
+7. On failure, the database logs; always `docker compose … down -v`.
 
-Two caches: the usual `~/.cargo` + `target`.
+Doc tests (`cargo test --doc`) run in CI as a separate step before the integration tests.
 
-## 6. Related: debug SQL comment tags
+## 6. Debug SQL comment tags
 
-Not a testing feature, but built alongside this suite and worth noting here because it
-makes live-Postgres test failures easier to diagnose: `connector::query_tag::QuerySession`
-prepends a comment like
+`connector::query_tag::QuerySession` prepends a comment such as
 
 ```
 /* rust-extract query_id=q_1a2b3c4d pipeline=orders_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
 ```
 
-to every data-scan query issued through `PostgresExecutionPlan` (the main DataFusion/
-Ballista path) and `PostgresExtractor`'s cursor-based methods, so
-the running statement is identifiable directly in `pg_stat_activity` / logs during a test
-run against a real server, not just in application-side logs. `strategy` is
-`full`, optionally suffixed `+pushdown`; `partition=i/n` (1-based) appears
-only when the scan is actually split. This added a `run_id: String` field to
-`PostgresExecutionPlanModel` (the type serialized across the Ballista wire) — the round
-trip is covered by `distributed::plan_codec::tests::test_round_trip` and
-`connector::query_tag`'s own 6 unit tests.
+to every data-scan query from `PostgresExecutionPlan` and `PostgresExtractor`, so a statement is
+identifiable in `pg_stat_activity` / server logs during a test run. The same tag is how the COPY
+cancel-on-drop path finds its backend (covered by `pg_decode.rs`
+`dropping_a_scan_stream_stops_the_source`).
 
-## 7. What's still open
+## 7. Notes and open items
 
-- **Strict-policy live check** (the one Phase C item not yet implemented): a live-Postgres
-  test proving `PushdownPolicy::Strict` keeps a predicate in Arrow but still returns
-  exactly the same rows `always` would — i.e. the paranoid mode is *correct*, not just
-  quiet. `pg_pushdown.rs` currently only differentials `always` vs `never`.
-- **`main.rs` module duplication (resolved)**: `main.rs` now uses `use rust_ballista_extraction_layer::...`
-  imports instead of re-declaring `mod` blocks, so the lib crate and bin crate share the same
-  compiled code. Unit tests run once under the lib target (129 tests); `cargo test --bins`
-  runs the integration/e2e tests only.
-- **Coverage gate (optional, not started)**: `cargo-tarpaulin` with a ratchet (fail only on
-  a coverage *drop*, never an absolute threshold).
-- **Property/`proptest` suites and hostile-value differential at scale**: the roadmap's
-  full vision; the current hostile fixture + `pg_pushdown.rs` differential is the seeded,
-  deterministic core of it, not the full property-based version.
-- **Multi-process scheduler/worker integration runs**: still manual/out of scope — the
-  wire format is exercised in-process by `pg_distributed.rs`/`e2e.rs` and unit-tested by
-  `distributed::plan_codec`/`table_codec`.
-
-## 8. Exit criteria
-
-- [x] Every unit-testable pure-logic path has a test; `cargo test --lib` covers it in
-      milliseconds, no database.
-- [x] Every historical live bug (TEXT[] decode, timestamptz timezone, `relid` stats SQL,
-      unbound cursor placeholders, EXPLAIN JSON decode type mismatch) has a named
-      regression test that would fail if its fix were reverted.
-- [x] No test anywhere skips for lack of a database or cluster; a broken harness fails
-      loudly.
-- [x] CI runs unit + integration + e2e on every push/PR with no manual setup.
-- [ ] Strict-policy live check (§7).
-- [ ] `main.rs`/lib crate de-duplication (§7, hygiene only — doesn't block correctness).
+- `main.rs` no longer re-declares the library's modules (it `use`s
+  `rust_ballista_extraction_layer::…`), so unit tests compile and run once, under the lib target;
+  the bin target has none.
+- Open: a live check that `PushdownPolicy::Strict` returns the same rows as `always`
+  (`pg_pushdown.rs` differentials `always` vs `never` only).
+- Open: `proptest`-generated predicate trees for the pushdown differential (the hazard table is
+  hand-written); a coverage ratchet; multi-process scheduler/worker runs (the wire format is
+  exercised in-process and by the codec unit tests).

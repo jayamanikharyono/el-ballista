@@ -1,13 +1,10 @@
 //! MySQL SQL dialect (prototype) — a second implementation of [`SqlDialect`], added to validate
 //! the trait against a non-Postgres backend.
 //!
-//! NOTE: `SqlDialect`/`Fidelity` are imported from `crate::pushdown` (currently physically under
-//! `connector::postgres::pushdown`). That cross-connector dependency is exactly the signal to lift
-//! the trait into a shared module — see `connector/mysql/mod.rs`.
+//! NOTE: `SqlDialect` is imported from the shared, engine-agnostic `crate::pushdown` module.
 
-use crate::pushdown::Fidelity;
 use crate::pushdown::dialect::SqlDialect;
-use crate::types::ColumnMetadata;
+use crate::pushdown::{CastType, Collation};
 
 /// MySQL dialect: backtick identifier quoting and positional `?` placeholders.
 pub struct MysqlDialect;
@@ -22,29 +19,19 @@ impl SqlDialect for MysqlDialect {
         "?".to_string()
     }
 
-    fn column_literal_fidelity(
-        &self,
-        _column: &ColumnMetadata,
-        literal_is_text: bool,
-        literal_is_float: bool,
-    ) -> Fidelity {
-        // Conservative for a prototype: float ordering (NaN/inf) and text collation semantics
-        // (MySQL defaults are commonly case-insensitive, e.g. utf8mb4_0900_ai_ci) can diverge
-        // from Rust's, so treat those as Inexact and let the engine keep the predicate.
-        if literal_is_float || literal_is_text {
-            Fidelity::Inexact
-        } else {
-            Fidelity::Exact
+    // TODO(mysql-pushdown): MySQL has no pushdown path yet. Column collations (e.g.
+    // `utf8mb4_0900_ai_ci` vs `_bin`) must be compared with DataFusion's byte-wise semantics
+    // before any text predicate is ever pushed as `Exact`.
+    fn cast_type_name(&self, to: CastType) -> &'static str {
+        match to {
+            CastType::Text => "CHAR",
         }
     }
 
-    fn column_column_fidelity(
-        &self,
-        _left_column: &ColumnMetadata,
-        _right_column: &ColumnMetadata,
-    ) -> Fidelity {
-        // Collation/charset interplay between two columns is not modeled yet: be conservative.
-        Fidelity::Inexact
+    fn collation_name(&self, collation: Collation) -> &'static str {
+        match collation {
+            Collation::Binary => "utf8mb4_bin",
+        }
     }
 }
 

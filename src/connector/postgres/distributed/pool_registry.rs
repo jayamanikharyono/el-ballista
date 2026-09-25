@@ -7,20 +7,41 @@
 //! serialized scan plan resolve the descriptor lazily through the same registry, so an
 //! N-worker process still opens one `budgeted_max_connections`-sized pool per source.
 //!
+//! Lifecycle: pools are created lazily on first use and shared for the life of the process.
+//! Idle connections are closed after [`IDLE_TIMEOUT`], so a pool nobody uses any more holds
+//! no source connections; [`SourcePoolRegistry::close_all`] closes every pool gracefully
+//! (the CLI calls it before exiting; long-lived library hosts can call it at shutdown), and
+//! closed pools are pruned from the registry.
+//!
 //! The registry is deliberately `PgPool`-concrete (see the SPI contract in
 //! `crate::connector`): a MySQL backend owns an analogous registry over its own pool type,
 //! keyed by its own [`crate::connector::SourceDescriptor`] implementation.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use tokio::sync::Semaphore;
 
 use super::connection::PostgresConnectionDescriptor;
 use crate::connector::SourceDescriptor;
 use crate::connector::errors::ExtractorError;
 
+/// Idle pooled connections are closed after this long.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The process-wide pool registry (created on first use).
+///
+/// # Examples
+///
+/// ```
+/// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+///
+/// // One registry per process: every caller shares the same budgeted pools.
+/// assert!(std::ptr::eq(registry(), registry()));
+/// ```
 pub fn registry() -> &'static SourcePoolRegistry {
     static REGISTRY: OnceLock<SourcePoolRegistry> = OnceLock::new();
     REGISTRY.get_or_init(SourcePoolRegistry::new)
@@ -39,7 +60,14 @@ fn runtime_key() -> String {
 
 #[derive(Debug, Default)]
 pub struct SourcePoolRegistry {
-    pools: Mutex<HashMap<String, PgPool>>,
+    pools: Mutex<HashMap<String, Entry>>,
+}
+
+/// One registered source: its budgeted pool plus the scan limiter sized to the same budget.
+#[derive(Debug, Clone)]
+struct Entry {
+    pool: PgPool,
+    scans: Arc<Semaphore>,
 }
 
 impl SourcePoolRegistry {
@@ -51,7 +79,7 @@ impl SourcePoolRegistry {
     /// scheduler that only plans never opens a single connection) with the descriptor's
     /// *budgeted* max_connections and the session-hygiene settings from
     /// docs/connectors/postgres.md §6.
-    pub fn pool(
+    pub(crate) fn pool(
         &self,
         descriptor: &PostgresConnectionDescriptor,
     ) -> Result<PgPool, ExtractorError> {
@@ -64,11 +92,29 @@ impl SourcePoolRegistry {
         // there is a single runtime: every CLI invocation, the scheduler, and
         // all executors sharing an executor process) while isolating runtimes
         // that merely share a process.
+        self.entry(descriptor).map(|e| e.pool)
+    }
+
+    /// The process-wide **scan limiter** for a source: a semaphore with one permit per
+    /// budgeted connection (the same budget as [`Self::pool`]). A partition scan holds a
+    /// permit for its whole duration, so at most `budgeted_max_connections` scans of this
+    /// source run at once in this process and the rest *wait* (cancellably, without a
+    /// timeout) instead of failing on the pool's acquire timeout. Metadata queries (schema,
+    /// statistics, EXPLAIN) do not take permits; they are short and use the pool directly.
+    pub(crate) fn scan_slots(
+        &self,
+        descriptor: &PostgresConnectionDescriptor,
+    ) -> Result<Arc<Semaphore>, ExtractorError> {
+        self.entry(descriptor).map(|e| e.scans)
+    }
+
+    fn entry(&self, descriptor: &PostgresConnectionDescriptor) -> Result<Entry, ExtractorError> {
         let key = format!("{}|rt={}", descriptor.registry_key(), runtime_key());
         let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        pools.retain(|_, entry| !entry.pool.is_closed());
 
-        if let Some(pool) = pools.get(&key) {
-            return Ok(pool.clone());
+        if let Some(entry) = pools.get(&key) {
+            return Ok(entry.clone());
         }
 
         let password = descriptor.resolved_password()?;
@@ -85,7 +131,8 @@ impl SourcePoolRegistry {
 
         let pool = PgPoolOptions::new()
             .max_connections(descriptor.budgeted_max_connections())
-            .acquire_timeout(std::time::Duration::from_secs(30))
+            .acquire_timeout(descriptor.acquire_timeout())
+            .idle_timeout(IDLE_TIMEOUT)
             .after_connect(move |conn, _meta| {
                 let statement_timeout = statement_timeout.clone();
                 Box::pin(async move {
@@ -108,8 +155,69 @@ impl SourcePoolRegistry {
             })
             .connect_lazy_with(connect_options);
 
-        pools.insert(key, pool.clone());
-        Ok(pool)
+        let budget = usize::try_from(descriptor.budgeted_max_connections()).unwrap_or(1);
+        let entry = Entry {
+            pool,
+            scans: Arc::new(Semaphore::new(budget.max(1))),
+        };
+        pools.insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    /// Close every registered pool (waiting for checked-out connections to return) and
+    /// clear the registry. Later `pool()` calls open fresh pools.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() {
+    /// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+    ///
+    /// // At shutdown: close pooled source connections gracefully.
+    /// registry().close_all().await;
+    /// assert!(registry().is_empty());
+    /// # }
+    /// ```
+    pub async fn close_all(&self) {
+        let pools: Vec<PgPool> = {
+            let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+            pools.drain().map(|(_, entry)| entry.pool).collect()
+        };
+        for pool in pools {
+            pool.close().await;
+        }
+    }
+
+    /// Number of registered (not yet closed) pools.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+    ///
+    /// // Pools open lazily, on the first scan of a source.
+    /// println!("{} open source pool(s)", registry().len());
+    /// ```
+    pub fn len(&self) -> usize {
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        pools.retain(|_, entry| !entry.pool.is_closed());
+        pools.len()
+    }
+
+    /// True when no pool is registered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+    ///
+    /// if registry().is_empty() {
+    ///     println!("no source connections held by this process");
+    /// }
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -121,33 +229,33 @@ pub enum SourcePool {
     Connected(PgPool),
     Deferred {
         descriptor: PostgresConnectionDescriptor,
-        pool: OnceLock<Result<PgPool, String>>,
+        pool: OnceLock<Result<PgPool, Arc<ExtractorError>>>,
     },
 }
 
 impl SourcePool {
-    pub fn connected(pool: PgPool) -> Self {
+    pub(crate) fn connected(pool: PgPool) -> Self {
         Self::Connected(pool)
     }
 
-    pub fn deferred(descriptor: PostgresConnectionDescriptor) -> Self {
+    pub(crate) fn deferred(descriptor: PostgresConnectionDescriptor) -> Self {
         Self::Deferred {
             descriptor,
             pool: OnceLock::new(),
         }
     }
 
-    pub fn get(&self) -> Result<PgPool, ExtractorError> {
+    pub(crate) fn get(&self) -> Result<PgPool, ExtractorError> {
         match self {
             Self::Connected(pool) => Ok(pool.clone()),
             Self::Deferred { descriptor, pool } => {
-                let result =
-                    pool.get_or_init(|| registry().pool(descriptor).map_err(|e| e.to_string()));
+                let result = pool.get_or_init(|| registry().pool(descriptor).map_err(Arc::new));
                 match result {
                     Ok(pool) => Ok(pool.clone()),
-                    Err(e) => Err(ExtractorError::Internal(format!(
-                        "cannot open source pool: {e}"
-                    ))),
+                    Err(e) => Err(ExtractorError::Shared {
+                        context: "cannot open source pool".to_string(),
+                        source: Arc::clone(e),
+                    }),
                 }
             }
         }
@@ -212,10 +320,67 @@ mod tests {
     }
 
     #[test]
-    fn test_deferred_get_fails_cleanly_without_password_env() {
-        unsafe {
-            std::env::remove_var("UNUSED_TEST_ENV");
+    fn test_pool_key_includes_session_settings_and_credentials_source() {
+        // S3: a second job must not inherit the first job's session settings.
+        let base = descriptor(1);
+        let mut timeout = base.clone();
+        timeout.statement_timeout_ms = 5;
+        let mut app = base.clone();
+        app.application_name = "other".into();
+        let mut pw = base.clone();
+        pw.password_env = "OTHER_ENV".into();
+        for other in [timeout, app, pw] {
+            assert_ne!(base.pool_key(), other.pool_key());
+            assert_ne!(base.registry_key(), other.registry_key());
         }
+    }
+
+    #[tokio::test]
+    async fn test_scan_slots_match_the_budget_and_are_shared() {
+        // S1: one limiter per source, sized to the per-process connection budget.
+        let mut d = descriptor(4); // pool_max 8 / 4 workers = 2
+        d.password_env = "PATH".into(); // lazy pool; any set variable works
+        let a = registry().scan_slots(&d).unwrap();
+        let b = registry().scan_slots(&d).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "same source, same limiter");
+        assert_eq!(a.available_permits(), 2);
+        let _held = a.clone().acquire_many_owned(2).await.unwrap();
+        assert!(
+            b.clone().try_acquire_owned().is_err(),
+            "a third scan must wait"
+        );
+    }
+
+    #[test]
+    fn test_acquire_timeout_never_undercuts_statement_timeout() {
+        // S1: a scan waiting for a connection held by a sibling scan must not hit a 30 s
+        // cliff while the holder is still within its statement timeout.
+        let mut d = descriptor(1);
+        d.statement_timeout_ms = 300_000;
+        assert_eq!(d.acquire_timeout(), Duration::from_secs(300));
+        d.statement_timeout_ms = 1_000;
+        assert_eq!(d.acquire_timeout(), Duration::from_secs(30));
+        d.statement_timeout_ms = 0;
+        assert_eq!(d.acquire_timeout(), Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn test_close_all_empties_the_registry() {
+        let reg = SourcePoolRegistry::new();
+        // Lazy pool, never connects: an always-present variable is a valid password source,
+        // so the test does not mutate the environment (T-6).
+        let mut d = descriptor(1);
+        d.password_env = "PATH".into();
+        let pool = reg.pool(&d).unwrap(); // lazy: no connection is opened
+        assert_eq!(reg.len(), 1);
+        reg.close_all().await;
+        assert!(pool.is_closed());
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn test_deferred_get_fails_cleanly_without_password_env() {
+        // `UNUSED_TEST_ENV` is never set anywhere (no env mutation needed, T-6).
         let pool = SourcePool::deferred(descriptor(1));
         assert!(pool.get().is_err());
         // A second get must not panic and must keep failing (lazy init already cached the error).

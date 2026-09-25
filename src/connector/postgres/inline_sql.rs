@@ -1,53 +1,128 @@
 //! Postgres inline SQL rendering for `EXPLAIN`.
 //!
-//! `render_inline_pg` renders a [`Predicate`](crate::pushdown::Predicate) with literals inlined as
-//! **Postgres** SQL text (double-quoted identifiers, `'`-doubled strings, `::float8` /
-//! `::timestamptz` casts). It is Postgres-specific, so it lives with the connector rather than in
-//! the backend-agnostic `pushdown` module (AGENTS.md §1/§6). Used only for `EXPLAIN (FORMAT JSON)`
-//! cost estimation — never a real executed query, which binds parameters via
-//! `Predicate::render_to` instead.
+//! [`PredicateInlineSql::render_inline`] renders a [`Predicate`] with literals inlined as
+//! **Postgres** SQL text. It goes through the same [`Predicate::render_to`] as execution (so
+//! parenthesization and casts are identical) with a sink that writes literals instead of binding
+//! them. Used only for `EXPLAIN (FORMAT JSON)` cost estimation, cache keys, and `rel plan`
+//! output — never for a query that returns rows.
 
-use crate::pushdown::{Literal, Predicate};
+use crate::connector::postgres::dialect::PostgresDialect;
+use crate::pushdown::{Predicate, SqlParam, SqlSink};
 
-/// Render a predicate as inline Postgres SQL text (EXPLAIN only).
-pub(crate) trait PredicateInlineSql {
-    fn render_inline_pg(&self) -> String;
+/// Render a predicate as inline Postgres SQL text (EXPLAIN / diagnostics only).
+pub trait PredicateInlineSql {
+    /// Inline Postgres SQL for this predicate.
+    ///
+    /// # Examples
+    /// ```
+    /// use datafusion::prelude::{col, lit};
+    /// use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
+    /// use rust_ballista_extraction_layer::pushdown::translate;
+    /// let (_, p) = translate(&col("id").eq(lit(7i64))).unwrap();
+    /// assert_eq!(p.render_inline(), r#"("id" = 7)"#);
+    /// ```
+    fn render_inline(&self) -> String;
 }
 
 impl PredicateInlineSql for Predicate {
-    fn render_inline_pg(&self) -> String {
-        match self {
-            Predicate::Column(name) => format!("\"{}\"", name.replace('"', "\"\"")),
-            Predicate::Literal(lit) => render_literal_inline(lit),
-            Predicate::Cmp { left, op, right } => {
-                format!(
-                    "({} {op} {})",
-                    left.render_inline_pg(),
-                    right.render_inline_pg()
-                )
-            }
-            Predicate::And(l, r) => {
-                format!("({} AND {})", l.render_inline_pg(), r.render_inline_pg())
-            }
-            Predicate::Or(l, r) => {
-                format!("({} OR {})", l.render_inline_pg(), r.render_inline_pg())
-            }
-            Predicate::Not(p) => format!("NOT ({})", p.render_inline_pg()),
-            Predicate::IsNull(p) => format!("{} IS NULL", p.render_inline_pg()),
-            Predicate::IsNotNull(p) => format!("{} IS NOT NULL", p.render_inline_pg()),
-            Predicate::Cast { expr, to_type } => {
-                format!("{}::{to_type}", expr.render_inline_pg())
-            }
-        }
+    fn render_inline(&self) -> String {
+        let mut sink = InlineSink(String::new());
+        self.render_to(&PostgresDialect, &mut sink);
+        sink.0
     }
 }
 
-fn render_literal_inline(literal: &Literal) -> String {
-    match literal {
-        Literal::Bool(v) => v.to_string().to_uppercase(),
-        Literal::Int(v) => v.to_string(),
-        Literal::Float(v) => format!("'{v}'::float8"),
-        Literal::Text(v) => format!("'{}'", v.replace('\'', "''")),
-        Literal::Timestamp(v) => format!("'{}'::timestamptz", v.to_rfc3339()),
+struct InlineSink(String);
+
+impl SqlSink for InlineSink {
+    fn push_sql(&mut self, sql: &str) {
+        self.0.push_str(sql);
+    }
+
+    fn push_param(&mut self, param: SqlParam) {
+        self.0.push_str(&render_param_inline(&param));
+    }
+}
+
+fn render_param_inline(param: &SqlParam) -> String {
+    match param {
+        SqlParam::Bool(v) => v.to_string().to_uppercase(),
+        SqlParam::Int(v) => v.to_string(),
+        SqlParam::Float(v) => format!("{}::float8", quote_text(&v.to_string())),
+        SqlParam::Text(v) => quote_text(v),
+        SqlParam::Timestamp(v) => format!("{}::timestamptz", quote_text(&v.to_rfc3339())),
+    }
+}
+
+/// A Postgres string literal that means `value` regardless of `standard_conforming_strings`:
+/// with a backslash present, an escape string `E'...'` (backslashes doubled — `E''` always
+/// treats `\` as an escape); otherwise a plain `'...'`, which never interprets backslashes when
+/// there are none. Quotes are doubled in both forms.
+fn quote_text(value: &str) -> String {
+    let quoted = value.replace('\'', "''");
+    if value.contains('\\') {
+        format!("E'{}'", quoted.replace('\\', "\\\\"))
+    } else {
+        format!("'{quoted}'")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pushdown::{CmpOp, Literal};
+
+    fn text_eq(value: &str) -> Predicate {
+        Predicate::Cmp {
+            left: Box::new(Predicate::Column("status".to_string())),
+            op: CmpOp::Eq,
+            right: Box::new(Predicate::Literal(Literal::Text(value.to_string()))),
+        }
+    }
+
+    #[test]
+    fn test_render_inline_quotes_text() {
+        assert_eq!(text_eq("PA'D").render_inline(), r#"("status" = 'PA''D')"#);
+    }
+
+    #[test]
+    fn test_render_inline_escapes_backslash_with_e_string() {
+        // M9: `a\b` must reach Postgres as the 3-character string under either setting of
+        // standard_conforming_strings.
+        assert_eq!(text_eq(r"a\b").render_inline(), r#"("status" = E'a\\b')"#);
+        assert_eq!(
+            text_eq(r"it's \n").render_inline(),
+            r#"("status" = E'it''s \\n')"#
+        );
+        // Trailing backslash cannot swallow the closing quote.
+        assert_eq!(text_eq(r"x\").render_inline(), r#"("status" = E'x\\')"#);
+    }
+
+    #[test]
+    fn test_render_inline_other_literals() {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let p = Predicate::Cmp {
+            left: Box::new(Predicate::Column("updated_at".to_string())),
+            op: CmpOp::Gt,
+            right: Box::new(Predicate::Literal(Literal::Timestamp(ts))),
+        };
+        assert_eq!(
+            p.render_inline(),
+            r#"("updated_at" > '2023-11-14T22:13:20+00:00'::timestamptz)"#
+        );
+        let p = Predicate::Cmp {
+            left: Box::new(Predicate::Column("x".to_string())),
+            op: CmpOp::Eq,
+            right: Box::new(Predicate::Literal(Literal::Float(f64::NAN))),
+        };
+        assert_eq!(p.render_inline(), r#"("x" = 'NaN'::float8)"#);
+    }
+
+    #[test]
+    fn test_render_inline_parenthesizes_like_execution() {
+        let p = Predicate::IsNull(Box::new(Predicate::Not(Box::new(Predicate::Column(
+            "flag".to_string(),
+        )))));
+        assert_eq!(p.render_inline(), r#"((NOT "flag") IS NULL)"#);
     }
 }

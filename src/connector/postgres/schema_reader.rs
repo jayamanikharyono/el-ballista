@@ -5,6 +5,7 @@
 
 use sqlx::PgPool;
 
+use crate::connector::errors::ExtractorError;
 use crate::types::{ColumnMetadata, TableMetadata};
 
 pub struct PostgresSchemaReader<'a> {
@@ -13,6 +14,22 @@ pub struct PostgresSchemaReader<'a> {
 }
 
 impl<'a> PostgresSchemaReader<'a> {
+    /// A reader over `pool`; unqualified table names resolve in the `public` schema.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
+    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
+    /// use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
+    ///
+    /// let meta = PostgresSchemaReader::new(ex.pool()).get_table_metadata("orders").await?;
+    /// for c in &meta.columns {
+    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub fn new(pool: &'a PgPool) -> Self {
         Self {
             pool,
@@ -20,7 +37,23 @@ impl<'a> PostgresSchemaReader<'a> {
         }
     }
 
-    #[allow(dead_code)]
+    /// A reader over `pool`; unqualified table names resolve in `schema_name`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
+    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
+    /// use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
+    ///
+    /// let reader = PostgresSchemaReader::with_schema(ex.pool(), "sales");
+    /// let meta = reader.get_table_metadata("orders").await?; // sales.orders
+    /// for c in &meta.columns {
+    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub fn with_schema(pool: &'a PgPool, schema_name: impl Into<String>) -> Self {
         Self {
             pool,
@@ -28,7 +61,7 @@ impl<'a> PostgresSchemaReader<'a> {
         }
     }
 
-    pub async fn get_table_schema(
+    pub(crate) async fn get_table_schema(
         &self,
         table_name: &str,
     ) -> Result<Vec<ColumnMetadata>, sqlx::Error> {
@@ -46,7 +79,7 @@ impl<'a> PostgresSchemaReader<'a> {
                 numeric_precision,
                 numeric_scale,
                 udt_name,
-                collation_name AS collation
+                collation_name
             FROM information_schema.columns
             WHERE table_schema = $1
               AND table_name = $2
@@ -61,13 +94,40 @@ impl<'a> PostgresSchemaReader<'a> {
         Ok(columns)
     }
 
-    pub async fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, sqlx::Error> {
+    /// Read a table's column metadata (ordinal order).
+    ///
+    /// Errors with [`ExtractorError::TableNotFound`] when `information_schema.columns` has
+    /// no rows for it — a missing (or invisible) table must never look like a zero-column
+    /// table, or a provider would register an empty schema and every scan would return
+    /// zero rows.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
+    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
+    /// use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
+    ///
+    /// let meta = PostgresSchemaReader::new(ex.pool()).get_table_metadata("public.orders").await?;
+    /// for c in &meta.columns {
+    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn get_table_metadata(
+        &self,
+        table_name: &str,
+    ) -> Result<TableMetadata, ExtractorError> {
         let (schema, table) = match table_name.split_once('.') {
             Some((s, t)) => (s, t),
             None => (self.schema_name.as_str(), table_name),
         };
 
         let columns = self.get_table_schema(table_name).await?;
+        if columns.is_empty() {
+            return Err(ExtractorError::TableNotFound(format!("{schema}.{table}")));
+        }
 
         let table_metadata = TableMetadata {
             schema_name: schema.to_string(),

@@ -40,14 +40,14 @@ impl Default for LogOptions {
 impl LogOptions {
     /// Resolve options from the real `std::env::args()` and the process environment.
     /// Command-line flags win over environment variables.
-    pub fn from_env_and_args() -> Self {
+    pub(crate) fn from_env_and_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
         Self::resolve(&args, |k| std::env::var(k).ok())
     }
 
     /// Testable core: resolve from an explicit argv and an environment lookup.
     /// CLI flags take precedence over env vars; env vars over the built-in defaults.
-    pub fn resolve<F>(args: &[String], env: F) -> Self
+    pub(crate) fn resolve<F>(args: &[String], env: F) -> Self
     where
         F: Fn(&str) -> Option<String>,
     {
@@ -100,9 +100,21 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 /// Install the global logger using options resolved from the environment and argv.
 ///
-/// Convenience wrapper over [`init`]. Call once at process start. A failure (for example
+/// Convenience wrapper over `init`. Call once at process start. A failure (for example
 /// a second call, or an unwritable log file) is reported to stderr and swallowed so it
 /// never aborts the program over logging alone.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rust_ballista_extraction_layer::logging;
+///
+/// fn main() {
+///     // Honors RUST_LOG / --log-level and REL_LOG_FILE / --log-file.
+///     logging::init_from_env_and_args();
+///     log::info!("extraction starting");
+/// }
+/// ```
 pub fn init_from_env_and_args() {
     let opts = LogOptions::from_env_and_args();
     if let Err(e) = init(&opts) {
@@ -115,7 +127,7 @@ pub fn init_from_env_and_args() {
 /// Emits to stderr always and, when `opts.file` is set, additionally appends to that file
 /// (creating parent directories as needed). Returns an error if a logger is already
 /// installed or the log file cannot be opened.
-pub fn init(opts: &LogOptions) -> Result<(), fern::InitError> {
+pub(crate) fn init(opts: &LogOptions) -> Result<(), fern::InitError> {
     let mut dispatch = fern::Dispatch::new()
         .level(opts.level)
         .format(|out, message, record| {

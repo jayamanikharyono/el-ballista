@@ -4,7 +4,8 @@ services:
   postgres:
     image: docker.io/library/postgres:17
     container_name: pg-learust
-    # Hardcoded test budget (same rule as benchmark bench-pg): cores 4-5 + 2g RAM.
+    # Hardcoded budget: a 2-CPU quota + 2g RAM (a quota, not a pin — benchmark/run.sh
+    # pins its own bench-pg container to cores 4-5 + 2g; this compose service is not it).
     cpus: 2
     mem_limit: 2g
     restart: unless-stopped
@@ -24,7 +25,7 @@ services:
       - ./initdb:/docker-entrypoint-initdb.d:ro
     command:
       - postgres
-      # Needed for the exact safe high watermark via pg_stat_activity.xact_start.
+      # Keeps pg_stat_activity populated (query tags show which scan is running).
       - -c
       - track_activities=on
       # Autovacuum keeps pg_stats fresh, which the cost model reads.

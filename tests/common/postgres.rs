@@ -15,11 +15,13 @@
 //! ```
 //!
 //! Design: schema isolation (not database isolation) inside the one server — each `TestDb` gets
-//! `test_<pid>_<n>`, builds the hostile fixture inside it, and drops the schema on `Drop`. Tests
-//! can run in parallel.
+//! `test_<pid>_<n>`, loads the hostile fixture (`tests/data/hostile.sql`) inside it, and drops
+//! the schema on `Drop` (over a fresh connection on a private runtime, bounded by a 10 s
+//! timeout, failures logged) or via the explicit `TestDb::cleanup().await`. Tests can run in
+//! parallel.
 
-use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
+use sqlx::{Connection, PgPool};
 use std::str::FromStr;
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +46,10 @@ pub struct TestDb {
     pub user: String,
     pub password: String,
     pub database: String,
+    /// Stored so teardown can open a fresh connection independent of the test runtime.
+    connect_options: PgConnectOptions,
+    /// Set by [`TestDb::cleanup`]; makes `Drop` a no-op.
+    cleaned: bool,
 }
 
 impl TestDb {
@@ -73,7 +79,7 @@ impl TestDb {
         let pool = PgPoolOptions::new()
             .max_connections(16)
             .acquire_timeout(Duration::from_secs(30))
-            .connect_with(options)
+            .connect_with(options.clone())
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -112,6 +118,8 @@ impl TestDb {
             user,
             password,
             database,
+            connect_options: options,
+            cleaned: false,
         };
         db.setup()
             .await
@@ -124,105 +132,115 @@ impl TestDb {
         format!("{}.hostile", self.schema)
     }
 
-    /// Build the hostile fixture: every decode edge in one small deterministic table.
-    /// `updated_at` is spread over 2024-01-01..08 so window queries can slice it.
+    /// Schema-qualified `hostile_infinity` table (±infinity timestamps/dates, which must fail
+    /// extraction with a typed error; kept out of `hostile` on purpose).
+    pub fn infinity_table(&self) -> String {
+        format!("{}.hostile_infinity", self.schema)
+    }
+
+    /// Build the hostile fixture from `tests/data/hostile.sql` (the single source of truth),
+    /// substituting this test's schema for every `__SCHEMA__` token. 13 rows, ids 1..13:
+    /// rows 1..8 have `updated_at` 2024-01-01..08 (one per day), rows 9..13 tie on
+    /// 2024-01-09 00:00:00+00. See the file header for the edges it covers.
     async fn setup(&self) -> Result<(), sqlx::Error> {
-        let s = &self.schema;
-        let sql = format!("CREATE TYPE {s}.mood AS ENUM ('sad', 'ok', 'ecstatic')");
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
-        let sql = format!(
-            "CREATE TABLE {s}.hostile (
-                id bigserial primary key,
-                name text,
-                nick varchar(20),
-                code bpchar(4),
-                amount numeric(12,2),
-                precise numeric(30,15),
-                count integer,
-                big bigint,
-                ratio double precision,
-                f real,
-                flag boolean,
-                tags text[],
-                meta jsonb,
-                uid uuid,
-                day date,
-                ts timestamptz,
-                naive timestamp without time zone,
-                feeling {s}.mood,
-                updated_at timestamptz not null
-            )"
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
-        // One row per edge; row 8 is the mostly-NULL row. Deterministic ids 1..8.
-        let sql = format!(
-            "INSERT INTO {s}.hostile
-             (name, nick, code, amount, precise, count, big, ratio, f, flag, tags,
-              meta, uid, day, ts, naive, feeling, updated_at) VALUES
-             ('Zürich', 'MÜNCHEN', 'ab', 123.45, 3.141592653589793, 2147483647,
-              9223372036854775807, 'NaN', 'Infinity', true, '{{\"a\",NULL,\"\"}}',
-              '{{\"a\":1,\"b\":[true,null]}}', '123e4567-e89b-12d3-a456-426614174000',
-              '2024-02-29', '2024-03-01 12:00:00+02', '2024-03-01 12:00:00',
-              'ecstatic', '2024-01-01'),
-             ('', '', '', -7.50, 0, -2147483648, -9223372036854775808,
-              '-Infinity', 1.5, false, '{{}}', '{{}}', '123e4567-e89b-12d3-a456-426614174001',
-              NULL, NULL, NULL, 'sad', '2024-01-02'),
-             ('plain', 'plain', 'wxyz', 0.00, -0.5, 0, 0, 0.0, 0.0, NULL,
-              '{{x,y,z}}', '[]', '123e4567-e89b-12d3-a456-426614174002',
-              '1970-01-01', '1970-01-01 00:00:00+00', '1970-01-01 00:00:00',
-              'ok', '2024-01-03'),
-             ('MiXeD', 'MiXeD', 'q', 99999999.99, 100.25, 42, 42, 2.5, -3.25, true,
-              NULL, NULL, '123e4567-e89b-12d3-a456-426614174003',
-              '1999-12-31', '1999-12-31 23:59:59-05', '1999-12-31 23:59:59',
-              'ok', '2024-01-04'),
-             ('nulls', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-              NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2024-01-05'),
-             ('six', 'six', 'six6', 1.00, 1.5, 6, 6, 6.0, 6.0, true,
-              '{{s}}', '{{\"n\":6}}', '123e4567-e89b-12d3-a456-426614174005',
-              '2024-06-15', '2024-06-15 06:30:00+00', '2024-06-15 06:30:00',
-              'sad', '2024-01-06'),
-             ('seven', 'seven', 'svn7', 42.42, -2.75, 7, 7, 7.0, 7.0, false,
-              '{{a,b}}', '{{\"n\":7}}', '123e4567-e89b-12d3-a456-426614174006',
-              '2024-07-07', '2024-07-07 07:07:07+00', '2024-07-07 07:07:07',
-              'ecstatic', '2024-01-07'),
-             ('eight', 'eight', 'eght', NULL, NULL, 8, 8, 8.0, 8.0, NULL,
-              NULL, NULL,               NULL, NULL, NULL, NULL, NULL, '2024-01-08')"
-        );
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-            .execute(&self.pool)
-            .await?;
-        let sql = format!("ANALYZE {s}.hostile");
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        let sql = HOSTILE_SQL.replace(SCHEMA_TOKEN, &self.schema);
+        // The schema name is harness-generated and asserted identifier-safe in
+        // `connect_with`; the rest of the script is a static, audited file.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 }
 
+/// The hostile fixture script (see its header). Loaded verbatim, schema token substituted.
+const HOSTILE_SQL: &str = include_str!("../data/hostile.sql");
+/// Placeholder in [`HOSTILE_SQL`] replaced by the per-test schema name.
+const SCHEMA_TOKEN: &str = "__SCHEMA__";
+
+/// Rows in `hostile` (`tests/data/hostile.sql`): ids 1..=13.
+pub const HOSTILE_ROWS: usize = 13;
+/// `updated_at` shared by the 5-row tie (ids 9..=13) in `hostile`.
+pub const HOSTILE_TIE_TS: &str = "2024-01-09 00:00:00+00";
+/// Ids of the 5-row `updated_at` tie.
+pub const HOSTILE_TIE_IDS: [i64; 5] = [9, 10, 11, 12, 13];
+
+impl TestDb {
+    /// Drop the per-test schema on the test's own runtime and close the pool. Prefer this over
+    /// relying on `Drop` when a test wants the teardown awaited (and its failure surfaced).
+    /// `Drop` becomes a no-op afterwards.
+    pub async fn cleanup(mut self) {
+        self.cleaned = true;
+        let sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema);
+        let res = tokio::time::timeout(
+            TEARDOWN_TIMEOUT,
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&self.pool),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("TestDb::cleanup: DROP SCHEMA {} failed: {e}", self.schema),
+            Err(_) => eprintln!(
+                "TestDb::cleanup: DROP SCHEMA {} timed out after {TEARDOWN_TIMEOUT:?}",
+                self.schema
+            ),
+        }
+        self.pool.close().await;
+    }
+}
+
+/// Upper bound on teardown: a stuck `DROP SCHEMA` must not hang the suite.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `DROP SCHEMA … CASCADE` over a FRESH connection on a private current-thread runtime.
+///
+/// Why not the test's pool: `Drop` runs on the test runtime's thread, which is blocked in
+/// `join()` below, so that runtime can never drive the pool's connection I/O — reusing it is
+/// what used to deadlock (or wait out the 30 s acquire timeout). A fresh `PgConnection` is
+/// owned entirely by the private runtime, so teardown cannot depend on the blocked one.
+fn drop_schema_blocking(options: PgConnectOptions, schema: String) {
+    let joined = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("TestDb::drop: cannot build teardown runtime for {schema}: {e}");
+                return;
+            }
+        };
+        rt.block_on(async {
+            let work = async {
+                let mut conn = PgConnection::connect_with(&options).await?;
+                let sql = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                    .execute(&mut conn)
+                    .await?;
+                conn.close().await
+            };
+            match tokio::time::timeout(TEARDOWN_TIMEOUT, work).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("TestDb::drop: DROP SCHEMA {schema} failed: {e}"),
+                Err(_) => eprintln!(
+                    "TestDb::drop: DROP SCHEMA {schema} timed out after {TEARDOWN_TIMEOUT:?}"
+                ),
+            }
+        });
+    })
+    .join();
+    if joined.is_err() {
+        eprintln!("TestDb::drop: teardown thread panicked");
+    }
+}
+
 impl Drop for TestDb {
     fn drop(&mut self) {
-        // Best-effort: a failed drop must never fail a test. Needs its own runtime
-        // because Drop has no async context.
-        let pool = self.pool.clone();
-        let schema = self.schema.clone();
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            if let Ok(rt) = rt {
-                rt.block_on(async {
-                    let sql = format!("DROP SCHEMA {schema} CASCADE");
-                    let _ = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
-                        .execute(&pool)
-                        .await;
-                });
-            }
-        })
-        .join();
+        // A failed drop must never fail (or hang) a test, but it is logged, not swallowed.
+        if self.cleaned {
+            return;
+        }
+        drop_schema_blocking(self.connect_options.clone(), self.schema.clone());
     }
 }
 
@@ -273,4 +291,16 @@ pub fn int64_col(batch: &arrow::record_batch::RecordBatch, name: &str) -> Vec<i6
     (0..arr.len())
         .filter_map(|i| arr.is_valid(i).then(|| arr.value(i)))
         .collect()
+}
+
+/// `batch` reordered by its ``col`` column ascending. Extraction carries no `ORDER BY`, so row
+/// order is unspecified; tests that assert on row positions must sort first.
+pub fn sorted_by(
+    batch: &arrow::record_batch::RecordBatch,
+    col: &str,
+) -> arrow::record_batch::RecordBatch {
+    let idx = batch.schema().index_of(col).expect("sort column exists");
+    let indices =
+        arrow::compute::sort_to_indices(batch.column(idx), None, None).expect("sort_to_indices");
+    arrow::compute::take_record_batch(batch, &indices).expect("take_record_batch")
 }

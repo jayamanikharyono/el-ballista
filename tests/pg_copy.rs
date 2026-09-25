@@ -52,84 +52,35 @@ async fn copy_full(ex: &PostgresExtractor, table: &str, batch_size: usize) -> Ve
     batches
 }
 
-fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
-    v.sort();
-    v
-}
-
-fn string_col(batches: &[RecordBatch], name: &str) -> Vec<Option<String>> {
+/// Every row as its full, displayed tuple (all columns, including `meta` jsonb, `uid`,
+/// `tags`, dates and timestamps), sorted by the rendered row. Comparing whole rows — not
+/// per-column sorted vectors — catches a row-permutation bug (values from different
+/// source rows glued together), which per-column sorting cannot see.
+fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    let opts = FormatOptions::default().with_null("<NULL>");
     let mut out = Vec::new();
     for b in batches {
-        let idx = b.schema().index_of(name).expect("column exists");
-        let arr = b
-            .column(idx)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string column");
-        out.extend((0..arr.len()).map(|i| arr.is_valid(i).then(|| arr.value(i).to_string())));
+        let formatters: Vec<_> = b
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).expect("formatter"))
+            .collect();
+        for r in 0..b.num_rows() {
+            out.push(formatters.iter().map(|f| f.value(r).to_string()).collect());
+        }
     }
+    out.sort();
     out
 }
 
-fn f64_bits(batches: &[RecordBatch], name: &str) -> Vec<u64> {
-    let mut out = Vec::new();
-    for b in batches {
-        let idx = b.schema().index_of(name).expect("column exists");
-        let arr = b
-            .column(idx)
-            .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
-            .expect("f64 column");
-        out.extend(
-            (0..arr.len())
-                .filter(|&i| arr.is_valid(i))
-                .map(|i| arr.value(i).to_bits()),
-        );
-    }
-    out
-}
-
-fn ts_micros(batches: &[RecordBatch], name: &str) -> Vec<Option<i64>> {
-    let mut out = Vec::new();
-    for b in batches {
-        let idx = b.schema().index_of(name).expect("column exists");
-        let arr = b
-            .column(idx)
-            .as_any()
-            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-            .expect("timestamp column");
-        out.extend((0..arr.len()).map(|i| arr.is_valid(i).then(|| arr.value(i))));
-    }
-    out
-}
-
-fn bool_col(batches: &[RecordBatch], name: &str) -> Vec<Option<bool>> {
-    let mut out = Vec::new();
-    for b in batches {
-        let idx = b.schema().index_of(name).expect("column exists");
-        let arr = b
-            .column(idx)
-            .as_any()
-            .downcast_ref::<arrow::array::BooleanArray>()
-            .expect("bool column");
-        out.extend((0..arr.len()).map(|i| arr.is_valid(i).then(|| arr.value(i))));
-    }
-    out
-}
-
-fn decimals(batches: &[RecordBatch], name: &str) -> Vec<Option<i128>> {
-    batches
+fn column_names(batch: &RecordBatch) -> Vec<String> {
+    batch
+        .schema()
+        .fields()
         .iter()
-        .flat_map(|b| common::decimal_col(b, name))
+        .map(|f| f.name().clone())
         .collect()
-}
-
-fn ids(batches: &[RecordBatch]) -> Vec<i64> {
-    let mut out = Vec::new();
-    for b in batches {
-        out.extend(common::int64_col(b, "id"));
-    }
-    out
 }
 
 #[tokio::test]
@@ -137,52 +88,52 @@ async fn copy_full_matches_cursor() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
     let ex = extractor(&db).await;
 
-    // Cursor baseline: the legacy single-batch full extract (concat of cursor batches).
+    // Cursor baseline: the single-batch full extract (concat of cursor batches).
     let expected = ex.extract_full_table(&db.table(), None).await?;
     // COPY with a tiny batch size: exercises multi-batch framing + byte caps.
     let actual = copy_full(&ex, &db.table(), 3).await;
 
     let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
     assert_eq!(actual_rows, expected.num_rows());
-    assert_eq!(expected.num_rows(), 8);
+    assert_eq!(expected.num_rows(), common::HOSTILE_ROWS);
     for b in &actual {
         assert_eq!(b.schema(), expected.schema(), "schema must match exactly");
     }
+    // The comparison below must actually cover the json/jsonb/uuid/array columns.
+    let names = column_names(&expected);
+    for c in [
+        "meta", "uid", "tags", "day", "ts", "naive", "feeling", "amount", "bin",
+    ] {
+        assert!(names.iter().any(|n| n == c), "fixture lost column {c}");
+    }
 
-    // Every hostile edge, COPY vs cursor: ids, exact decimals (incl. NULLs),
-    // unicode/empty text, NaN/-Infinity float bits, timestamps, bools.
-    assert_eq!(
-        sorted(ids(&actual)),
-        sorted(common::int64_col(&expected, "id"))
-    );
-    assert_eq!(
-        sorted(decimals(&actual, "amount")),
-        sorted(decimals(std::slice::from_ref(&expected), "amount"))
-    );
-    assert_eq!(
-        sorted(decimals(&actual, "precise")),
-        sorted(decimals(std::slice::from_ref(&expected), "precise"))
-    );
-    assert_eq!(
-        sorted(string_col(&actual, "name")),
-        sorted(string_col(std::slice::from_ref(&expected), "name"))
-    );
-    assert_eq!(
-        sorted(string_col(&actual, "nick")),
-        sorted(string_col(std::slice::from_ref(&expected), "nick"))
-    );
-    assert_eq!(
-        sorted(f64_bits(&actual, "ratio")),
-        sorted(f64_bits(std::slice::from_ref(&expected), "ratio"))
-    );
-    assert_eq!(
-        sorted(ts_micros(&actual, "ts")),
-        sorted(ts_micros(std::slice::from_ref(&expected), "ts"))
-    );
-    assert_eq!(
-        sorted(bool_col(&actual, "flag")),
-        sorted(bool_col(std::slice::from_ref(&expected), "flag"))
-    );
+    // Whole-row differential oracle, every hostile edge at once.
+    let expected_rows = rows(std::slice::from_ref(&expected));
+    assert_eq!(rows(&actual), expected_rows);
+
+    // jsonb is Postgres' own `::text` rendering on both paths (not a serde round trip).
+    let meta: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT meta::text FROM {} WHERE meta IS NOT NULL ORDER BY id",
+        db.table()
+    )))
+    .fetch_all(&db.pool)
+    .await?;
+    let meta_idx = expected.schema().index_of("meta")?;
+    let got: Vec<String> = {
+        let ids = common::int64_col(&expected, "id");
+        let arr = expected
+            .column(meta_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("meta is Utf8");
+        let mut pairs: Vec<(i64, String)> = (0..arr.len())
+            .filter(|&i| arr.is_valid(i))
+            .map(|i| (ids[i], arr.value(i).to_string()))
+            .collect();
+        pairs.sort();
+        pairs.into_iter().map(|(_, v)| v).collect()
+    };
+    assert_eq!(got, meta, "jsonb must equal Postgres' text rendering");
     Ok(())
 }
 
@@ -214,13 +165,8 @@ async fn copy_keyset_matches_cursor() -> Result<(), Box<dyn std::error::Error>> 
         let actual_rows: usize = actual_batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(actual_rows, expected.num_rows(), "range [{lo}, {hi})");
         assert_eq!(
-            sorted(ids(&actual_batches)),
-            sorted(common::int64_col(&expected, "id")),
-            "range [{lo}, {hi})"
-        );
-        assert_eq!(
-            sorted(decimals(&actual_batches, "precise")),
-            sorted(decimals(std::slice::from_ref(&expected), "precise")),
+            rows(&actual_batches),
+            rows(std::slice::from_ref(&expected)),
             "range [{lo}, {hi})"
         );
     }

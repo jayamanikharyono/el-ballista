@@ -1,12 +1,13 @@
 //! Connector API example — extract via the fluent `PostgresConnector` builder.
 //!
 //! `connector.extract().standalone()` / `.distributed()` is the single entry point the CLI
-//! (`rel run` / `rel distribute`) also uses. `collect()` returns the Arrow batches with no
-//! checkpoint side effects; `run()` performs the operational job (split-execution
-//! checkpointing).
+//! (`rel run` / `rel distribute`) also uses. `collect()` / `stream()` return the Arrow data
+//! with no checkpoint side effects; `run_with(consumer)` is the operational job (a split is
+//! checkpointed only after the consumer acknowledged it); `run()` is a diagnostic row count.
 //!
 //! Usage: cargo run --example pipeline_extraction -- [config.json]
 
+use futures::TryStreamExt;
 use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
@@ -34,19 +35,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows
     );
 
-    // Single-node operational run (split-execution checkpointing).
-    let outcome = connector.extract().standalone().run().await?;
+    // Single-node operational run: each split's stream goes to the consumer; the split is
+    // checkpointed only after the consumer returns Ok. A second invocation skips them.
+    let outcome = connector
+        .extract()
+        .standalone()
+        .run_with(|split, mut stream| async move {
+            let mut rows = 0usize;
+            while let Some(batch) = stream.try_next().await? {
+                rows += batch.num_rows(); // write `batch` somewhere durable here
+            }
+            println!("  {} delivered {rows} row(s)", split.split_id);
+            Ok(())
+        })
+        .await?;
     println!(
-        "standalone run(): {} row(s), splits {}/{}",
-        outcome.rows_extracted, outcome.splits_completed, outcome.splits_total
+        "standalone run_with(): {} row(s) delivered, splits {}/{} ({} skipped)",
+        outcome.rows_delivered,
+        outcome.splits_completed,
+        outcome.splits_total,
+        outcome.splits_skipped
     );
 
-    // Distributed over Ballista. `.distributed()` defaults to the standard scheduler URL;
-    // `.in_process()` here keeps the example self-contained (spins up a local cluster).
-    let outcome = connector.extract().distributed().in_process().run().await?;
+    // Diagnostic count only (no checkpoint, nothing delivered) — distributed over Ballista.
+    // `.distributed()` defaults to the standard scheduler URL; `.in_process()` here keeps the
+    // example self-contained (spins up a local cluster).
+    let counted = connector.extract().distributed().in_process().run().await?;
     println!(
-        "distributed run(): {} row(s), workers {:?}",
-        outcome.rows_extracted, outcome.workers
+        "distributed run() [diagnostic]: {} row(s), workers {:?}",
+        counted.rows_extracted, counted.workers
     );
 
     Ok(())

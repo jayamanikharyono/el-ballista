@@ -5,9 +5,11 @@
 //! the environment this was written in, so new dependencies were kept to ones already resolved
 //! in Cargo.Lock transitively. `clap` was not one of them.
 //!
-//! Subcommands: `rel run` / `rel distribute` (full or filtered extraction with
-//! split-execution checkpointing), `rel checkpoint show|reset` (split status),
-//! `rel demo`, and `rel plan` (per-filter push/keep decisions, docs/pushdown.md).
+//! Subcommands: `rel run` / `rel distribute` (DIAGNOSTIC full or filtered extraction:
+//! scans, counts rows, discards them — no data delivered, no checkpoint written; this
+//! project is not a sink, the operational job is the library's `run_with(consumer)`),
+//! `rel checkpoint show|reset` (split status of `run_with` jobs), `rel demo`, and
+//! `rel plan` (per-filter push/keep decisions plus a limited row preview, docs/pushdown.md).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,27 +19,26 @@ use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::start_server;
-use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::Expr;
-use datafusion::prelude::SessionContext;
 
+use rust_ballista_extraction_layer::checkpoint::CheckpointStore;
 use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-use rust_ballista_extraction_layer::checkpoint::{CheckpointStore, JobKey};
-use rust_ballista_extraction_layer::config::{FilterEntry, FilterInput, JobConfig};
+use rust_ballista_extraction_layer::config::{
+    FilterEntry, FilterInput, JobConfig, PushdownPolicy, policy_name,
+};
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+use rust_ballista_extraction_layer::connector::postgres::distributed::{
+    PostgresLogicalCodec, PostgresPhysicalCodec,
+};
 use rust_ballista_extraction_layer::connector::postgres::pipeline::parse_filter_expr;
-use rust_ballista_extraction_layer::connector::postgres::{
-    PostgresConnector, PostgresTableProvider,
-};
-use rust_ballista_extraction_layer::distributed::{
-    PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec,
-};
 use rust_ballista_extraction_layer::errors::AppError;
-use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
 
-const USAGE: &str = "usage:\n  rel run --config <path> [--filter 'col=value' ...]\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port] [--filter 'col=value' ...]\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also REL_LOG_FILE)\n  note: at debug level every generated SQL query is logged\n  note: `rel run` extracts the full table unless the config sets `filters` or --filter flags are given";
+/// Rows `rel plan` previews when `--limit` is not given.
+const DEFAULT_PLAN_LIMIT: usize = 20;
 
-pub async fn dispatch() -> Result<(), AppError> {
+pub(crate) const USAGE: &str = "usage:\n  rel run --config <path> [--filter 'col=value' ...]\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port] [--filter 'col=value' ...]\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value' ...] [--limit n]\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]\n\n  `rel run` / `rel distribute` are DIAGNOSTIC: they scan the job (full table, or the\n  config `filters` plus --filter flags), count rows and discard them. No data is delivered\n  and no checkpoint is read or written. This project is not a sink: the operational,\n  checkpointed job is the library API `PostgresConnector::...run_with(consumer)`, whose\n  split state `rel checkpoint show|reset` inspects and clears.\n  `rel plan` prints each filter's pushdown decision and previews --limit rows (default 20).\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also REL_LOG_FILE)\n  note: at debug level every generated SQL query is logged";
+
+pub(crate) async fn dispatch() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
@@ -158,23 +159,23 @@ fn load_config_with_filters(
     Ok(config)
 }
 
-/// Runs the extraction job: full table scan when no filters are given, otherwise a
-/// filtered extraction with caller-provided predicates pushed to the source.
-/// Split progress is checkpointed so a retry skips completed splits. The project
-/// ships no sink layer by design — the extraction output is the Arrow batch, and
-/// materialization is the downstream consumer's responsibility.
+/// `rel run` — DIAGNOSTIC: scan the job's splits (full table, or its filters pushed to
+/// the source), count rows, discard the batches. Reads and writes no checkpoint and delivers
+/// no data; the operational job is the library's `run_with(consumer)`.
 async fn run_job(config_path: &str, cli_filters: &[String]) -> Result<(), AppError> {
     let config = load_config_with_filters(config_path, cli_filters)?;
     let job_id = config.job_id.clone();
     let filtered = !config.filters.is_empty();
-    let connector = PostgresConnector::from_config(config);
+    log::info!(
+        "job '{job_id}': diagnostic run (rows are counted and discarded; no checkpoint is written)"
+    );
+    let connector = PostgresConnector::from_config(config)?;
     let outcome = connector.extract().standalone().run().await?;
     println!(
-        "job '{}' ({}): extracted {} row(s), splits {}/{}",
+        "job '{}' ({}, diagnostic): counted {} row(s) in {} split(s); nothing delivered, no checkpoint written",
         job_id,
         if filtered { "filtered" } else { "full" },
         outcome.rows_extracted,
-        outcome.splits_completed,
         outcome.splits_total,
     );
     Ok(())
@@ -183,9 +184,8 @@ async fn run_job(config_path: &str, cli_filters: &[String]) -> Result<(), AppErr
 async fn checkpoint_show(config_path: &str) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
-    let key = JobKey::new(config.job_id.clone());
 
-    match store.read(&key).await? {
+    match store.read(&config.job_id).await? {
         Some(checkpoint) => println!("{checkpoint:#?}"),
         None => println!("no checkpoint yet for job '{}'", config.job_id),
     }
@@ -194,102 +194,59 @@ async fn checkpoint_show(config_path: &str) -> Result<(), AppError> {
 }
 
 /// Delete the split checkpoint so the next run starts fresh — the operator escape
-/// hatch for a wedged or stale split state.
+/// hatch after a plan change (`PlanMismatch`) or for a wedged split state. Takes the job's
+/// run lock first, so it refuses while a run is active.
 async fn checkpoint_reset(config_path: &str) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
-    let key = JobKey::new(config.job_id.clone());
-    store.reset(&key).await?;
+    let ttl = std::time::Duration::from_secs(config.checkpoint.lock_ttl_secs);
+    let lock = store.lock(&config.job_id, ttl).await?;
+    let reset = store.reset(&config.job_id).await;
+    lock.release().await?;
+    reset?;
     println!("checkpoint reset for job '{}'", config.job_id);
     Ok(())
 }
 
-/// `rel plan` — docs/pushdown.md's `rel plan --explain`, scoped down: rather than parsing
-/// arbitrary SQL and walking the resulting logical plan (which needs DataFusion internals this
-/// pass couldn't verify against a compiler), filters come in as simple `column<op>value` CLI
-/// flags and are built directly into `Expr`s with the shared [`parse_filter_expr`] helper.
-/// Prints each filter's push/keep decision — mirroring the worked
-/// example in docs/architecture.md §3 — then actually runs the query so the numbers are real,
-/// not just a plan.
+/// `rel plan` — docs/pushdown.md's `rel plan --explain`, scoped down: filters come from the
+/// config's `filters` plus `column<op>value` `--filter` flags. Uses exactly the path every
+/// run uses ([`Pipeline::explain_filters`], schema-coerced predicates, the same provider), so
+/// the preview cannot disagree with execution. Prints each filter's push/keep decision, then
+/// previews at most `--limit` rows (default 20 — never the whole table).
+///
+/// [`Pipeline::explain_filters`]: rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline::explain_filters
 async fn plan_explain(
     config_path: &str,
     policy_str: Option<&str>,
     filter_strs: &[String],
     limit: Option<usize>,
 ) -> Result<(), AppError> {
-    let config = JobConfig::from_file(config_path)?;
-
-    let policy_str = policy_str.unwrap_or(&config.pushdown.policy).to_string();
-    let policy = PushdownPolicy::parse(&policy_str);
-    let deny = config.pushdown.deny.clone();
-
-    let exprs: Vec<Expr> = filter_strs
-        .iter()
-        .map(|raw| parse_filter_expr(raw))
-        .collect::<Result<_, _>>()?;
-
-    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
-    let provider = PostgresTableProvider::new(
-        descriptor,
-        &config.resolved_table(),
-        policy,
-        deny,
-        config.pushdown.push.clone(),
-        rust_ballista_extraction_layer::pushdown::cost_model::CostParams {
-            max_source_cost: config.pushdown.max_source_cost,
-            keep_threshold: config.pushdown.keep_threshold,
-        },
-        config.pushdown.statistics_ttl_secs,
-        config.execution.batch_size,
-    )
-    .await?;
-
-    let expr_refs: Vec<&Expr> = exprs.iter().collect();
-    // Warm EXPLAIN estimates first so cost-based decisions below use them, exactly as a
-    // warmed production provider would.
-    provider.warm_explain(&exprs).await;
-    let decisions = provider.supports_filters_pushdown(&expr_refs)?;
-
-    println!("policy: {policy_str}");
-    if filter_strs.is_empty() {
-        println!("  (no --filter flags given)");
+    let mut config = load_config_with_filters(config_path, filter_strs)?;
+    if let Some(raw) = policy_str {
+        config.pushdown.policy =
+            PushdownPolicy::parse(raw).map_err(|e| AppError::Config(e.to_string()))?;
     }
-    for ((raw, expr), decision) in filter_strs.iter().zip(exprs.iter()).zip(decisions.iter()) {
-        println!(
-            "  {raw:<40} -> {decision:?} ({})",
-            provider.explain_decision(expr)
-        );
+    let policy = policy_name(config.pushdown.policy);
+    let connector = PostgresConnector::from_config(config)?;
+    let pipeline = connector.pipeline();
+
+    println!("policy: {policy}");
+    let decisions = pipeline.explain_filters().await?;
+    if decisions.is_empty() {
+        println!("  (no filters: full extraction)");
+    }
+    for d in &decisions {
+        println!("  {:<40} -> {:?} ({})", d.filter, d.pushdown, d.reason);
     }
 
-    let ctx = {
-        use datafusion::execution::session_state::SessionStateBuilder;
-        let state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_optimizer_rule(Arc::new(
-                rust_ballista_extraction_layer::pushdown::optimizer_rule::SourceAwarePushdownRule,
-            ))
-            .build();
-        SessionContext::new_with_state(state)
-    };
-    ctx.register_table(&config.table, Arc::new(provider))?;
-    let mut df = ctx.table(&config.table).await?;
-
-    for expr in exprs {
-        df = df.filter(expr)?;
-    }
-
-    if let Some(n) = limit {
-        df = df.limit(0, Some(n))?;
-    }
-
-    df.show().await?;
-
+    let limit = limit.unwrap_or(DEFAULT_PLAN_LIMIT);
+    println!("preview (at most {limit} row(s); --limit to change):");
+    pipeline.preview(limit).await?.show().await?;
     Ok(())
 }
 
-/// `rel distribute` — docs/roadmap.md Phase 4. Same job semantics as `rel run` (full or
-/// filtered extraction with split checkpointing), but the extraction itself is
-/// executed by a Ballista cluster: in-proc (`standalone`) or against a `rel scheduler`/`rel
+/// `rel distribute` — docs/roadmap.md Phase 4. DIAGNOSTIC like `rel run` (rows counted and
+/// discarded, no checkpoint), but the extraction itself is executed by a Ballista cluster: in-proc (`standalone`) or against a `rel scheduler`/`rel
 /// worker` deployment. The table is registered so each scan splits into `workers` keyset
 /// partitions, and every process budgets its source pool to `pool_max / workers`.
 async fn run_distributed(
@@ -300,7 +257,7 @@ async fn run_distributed(
 ) -> Result<(), AppError> {
     let config = load_config_with_filters(config_path, cli_filters)?;
     let job_id = config.job_id.clone();
-    let connector = PostgresConnector::from_config(config);
+    let connector = PostgresConnector::from_config(config)?;
     // No --scheduler-url keeps `rel distribute`'s zero-config behavior: an in-process cluster.
     let mut extraction = connector.extract().distributed();
     extraction = match scheduler_url {
@@ -312,12 +269,10 @@ async fn run_distributed(
     }
     let outcome = extraction.run().await?;
     println!(
-        "job '{}' (distributed, workers={}): extracted {} row(s), splits {}/{}",
+        "job '{}' (distributed, workers={}, diagnostic): counted {} row(s); nothing delivered, no checkpoint written",
         job_id,
         outcome.workers.unwrap_or(0),
         outcome.rows_extracted,
-        outcome.splits_completed,
-        outcome.splits_total,
     );
     Ok(())
 }

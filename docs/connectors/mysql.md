@@ -1,23 +1,63 @@
 # MySQL Connector
 
-Crate: `rel-connector-mysql`. Built on `sqlx` (`MySqlPool`, `?` placeholders, backtick
-quoting).
+Module: `rust_ballista_extraction_layer::connector::mysql` (in this crate — there is no separate
+connector crate). Built on `sqlx` (`MySqlPool`, `?` placeholders, backtick quoting).
 
-> **Status: experimental prototype (walking skeleton).** What actually exists today is
-> connect, schema reading from `information_schema`, and full-table extraction to typed
-> Arrow — no pushdown, no parallel/distributed execution, no watermark machinery. Much
-> of this document (§§3, 5.2–5.4, parts of §§2, 7, 8) is **design reference for promoting
-> the prototype**, not a description of shipped behavior; such passages are marked
-> *(design)*. Ranges are caller-provided; watermark anchoring is deferred — see
-> [deferred/incremental-extraction.md](../deferred/incremental-extraction.md).
+> **Status: experimental prototype (walking skeleton).** §0 below is the complete list of what
+> the code does today. Everything else in this document is **design reference for promoting the
+> prototype**; sections and passages that describe unbuilt behaviour are marked
+> ***(design, not implemented)***. Ranges are caller-provided; watermark anchoring is deferred —
+> see [deferred/incremental-extraction.md](../deferred/incremental-extraction.md).
 
-Covers MySQL 8.0+, Cloud SQL for MySQL, and (with caveats noted inline) MariaDB. MySQL 5.7 is
-supported but loses histogram-based cost estimation.
+Covers MySQL 8.0+ (the version the test suite runs against). MariaDB, Cloud SQL and MySQL 5.7 are
+untested.
 
 MySQL is the harder of the two connectors, and it is worth being explicit about why: it has no bulk
 export path, no exportable snapshot, weaker statistics, and a type system with several values that
 have no Arrow representation. None of this is fatal, but every one of them needs a deliberate
 decision rather than a default.
+
+---
+
+## 0. What ships today
+
+Everything here is implemented in `src/connector/mysql/` and exercised by `tests/mysql.rs`,
+`tests/extraction_matrix.rs` and `tests/dvdrental_cross_engine.rs` against the compose MySQL 8.0.
+
+- **Connect** — `MysqlExtractor::connect(host, port, user, password, database, pool_max)`.
+  Credentials are passed to `MySqlConnectOptions` field by field (no URL is formatted, so
+  passwords containing `/ # ? @ :` work). Each session is pinned to `time_zone = '+00:00'`. No
+  other session settings are applied (no `net_write_timeout`, `max_execution_time`,
+  `transaction_read_only`, `sql_mode` or connection attributes — see §7).
+- **Schema** — `MysqlSchemaReader::get_table_metadata("table" | "schema.table")` reads
+  `COLUMN_NAME`, `DATA_TYPE`, `IS_NULLABLE`, `COLUMN_TYPE` and `COLLATION_NAME` from
+  `information_schema.COLUMNS` in ordinal order. A table with no visible columns is
+  `MysqlError::TableNotFound` (never an empty `SELECT  FROM …`). `COLLATION_NAME` is read but not
+  used (marked `TODO(mysql-pushdown)` in the code).
+- **Extraction** — full table only, optionally projected; an unknown projection column is
+  `MysqlError::UnknownColumns`. One plain `` SELECT `c1`, … FROM `db`.`t` `` (no casts, no
+  `ORDER BY` — row order is unspecified) over a sqlx prepared statement (binary protocol).
+  - `extract_full_table_for_each_batch(table, columns, batch_size, on_batch)` streams rows with
+    sqlx `fetch` and calls `on_batch` with one `RecordBatch` per `batch_size` rows (the tail
+    batch may be smaller): at most one batch of rows is resident. Returns the Arrow schema (also
+    for an empty table, where `on_batch` is never called). `batch_size == 0` is
+    `MysqlError::InvalidBatchSize`. The first error (source, decode, or from `on_batch`) stops
+    the stream and is returned.
+  - `extract_full_table(table, columns)` is built on the above and **materializes** the whole
+    table into one `RecordBatch` — for small tables and tests.
+- **Errors** — typed `MysqlError` (`Source`, `Arrow`, `Extractor`, `TableNotFound`,
+  `UnknownColumns`, `InvalidBatchSize`, `Decode { column }`, `OutOfRange { column, target }`,
+  `NotBoolean { column }`), each keeping its cause as `#[source]`; messages name tables and
+  columns, never row values or credentials. A decode failure fails the extraction — it is never
+  turned into NULL or zero rows.
+- **Consistency** — a single statement on one connection: whatever that statement sees under the
+  server's isolation level (InnoDB: a consistent read for the statement). No multi-statement
+  snapshot, no resumability, no checkpointing.
+- **Not implemented** — filters/pushdown (`MysqlDialect` exists and is unit-tested, but nothing
+  calls it for predicates), a DataFusion `TableProvider`, parallel/keyset partitioning,
+  distributed execution, checkpointed jobs (`run_with`) and the `run()` diagnostic,
+  statistics/cost estimation, retries.
+  Filtering happens in DataFusion after extraction (`tests/mysql.rs`).
 
 ---
 
@@ -27,10 +67,14 @@ There is **no `COPY` equivalent**. `SELECT … INTO OUTFILE` writes a file on th
 useless to a remote extractor (and usually blocked by `secure_file_priv`). So the only path is the
 normal result-set protocol, and the job is to use it well.
 
+What the prototype does (see §0):
+
 ```rust
-let stmt = conn.prep(&sql).await?;
-let mut stream = conn.exec_stream::<Row, _, _>(&stmt, params).await?;
-while let Some(row) = stream.next().await { /* decode into Arrow builders */ }
+let mut stream = sqlx::query(sql).fetch(&pool);       // prepared statement → binary protocol
+while let Some(row) = stream.try_next().await? {       // rows arrive as the server sends them
+    buf.push(row);                                     // ≤ batch_size rows buffered
+    if buf.len() == batch_size { on_batch(decode(&buf)?)?; buf.clear(); }
+}
 ```
 
 Two choices matter here:
@@ -39,78 +83,87 @@ Two choices matter here:
 string: integers, decimals, and timestamps all arrive formatted and must be parsed. Prepared
 statements use the binary protocol, where an `INT` is 4 bytes and a `DATETIME` is a packed
 structure. For extraction workloads this is a large decode-CPU difference, and it removes a class
-of locale- and format-dependent parsing bugs.
+of locale- and format-dependent parsing bugs. (Implemented: sqlx prepares every `query()`.)
 
-**Streaming over buffering.** `exec_stream` yields rows as they arrive rather than materializing
-the result set. This is what makes backpressure work; a buffering API turns a large table into an
-OOM. (Rust's ergonomics are better than JDBC's here — there is no equivalent of the
-`setFetchSize(Integer.MIN_VALUE)` incantation — but the underlying requirement is the same.)
+**Streaming over buffering.** `fetch` yields rows as they arrive rather than materializing the
+result set, so memory is bounded by `batch_size`. (Implemented for
+`extract_full_table_for_each_batch`; `extract_full_table` deliberately materializes.)
 
-### The `net_write_timeout` trap
+### The `net_write_timeout` trap *(design, not implemented)*
 
 While the client is streaming a large result, the server is blocked writing to the socket. If the
-client consumes slowly — because a downstream sink applied backpressure, which is *by design* —
+client consumes slowly — because a downstream consumer applied backpressure, which is *by design* —
 the server can hit `net_write_timeout` (default 60s) and **kill the connection mid-result**. The
 symptom is a "lost connection during query" partway through a long extraction, which looks like a
 network problem and is not.
 
-The connector raises it per session:
+The design raises it per session:
 
 ```sql
 SET SESSION net_write_timeout = 600;
 ```
 
-and treats the resulting error class as retryable at partition granularity. *(Design:
-the prototype has a single serial scan path; per-partition retry arrives with
-parallel execution.)*
+and treats the resulting error class as retryable at partition granularity. **Today** the
+prototype does not set it and has no retry: a slow `on_batch` callback can hit the server
+default and the extraction fails with `MysqlError::Source`.
 
 ---
 
 ## 2. Type mapping
 
 MySQL's wire protocol under-describes its own types, so the connector resolves every column from
-`information_schema.COLUMNS` at plan time — `COLUMN_TYPE` (which carries `unsigned`, display width,
-and `ENUM`/`SET` members), `CHARACTER_SET_NAME`, `COLLATION_NAME`, `NUMERIC_PRECISION`,
-`NUMERIC_SCALE`, and `DATETIME_PRECISION`.
+`information_schema.COLUMNS` — `DATA_TYPE` plus `COLUMN_TYPE`, which carries `unsigned`, the
+display width that marks `tinyint(1)` as BOOLEAN, `bit(n)` and `decimal(p,s)`. (`NUMERIC_PRECISION`,
+`NUMERIC_SCALE`, `DATETIME_PRECISION` and `CHARACTER_SET_NAME` are not read; precision/scale are
+parsed from `COLUMN_TYPE`.)
+
+The table below is **what ships** (`type_mapper::arrow_type_for`, decoded by `row_adapter`);
+*(design)* marks the only rows that describe unbuilt behaviour.
 
 | MySQL | Arrow | Notes |
 | --- | --- | --- |
-| `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` | `Int8` / `Int16` / `Int32` / `Int32` / `Int64` | |
-| the same, `UNSIGNED` | `UInt8` / `UInt16` / `UInt32` / `UInt32` / `UInt64` | **`BIGINT UNSIGNED` does not fit `i64`.** Must map to `UInt64`, and literals above `i64::MAX` must be bound as unsigned |
-| `TINYINT(1)` | `Int8` | Ambiguous by convention (most ORMs use it as a boolean but some genuinely store −128..127). The prototype maps it to `Int8`; a `tinyint1_as_bool` option is *(design, not implemented)* |
-| `BOOL` / `BOOLEAN` | `Boolean` | Aliases for `TINYINT(1)` |
-| `DECIMAL(p,s)`, p ≤ 38 | `Decimal128(p, s)` | |
-| `DECIMAL(p,s)`, 38 < p ≤ 65 | `Decimal256(p, s)` | MySQL allows up to 65 digits, exceeding `Decimal128` |
-| `FLOAT` / `DOUBLE` | `Float32` / `Float64` | Comparisons always `Inexact` |
-| `BIT(n)` | `UInt64` (n ≤ 64) | Big-endian on the wire |
-| `DATE` | `Date32` | `0000-00-00` is **not representable** — see §3 |
-| `DATETIME(p)` | `Timestamp(µs, None)` | No time zone attached, ever |
-| `TIMESTAMP(p)` | `Timestamp(µs, None)` in the prototype | Converted by the server using the session `time_zone` (see §4); no zone is recorded on the Arrow type |
-| `TIME(p)` | `Duration(Microsecond)` | Range is **−838:59:59 to 838:59:59**, an interval rather than a time of day. `Time64` would be wrong |
-| `YEAR` | `Int16` | |
-| `CHAR` / `VARCHAR` / `TEXT` family | `Utf8` | Collation recorded; drives `Exact` vs `Inexact` — see §3 |
-| `BINARY` / `VARBINARY` / `BLOB` family | `Binary` | Distinguished from `TEXT` only by the `binary` character set (id 63), not by the protocol type |
-| `ENUM` | `Utf8` in the prototype | Members parsed from `COLUMN_TYPE`; `Dictionary(Int32, Utf8)` is *(design, not implemented)* |
+| `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` | `Int8` / `Int16` / `Int32` / `Int32` / `Int64` | Decoded as `i64`, narrowed with `TryFrom` (no wrapping) |
+| `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` `UNSIGNED` | `Int16` / `Int32` / `Int32` / `Int64` | Next wider signed type, so every value fits. Decoded as `u64` and converted with `TryFrom`; a value that does not fit is `MysqlError::OutOfRange`, never wrapped |
+| `BIGINT UNSIGNED` | `UInt64` | Does not fit `i64` |
+| `TINYINT(1)` (= `BOOL` / `BOOLEAN`) | `Boolean` | Detected by `COLUMN_TYPE = 'tinyint(1)'` exactly (`tinyint(1) unsigned` stays an integer). Only 0/1 are accepted; any other stored value is `MysqlError::NotBoolean` rather than a lossy "non-zero is true" |
+| `DECIMAL(p,s)`, p ≤ 38 | `Decimal128(p, s)` | Exact |
+| `DECIMAL(p,s)`, 38 < p ≤ 65 | — | **Typed error** (`UnsupportedType`) at schema build. `Decimal256(p, s)` is *(design, not implemented)* |
+| `FLOAT` / `DOUBLE` | `Float32` / `Float64` | |
+| `BIT(1)` | `Boolean` | |
+| `BIT(n)`, 1 < n ≤ 64 | `UInt64` | Big-endian on the wire |
+| `DATE` | `Date32` | `0000-00-00` → typed error `ZeroDate`; partial zero dates (`2026-00-15`) → typed `Decode` error — see §3 |
+| `DATETIME(p)` | `Timestamp(µs, None)` | No time zone attached; zero datetime → typed error `ZeroDate` |
+| `TIMESTAMP(p)` | `Timestamp(µs, None)` | Rendered by the server in the session `time_zone`, which is pinned to `+00:00`; no zone is recorded on the Arrow type |
+| `TIME(p)` | `Duration(µs)` | Range is **−838:59:59 to 838:59:59** — an interval, not a time of day, so `Time64` would be wrong. Sign preserved |
+| `YEAR` | `Int16` | Decoded as `u16` |
+| `CHAR` / `VARCHAR` / `TEXT` family | `Utf8` | Collation is read but not used yet |
+| `BINARY` / `VARBINARY` / `BLOB` family | `Binary` | Chosen from `DATA_TYPE`, not the protocol type |
+| `ENUM` | `Utf8` | `Dictionary(Int32, Utf8)` is *(design, not implemented)* |
 | `SET` | `Utf8` | Comma-joined as stored |
-| `JSON` | `Utf8` | Stored as binary internally, returned as text |
-| spatial types | `Utf8` in the prototype | Unrecognized types fall back to `Utf8` (no `cast_to` hatch yet) |
+| `JSON` | `Utf8` | Parsed and re-serialized by `serde_json` (key order / whitespace normalized) |
+| spatial and any other type | `Utf8` | Decoded as a string; a type sqlx cannot decode as a string fails with `MysqlError::Decode` |
 
 ---
 
 ## 3. Values MySQL permits that Arrow cannot represent
 
-This is MySQL's distinguishing hazard. *(Design: the `on_unrepresentable` policy and the
-`rel_null_coerced_total` counter described below do not exist yet — the prototype surfaces
-decode failures as errors.)*
+This is MySQL's distinguishing hazard. **Today** every such value fails the extraction with a
+typed error. The `on_unrepresentable` policy and the `rel_null_coerced_total` counter described
+below are *(design, not implemented)*.
 
 **Zero dates.** Unless `sql_mode` includes `NO_ZERO_DATE` and `NO_ZERO_IN_DATE`, MySQL accepts
-`0000-00-00` and `2026-00-15`. Neither is a real date and neither has an Arrow encoding. The
-design maps them to null, incrementing `rel_null_coerced_total{reason="zero_date"}`. Legacy
+`0000-00-00` and `2026-00-15`. Neither is a real date and neither has an Arrow encoding.
+**Today** both fail the extraction: sqlx decodes a full zero date as NULL, so the projection
+carries one `(col = 0)` marker per `DATE`/`DATETIME`/`TIMESTAMP` column and a zero date raises
+`MysqlError::ZeroDate { column }`; a partial zero date fails decoding (`MysqlError::Decode`).
+A real NULL stays NULL. *(Design, not implemented:)* an opt-in policy that maps them to null,
+incrementing `rel_null_coerced_total{reason="zero_date"}`. Legacy
 schemas frequently use `0000-00-00` as a "no value" sentinel, so this counter is often non-zero
 on the first run against an old database — which is exactly the moment you want to know about
 it rather than discover it in a warehouse query six weeks later.
 
-**Out-of-range `TIME`.** Values beyond ±24h are legal and are why the mapping is `Duration`.
+**Out-of-range `TIME`.** Values beyond ±24h are legal and are why the mapping is `Duration`
+(implemented).
 
 **Truncated data in non-strict mode.** With a permissive `sql_mode`, MySQL silently truncates
 oversized values on write. Nothing the extractor can do about data already stored, but the
@@ -118,8 +171,10 @@ planned `rel doctor` command would report the source's `sql_mode` so the behavio
 visible.
 
 **Case-insensitive collation.** MySQL 8.0's default `utf8mb4_0900_ai_ci` is accent- and
-case-insensitive, so `WHERE status = 'PAID'` matches `'paid'` in MySQL and not in Arrow. Every
-string predicate on a `_ci` or `_ai` column is therefore pushed as **`Inexact`**, never `Exact`.
+case-insensitive, so `WHERE status = 'PAID'` matches `'paid'` in MySQL and not in Arrow. In the
+design, every string predicate on a `_ci` or `_ai` column is pushed as **`Inexact`**, never
+`Exact`. *(Pushdown is not implemented for MySQL; `MysqlDialect` currently rates every text or
+float comparison `Inexact` without looking at the collation.)*
 This is covered in full in [pushdown §3.1](../pushdown.md#31-string-collation--the-big-one) and it
 is the single most likely way to get silently wrong results from this connector.
 
@@ -136,7 +191,7 @@ differently, or when DST shifts.
 SET SESSION time_zone = '+00:00';
 ```
 
-Applied on every connection. `DATETIME` columns still carry no zone information — the Arrow type is
+Applied on every connection (implemented: `MySqlConnectOptions::timezone("+00:00")`). `DATETIME` columns still carry no zone information — the Arrow type is
 deliberately `Timestamp(µs, None)` rather than a lie about UTC, and interpreting them is a
 modeling decision for the warehouse, not something the extractor should guess.
 
@@ -145,6 +200,11 @@ modeling decision for the warehouse, not something the extractor should guess.
 > **Scope note:** watermark anchoring is deferred — see [deferred/incremental-extraction.md](../deferred/incremental-extraction.md). Ranges are caller-provided.
 
 ## 5. Consistency notes
+
+**Today:** one `SELECT` per extraction on one connection — no explicit transaction, no snapshot
+spanning statements, no parallelism (§0). The `START TRANSACTION WITH CONSISTENT SNAPSHOT` usage
+and the `parallel_consistency` modes in §§5.1–5.4 are *(design, not implemented)*; §5.1 explains
+the MySQL constraint they are designed around.
 
 ### 5.1 No exportable snapshot
 
@@ -202,7 +262,7 @@ Stored alongside the range in the checkpoint, it gives an exact, orderable posit
 auditing, for reconciling a suspected gap, and as the handover point when a table is later
 migrated to binlog-based capture.
 
-### 5.4 Reading from a replica
+### 5.4 Reading from a replica *(design, not implemented)*
 
 The same hazard as a Postgres standby, with worse instrumentation. The replica's clock is current
 but its data is behind, so an orchestrator-supplied `hi = now()` skips rows that have not
@@ -220,9 +280,9 @@ default settings is one of the easiest ways to lose rows quietly. None of `role`
 
 ---
 
-## 6. Statistics and cost estimation
+## 6. Statistics and cost estimation *(design, not implemented)*
 
-Weaker than Postgres, and the cost model has to account for that.
+Nothing in this section exists for MySQL yet. Weaker than Postgres, and the cost model has to account for that.
 
 ```sql
 -- Row count: approximate for InnoDB, routinely off by tens of percent
@@ -258,7 +318,10 @@ Never use `EXPLAIN ANALYZE` (8.0.18+) for estimation — it executes the query.
 
 ---
 
-## 7. Session configuration
+## 7. Session configuration *(design, not implemented — except `time_zone`)*
+
+Today only `time_zone = '+00:00'` is set (plus sqlx's own connect defaults). The rest is the
+design target:
 
 ```sql
 SET SESSION time_zone = '+00:00';
@@ -294,9 +357,9 @@ falls back to `role = "replica"` plus a manually specified `replica_lag_floor` a
 
 ---
 
-## 8. Partitioning
+## 8. Partitioning *(design, not implemented)*
 
-Only `keyset` is available. There is no `ctid` analogue, so there is no cheap physical split:
+The prototype has no partitioned or parallel scan. In the design, only `keyset` is available. There is no `ctid` analogue, so there is no cheap physical split:
 
 ```sql
 WHERE order_id >= ? AND order_id < ?
@@ -314,7 +377,7 @@ serial and parallelism is something you turn on knowingly.
 
 ---
 
-## 9. Future: binlog CDC
+## 9. Future: binlog CDC *(design, not implemented)*
 
 The same shape as the Postgres logical replication path, and the same payoff — hard deletes become
 visible and commit-order skew disappears, since binlog events are ordered by commit.

@@ -14,16 +14,21 @@
 //! decoder ([`RowBatchBuilder::append_copy_field`]) and a differential COPY-vs-cursor
 //! test agrees by construction.
 //!
-//! Contract: [`supports_binary_copy`] gates every caller. Unsupported shapes
+//! Contract: `supports_binary_copy` gates every caller. Unsupported shapes
 //! (unmapped types, pushed filters with bound literals which `COPY` cannot take)
 //! fall back to the cursor/`SELECT` path with a loud log — never silently wrong data.
 
+use std::future::Future;
+
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::Postgres;
 
 use crate::connector::errors::ExtractorError;
 use crate::connector::postgres::arrow_type_mapper::ArrowTypeMapper;
-use crate::connector::postgres::row_adapter::RowBatchBuilder;
+use crate::connector::postgres::row_adapter::{ByteCursor, RowBatchBuilder};
 use crate::types::{ColumnMetadata, TableMetadata};
 
 /// Microseconds between the Unix epoch (Arrow) and the PostgreSQL epoch (2000-01-01).
@@ -38,112 +43,29 @@ const COPY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 /// True when every column has a binary-COPY decoder (i.e. [`ArrowTypeMapper::map`]
 /// succeeds — the decoder set mirrors it exactly). Zero columns (e.g. `COUNT(*)`)
 /// count as supported: the single `SELECT 1` column is skipped and only rows counted.
-pub fn supports_binary_copy(columns: &[ColumnMetadata]) -> bool {
+pub(crate) fn supports_binary_copy(columns: &[ColumnMetadata]) -> bool {
     columns.iter().all(|c| ArrowTypeMapper::map(c).is_ok())
 }
 
-/// Parse one binary-`text[]` array value into nullable elements. Layout: `ndim: i32`,
-/// `has_nulls: i32` (informational), `elem_oid: u32` (must be 25 = `text`), then per
-/// dimension `count: i32` + `lower_bound: i32`, then `count` elements of
-/// `len: i32` (`-1` = NULL) + UTF-8 bytes. Only 1-D arrays are supported (everything
-/// this crate produces); anything else is an error, not a silent flatten.
-pub fn parse_copy_text_array(raw: &[u8]) -> Result<Vec<Option<String>>, ExtractorError> {
-    let corrupt = |why: &str| ExtractorError::Internal(format!("corrupt binary text[]: {why}"));
-    let mut cur = Cursor::new(raw);
-    let ndim = cur.i32().ok_or_else(|| corrupt("short ndim"))?;
-    let _has_nulls = cur.i32().ok_or_else(|| corrupt("short flags"))?;
-    let elem_oid = cur.u32().ok_or_else(|| corrupt("short elem oid"))?;
-    if elem_oid != 25 {
-        return Err(corrupt("non-text element OID"));
+/// Reject `batch_size = 0` before any statement runs: a zero row cap would issue
+/// `FETCH FORWARD 0` (which re-reads the current row, or returns nothing) and could turn
+/// an extraction into "success, zero rows".
+pub(crate) fn validate_batch_size(batch_size: usize) -> Result<(), ExtractorError> {
+    if batch_size == 0 {
+        return Err(ExtractorError::InvalidConfig(
+            "batch_size must be > 0".to_string(),
+        ));
     }
-    if ndim == 0 {
-        if !cur.rest().is_empty() {
-            return Err(corrupt("trailing bytes in empty array"));
-        }
-        return Ok(Vec::new());
-    }
-    if ndim != 1 {
-        return Err(corrupt("only 1-D text[] arrays are supported"));
-    }
-    let count = cur.i32().ok_or_else(|| corrupt("short dim"))?;
-    let _lower = cur.i32().ok_or_else(|| corrupt("short lower bound"))?;
-    if count < 0 {
-        return Err(corrupt("negative element count"));
-    }
-    let mut items = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let len = cur.i32().ok_or_else(|| corrupt("short element len"))?;
-        if len == -1 {
-            items.push(None);
-        } else if len < 0 {
-            return Err(corrupt("negative element length"));
-        } else {
-            let bytes = cur
-                .bytes(len as usize)
-                .ok_or_else(|| corrupt("truncated element"))?;
-            items.push(Some(String::from_utf8(bytes.to_vec()).map_err(|e| {
-                ExtractorError::Internal(format!("invalid UTF-8 in text[] element: {e}"))
-            })?));
-        }
-    }
-    if !cur.rest().is_empty() {
-        return Err(corrupt("trailing bytes"));
-    }
-    Ok(items)
+    Ok(())
 }
 
-/// Minimal big-endian cursor over a slice. `None` = truncated input (the caller
-/// buffers more and retries — never a panic on hostile lengths).
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        &self.buf[self.pos..]
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        if end > self.buf.len() {
-            return None;
-        }
-        let out = &self.buf[self.pos..end];
-        self.pos = end;
-        Some(out)
-    }
-
-    fn i16(&mut self) -> Option<i16> {
-        self.take(2).map(|b| i16::from_be_bytes([b[0], b[1]]))
-    }
-
-    fn i32(&mut self) -> Option<i32> {
-        self.take(4)
-            .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        self.take(4)
-            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        self.take(n)
-    }
-}
-
-/// Incremental binary-COPY parser. Feed wire `Bytes` chunks via [`Self::push_bytes`]
-/// (completed byte-capped batches come back), then [`Self::finish`] for the trailing
+/// Incremental binary-COPY parser. Feed wire `Bytes` chunks via `Self::push_bytes`
+/// (completed byte-capped batches come back), then `Self::finish` for the trailing
 /// partial batch. Chunk boundaries are meaningless: a tuple split across chunks waits
 /// for the rest — peak memory stays `O(batch)` regardless of chunking.
 pub struct CopyBatchDecoder {
     builder: RowBatchBuilder,
-    columns: Vec<ColumnMetadata>,
+    ncols: usize,
     batch_size: usize,
     max_batch_bytes: usize,
     buf: Vec<u8>,
@@ -154,12 +76,13 @@ pub struct CopyBatchDecoder {
 
 impl CopyBatchDecoder {
     /// Build a decoder. Errors on unmapped column types so callers fall back to the
-    /// cursor path *before* opening the COPY stream.
-    pub fn new(
+    /// cursor path *before* opening the COPY stream, and on `batch_size = 0`.
+    pub(crate) fn new(
         table_metadata: &TableMetadata,
         batch_size: usize,
         max_batch_bytes: usize,
     ) -> Result<Self, ExtractorError> {
+        validate_batch_size(batch_size)?;
         if !supports_binary_copy(&table_metadata.columns) {
             return Err(ExtractorError::UnsupportedType(
                 "binary COPY unsupported for this projection (unmapped type)".into(),
@@ -167,7 +90,7 @@ impl CopyBatchDecoder {
         }
         Ok(Self {
             builder: RowBatchBuilder::with_capacity(table_metadata, batch_size)?,
-            columns: table_metadata.columns.clone(),
+            ncols: table_metadata.columns.len(),
             batch_size,
             max_batch_bytes,
             buf: Vec::new(),
@@ -178,13 +101,13 @@ impl CopyBatchDecoder {
     }
 
     /// Feed one wire chunk; returns the batches that filled up (usually zero or one).
-    pub fn push_bytes(&mut self, chunk: &[u8]) -> Result<Vec<RecordBatch>, ExtractorError> {
-        self.buf.extend_from_slice(chunk);
+    pub(crate) fn push_bytes(&mut self, chunk: &[u8]) -> Result<Vec<RecordBatch>, ExtractorError> {
         // Compact the consumed prefix so a long stream never grows the buffer.
         if self.pos > 65536 {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
+        self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         loop {
             match self.try_parse_tuple()? {
@@ -208,7 +131,7 @@ impl CopyBatchDecoder {
 
     /// End of stream: error on a truncated tuple or a missing trailer, else return the
     /// trailing partial batch (if any).
-    pub fn finish(&mut self) -> Result<Option<RecordBatch>, ExtractorError> {
+    pub(crate) fn finish(&mut self) -> Result<Option<RecordBatch>, ExtractorError> {
         if self.pos != self.buf.len() {
             return Err(ExtractorError::Internal(
                 "truncated binary COPY stream: trailing unparseable bytes".into(),
@@ -226,139 +149,108 @@ impl CopyBatchDecoder {
         }
     }
 
+    fn parse_header(&mut self) -> Result<bool, ExtractorError> {
+        let corrupt = |why: &str| ExtractorError::Internal(format!("corrupt binary COPY: {why}"));
+        let mut cur = ByteCursor::new(&self.buf[self.pos..]);
+        // Signature (11) + flags (4) + header-ext length (4) + extension.
+        let Some(sig) = cur.take(11) else {
+            return Ok(false);
+        };
+        if sig != COPY_SIGNATURE {
+            return Err(corrupt("bad signature"));
+        }
+        let (Some(flags), Some(ext_len)) = (cur.i32(), cur.i32()) else {
+            return Ok(false);
+        };
+        if flags & 0x0001_0000 != 0 {
+            return Err(corrupt("OID columns not supported"));
+        }
+        let ext_len =
+            usize::try_from(ext_len).map_err(|_| corrupt("negative header extension length"))?;
+        if cur.take(ext_len).is_none() {
+            return Ok(false);
+        }
+        self.pos += 19 + ext_len;
+        self.header_done = true;
+        Ok(true)
+    }
+
     /// Attempt one tuple at the current position. `NeedMore` leaves all state
     /// untouched (including builders — nothing is appended until the whole tuple is
-    /// buffered, so a retried parse can never double-append).
+    /// buffered, so a retried parse can never double-append). Two passes over the
+    /// buffered bytes (framing, then decode) — no per-tuple allocation.
     fn try_parse_tuple(&mut self) -> Result<TupleOutcome, ExtractorError> {
         let corrupt = |why: &str| ExtractorError::Internal(format!("corrupt binary COPY: {why}"));
-        if !self.header_done {
-            // Signature (11) + flags (4) + header-ext length (4) + extension.
-            if self.buf.len() - self.pos < 19 {
-                return Ok(TupleOutcome::NeedMore);
-            }
-            if &self.buf[self.pos..self.pos + 11] != COPY_SIGNATURE {
-                return Err(corrupt("bad signature"));
-            }
-            let flags = i32::from_be_bytes(
-                self.buf[self.pos + 11..self.pos + 15]
-                    .try_into()
-                    .map_err(|_| corrupt("short flags"))?,
-            );
-            if flags & 0x0001_0000 != 0 {
-                return Err(corrupt("OID columns not supported"));
-            }
-            let ext_len = i32::from_be_bytes(
-                self.buf[self.pos + 15..self.pos + 19]
-                    .try_into()
-                    .map_err(|_| corrupt("short header ext"))?,
-            );
-            if ext_len < 0 {
-                return Err(corrupt("negative header extension length"));
-            }
-            let total = 19usize
-                .checked_add(ext_len as usize)
-                .ok_or_else(|| corrupt("header too large"))?;
-            if self.buf.len() - self.pos < total {
-                return Ok(TupleOutcome::NeedMore);
-            }
-            self.pos += total;
-            self.header_done = true;
+        if !self.header_done && !self.parse_header()? {
+            return Ok(TupleOutcome::NeedMore);
         }
 
-        let ncols = self.columns.len();
-        // Walk the tuple first (lengths only): only decode once the whole tuple is
-        // buffered, so a split tuple never partially appends.
-        let mut cur = Cursor::new(&self.buf[self.pos..]);
-        let nfields = match cur.i16() {
-            Some(v) => v,
-            None => return Ok(TupleOutcome::NeedMore),
+        let buffered = &self.buf[self.pos..];
+        let mut cur = ByteCursor::new(buffered);
+        let Some(nfields) = cur.i16() else {
+            return Ok(TupleOutcome::NeedMore);
         };
         if nfields == -1 {
             self.pos += 2;
             return Ok(TupleOutcome::Eof);
         }
-        if nfields < 0 {
-            return Err(corrupt("negative field count"));
-        }
         // Zero-column projections (`SELECT 1`) carry exactly one unread payload column.
-        let want_fields = if ncols == 0 { 1 } else { ncols };
-        if nfields as usize != want_fields {
+        let want_fields = self.ncols.max(1);
+        if usize::try_from(nfields).ok() != Some(want_fields) {
             return Err(corrupt("field count mismatch with projection"));
         }
-        let mut total = 2usize;
-        let mut lens: Vec<i32> = Vec::with_capacity(want_fields);
-        for _ in 0..want_fields {
-            let len = match cur.i32() {
-                Some(v) => v,
-                None => return Ok(TupleOutcome::NeedMore),
-            };
-            if len < -1 {
-                return Err(corrupt("negative field length"));
-            }
-            if len == -1 {
-                total = total
-                    .checked_add(4)
-                    .ok_or_else(|| corrupt("tuple too large"))?;
-                lens.push(-1);
-            } else {
-                // Skip the value bytes: the next length starts after them. A
-                // truncated value means the tuple is split across chunks — wait.
-                if cur.bytes(len as usize).is_none() {
-                    return Ok(TupleOutcome::NeedMore);
-                }
-                total = total
-                    .checked_add(4)
-                    .and_then(|t| t.checked_add(len as usize))
-                    .ok_or_else(|| corrupt("tuple too large"))?;
-                lens.push(len);
-            }
-        }
-        if self.buf.len() - self.pos < total {
-            return Ok(TupleOutcome::NeedMore);
-        }
 
-        // Whole tuple buffered: consume and decode (infallible w.r.t. buffering).
-        self.pos += 2;
-        for (idx, len) in lens.into_iter().enumerate() {
-            let raw = if len == -1 {
-                self.pos += 4;
-                None
-            } else {
-                self.pos += 4;
-                let end = self.pos + len as usize;
-                let bytes = &self.buf[self.pos..end];
-                self.pos = end;
-                Some(bytes)
+        // Pass 1: framing only — is the whole tuple buffered?
+        for _ in 0..want_fields {
+            let Some(len) = cur.i32() else {
+                return Ok(TupleOutcome::NeedMore);
             };
-            if ncols > 0 {
-                // `raw` borrows `self.buf` while `self.builder` is borrowed mutably:
-                // disjoint fields, but the borrow checker needs the split spelled out.
-                let columns = &self.columns;
-                self.builder.append_copy_field(idx, &columns[idx], raw)?;
+            if len == -1 {
+                continue;
+            }
+            let len = usize::try_from(len).map_err(|_| corrupt("negative field length"))?;
+            if cur.take(len).is_none() {
+                return Ok(TupleOutcome::NeedMore);
             }
         }
-        if ncols > 0 {
-            self.builder.inc_row();
-        } else {
-            // Zero-column projection: count the row, skip the payload.
-            self.builder.inc_row();
+        let total = buffered.len() - cur.rest().len();
+
+        // Pass 2: decode (framing already validated).
+        let mut cur = ByteCursor::new(&buffered[2..total]);
+        if self.ncols > 0 {
+            for idx in 0..want_fields {
+                let len = cur.i32().ok_or_else(|| corrupt("framing changed"))?;
+                let raw = if len == -1 {
+                    None
+                } else {
+                    let len = usize::try_from(len).map_err(|_| corrupt("negative length"))?;
+                    Some(cur.take(len).ok_or_else(|| corrupt("framing changed"))?)
+                };
+                self.builder.append_copy_field(idx, raw)?;
+            }
         }
+        self.builder.inc_row();
+        self.pos += total;
         Ok(TupleOutcome::Tuple)
     }
 }
 
-/// Drive a COPY byte stream to completion, invoking `on_batch` per flushed batch.
-/// Thin async wrapper over [`CopyBatchDecoder`] for the extractor's `for_each_batch`
-/// shape; the `ExecutionPlan` executor drives the decoder directly so it can yield.
-pub async fn drive_copy_stream<S>(
+/// Drive a COPY byte stream to completion, awaiting `on_batch` per flushed batch.
+///
+/// `on_batch` is async so a streaming consumer can apply backpressure (e.g. a bounded
+/// channel send); synchronous callers pass `|b| std::future::ready(f(b))`. An `Err` from
+/// `on_batch` stops the scan and is returned as-is.
+pub(crate) async fn drive_copy_stream<S, F, Fut>(
     stream: &mut S,
     table_metadata: &TableMetadata,
     batch_size: usize,
     max_batch_bytes: usize,
-    on_batch: &mut impl FnMut(RecordBatch) -> Result<(), ExtractorError>,
+    mut on_batch: F,
 ) -> Result<u64, ExtractorError>
 where
     S: futures::Stream<Item = Result<Bytes, sqlx::Error>> + Unpin,
+    F: FnMut(RecordBatch) -> Fut,
+    Fut: Future<Output = Result<(), ExtractorError>>,
 {
     use futures::TryStreamExt as _;
     let mut decoder = CopyBatchDecoder::new(table_metadata, batch_size, max_batch_bytes)?;
@@ -366,15 +258,157 @@ where
     while let Some(chunk) = stream.try_next().await? {
         for batch in decoder.push_bytes(&chunk)? {
             total += batch.num_rows() as u64;
-            on_batch(batch)?;
+            on_batch(batch).await?;
         }
     }
     if let Some(batch) = decoder.finish()? {
         total += batch.num_rows() as u64;
-        on_batch(batch)?;
+        on_batch(batch).await?;
     }
     Ok(total)
 }
+
+/// Run one `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` on a pooled connection and decode
+/// it through [`drive_copy_stream`]. Shared by the extractor and the DataFusion/Ballista
+/// execution plan.
+///
+/// `copy_sql` must start with `tag` (the unique debug comment of `connector::query_tag`):
+/// the tag identifies this statement in `pg_stat_activity`.
+///
+/// COPY is a **single statement**: `statement_timeout` bounds the whole scan (including
+/// time the consumer spends applying backpressure), and the statement reads one snapshot.
+/// `statement_timeout_ms` overrides the session timeout for this COPY only (`Some(0)` = no
+/// limit), via `SET LOCAL` in a transaction around it.
+/// If the scan does not complete — decode error, consumer error or dropped consumer, or
+/// this future being dropped — the connection is closed instead of being returned to the
+/// pool (so nobody drains the rest of the COPY), and a fire-and-forget task sends
+/// `pg_cancel_backend` over another connection of the same pool (within the source budget)
+/// so the source stops scanning now.
+// Justification (AGENTS §1): the parameters are the independent scan knobs (pool, SQL, tag,
+// projection, batch/byte caps, timeout, callback); a params struct would only rename them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn copy_scan<F, Fut>(
+    pool: &PgPool,
+    copy_sql: &str,
+    tag: &str,
+    table_metadata: &TableMetadata,
+    batch_size: usize,
+    max_batch_bytes: usize,
+    statement_timeout_ms: Option<u64>,
+    on_batch: F,
+) -> Result<u64, ExtractorError>
+where
+    F: FnMut(RecordBatch) -> Fut,
+    Fut: Future<Output = Result<(), ExtractorError>>,
+{
+    // Validate before touching the source (type support, batch size).
+    CopyBatchDecoder::new(table_metadata, batch_size, max_batch_bytes)?;
+
+    let mut conn = pool.acquire().await?;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let mut guard = CopyCancelGuard {
+        conn,
+        pool: pool.clone(),
+        pid,
+        tag: tag.to_string(),
+        completed: false,
+    };
+    // A timeout override is scoped to this COPY: `SET LOCAL` inside an explicit transaction
+    // that is committed only after the scan completed. On any failure the guard closes the
+    // connection, so the override can never leak into a pooled session.
+    if let Some(ms) = statement_timeout_ms {
+        sqlx::query("BEGIN").execute(&mut *guard.conn).await?;
+        let set = format!("SET LOCAL statement_timeout = {ms}");
+        sqlx::query(sqlx::AssertSqlSafe(set.as_str()))
+            .execute(&mut *guard.conn)
+            .await?;
+    }
+    let result = {
+        let mut stream = guard.conn.copy_out_raw(copy_sql).await?;
+        drive_copy_stream(
+            &mut stream,
+            table_metadata,
+            batch_size,
+            max_batch_bytes,
+            on_batch,
+        )
+        .await
+    };
+    if result.is_ok() && statement_timeout_ms.is_some() {
+        sqlx::query("COMMIT").execute(&mut *guard.conn).await?;
+    }
+    guard.completed = result.is_ok();
+    result
+}
+
+/// Owns the COPY connection. On drop without `completed`, closes the connection (never
+/// returned to the pool mid-COPY) and spawns a detached `pg_cancel_backend(pid)`.
+struct CopyCancelGuard {
+    conn: PoolConnection<Postgres>,
+    pool: PgPool,
+    pid: i32,
+    tag: String,
+    completed: bool,
+}
+
+impl Drop for CopyCancelGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.conn.close_on_drop();
+        match tokio::runtime::Handle::try_current() {
+            // Detached by design (the JoinHandle is intentionally dropped): `Drop` cannot
+            // await, and the consumer is gone. The task is bounded (a 5 s acquire timeout
+            // plus one statement) and logs its own outcome.
+            Ok(handle) => {
+                let (pool, pid, tag) = (self.pool.clone(), self.pid, std::mem::take(&mut self.tag));
+                drop(handle.spawn(cancel_backend(pool, pid, tag)));
+            }
+            Err(_) => log::warn!(
+                "COPY on backend {} ended early outside a tokio runtime; not cancelling \
+                 (the closed connection still stops the scan)",
+                self.pid
+            ),
+        }
+    }
+}
+
+/// Cancel backend `pid` if (and only if) it is still running the statement tagged `tag`.
+///
+/// Uses a connection **from the same pool**, so the cancel never exceeds the source budget
+/// (`pool_max`): the COPY connection itself is being closed, which frees its slot. If no
+/// connection becomes available within [`CANCEL_ACQUIRE_TIMEOUT`], the cancel is skipped —
+/// the server still aborts the COPY on its next write to the closed socket.
+async fn cancel_backend(pool: PgPool, pid: i32, tag: String) {
+    const SQL: &str = "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+                       WHERE pid = $1 AND starts_with(query, $2)";
+    let result = match tokio::time::timeout(CANCEL_ACQUIRE_TIMEOUT, pool.acquire()).await {
+        Ok(Ok(mut conn)) => sqlx::query(SQL)
+            .bind(pid)
+            .bind(&tag)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            log::warn!(
+                "no pooled connection free within {CANCEL_ACQUIRE_TIMEOUT:?} to cancel COPY on \
+                 backend {pid}; relying on the closed connection to stop it"
+            );
+            return;
+        }
+    };
+    match result {
+        Ok(()) => log::info!("cancelled unfinished COPY on backend {pid}"),
+        Err(e) => log::warn!("could not cancel unfinished COPY on backend {pid}: {e}"),
+    }
+}
+
+/// How long [`cancel_backend`] waits for a pooled connection before giving up.
+const CANCEL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TupleOutcome {
@@ -544,14 +578,15 @@ mod tests {
 
     #[test]
     fn uuid_jsonb_and_text_array_decode() {
+        // uuid/json/jsonb are selected as `::text` (see query_builder::push_columns), so
+        // on the wire they are plain UTF-8 text — exactly Postgres' own rendering.
         let meta = table(vec![
             col("u", "uuid", None),
             col("j", "jsonb", None),
             col("t", "ARRAY", Some("_text")),
         ]);
-        let uid = uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
-        let mut jsonb = vec![1u8];
-        jsonb.extend_from_slice(br#"{"a":1}"#);
+        let uid = b"123e4567-e89b-12d3-a456-426614174000".to_vec();
+        let jsonb = br#"{"a": 12345678901234567.89}"#.to_vec();
         // Binary text[]: ndim=1, flags=0, oid=25, dim(count=2, lbound=1), "a", NULL.
         let mut arr = Vec::new();
         arr.extend_from_slice(&1i32.to_be_bytes());
@@ -562,7 +597,7 @@ mod tests {
         arr.extend_from_slice(&1i32.to_be_bytes());
         arr.extend_from_slice(b"a");
         arr.extend_from_slice(&(-1i32).to_be_bytes());
-        let bytes = copy_stream(&[vec![Some(uid.as_bytes().to_vec()), Some(jsonb), Some(arr)]]);
+        let bytes = copy_stream(&[vec![Some(uid), Some(jsonb), Some(arr)]]);
         let batches = decode_all(&meta, &bytes, 3);
         let b = &batches[0];
         assert_eq!(b.num_rows(), 1);
@@ -577,7 +612,7 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap();
-        assert_eq!(j.value(0), r#"{"a":1}"#);
+        assert_eq!(j.value(0), r#"{"a": 12345678901234567.89}"#);
         let t = b
             .column(2)
             .as_any()
@@ -585,6 +620,68 @@ mod tests {
             .unwrap();
         assert_eq!(t.len(), 1);
         assert!(t.is_valid(0));
+    }
+
+    fn decode_err(meta: &TableMetadata, bytes: &[u8]) -> ExtractorError {
+        let mut decoder = CopyBatchDecoder::new(meta, 1024, 16 * 1024 * 1024).unwrap();
+        match decoder.push_bytes(bytes) {
+            Err(e) => e,
+            Ok(_) => decoder.finish().expect_err("decode must fail"),
+        }
+    }
+
+    #[test]
+    fn infinity_timestamps_and_dates_are_typed_errors() {
+        // B4: both signs, all three types; the error names the column.
+        for (ty, raw) in [
+            ("timestamp with time zone", i64b(i64::MAX)),
+            ("timestamp with time zone", i64b(i64::MIN)),
+            ("timestamp without time zone", i64b(i64::MAX)),
+            ("timestamp without time zone", i64b(i64::MIN)),
+            ("date", i32b(i32::MAX)),
+            ("date", i32b(i32::MIN)),
+        ] {
+            let meta = table(vec![col("when_", ty, None)]);
+            let err = decode_err(&meta, &copy_stream(&[vec![Some(raw)]]));
+            assert!(
+                matches!(&err, ExtractorError::UnsupportedValue { column, .. } if column == "when_"),
+                "{ty}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_nan_and_overscale_are_typed_errors() {
+        let mut n = col("n", "numeric", None);
+        n.numeric_precision = None;
+        n.numeric_scale = None;
+        let meta = table(vec![n]);
+        let nan = vec![0u8, 0, 0, 0, 0xC0, 0, 0, 0];
+        assert!(matches!(
+            decode_err(&meta, &copy_stream(&[vec![Some(nan)]])),
+            ExtractorError::UnsupportedValue { .. }
+        ));
+        // 1.123456789012 (12 fractional digits) into the Decimal128(38,10) default.
+        let mut over = Vec::new();
+        for w in [4u16, 0, 0, 12] {
+            over.extend_from_slice(&w.to_be_bytes());
+        }
+        for d in [1u16, 1234, 5678, 9012] {
+            over.extend_from_slice(&d.to_be_bytes());
+        }
+        assert!(matches!(
+            decode_err(&meta, &copy_stream(&[vec![Some(over)]])),
+            ExtractorError::UnsupportedValue { .. }
+        ));
+    }
+
+    #[test]
+    fn batch_size_zero_is_rejected() {
+        let meta = table(vec![col("a", "integer", None)]);
+        assert!(matches!(
+            CopyBatchDecoder::new(&meta, 0, 1024),
+            Err(ExtractorError::InvalidConfig(_))
+        ));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run --example full_extraction
+//! PGPASSWORD=... cargo run --example full_extraction
 //! ```
 
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
@@ -21,6 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
     rust_ballista_extraction_layer::logging::init_from_env_and_args();
+
+    // Never hard-code credentials: the password comes from the environment.
+    let password = std::env::var("PGPASSWORD")
+        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/app")?;
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Full Load Example");
@@ -34,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "localhost",
         5432,
         "postgres",
-        "postgres",
+        &password,
         "app",
         5,
         30000,

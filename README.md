@@ -8,7 +8,8 @@ El Ballista extracts data from source databases into bounded Apache Arrow `Recor
 
 The layer handles source-aware pushdown, extraction planning, split checkpointing, and streaming data as Arrow `RecordBatch`es. Operations can run in the source database or in DataFusion based on connector capabilities, statistics, and policy. Full and filtered extraction are the supported patterns — incremental and backfill use cases are expressed as caller-provided filter predicates, with no watermark state in the extraction layer. Ballista is used when distributed execution is configured.
 
-> **Status (September 2026):** Phases 1–4 implemented and tested against live PostgreSQL. See [`docs/roadmap.md`](docs/roadmap.md) for the roadmap and [`docs/testing-plan.md`](docs/testing-plan.md) for test coverage.
+> **Status (September 2026):** Phases 1–4 implemented and tested against live PostgreSQL; a MySQL connector exists as a prototype (schema read + full-table extract only). See [`docs/roadmap.md`](docs/roadmap.md) for the roadmap and [`docs/testing-plan.md`](docs/testing-plan.md) for test coverage.
+
 ---
 
 
@@ -71,10 +72,12 @@ For each operation, the layer can determine whether it should run in the source 
 
 
 The extraction layer reads from PostgreSQL and exposes the result as a
-`SendableRecordBatchStream`. Data stays in Arrow's columnar format throughout — no copying or conversion as it flows into DataFusion.
+`SendableRecordBatchStream`. Each value is decoded once from the Postgres binary wire format
+into Arrow builders; from there the batches are Arrow's columnar format end to end, and
+DataFusion consumes them as they are (no second conversion).
 
 
-Ballista can provide distributed execution when configured. The project does not implement its own sink layer; examples that need to materialize results locally use DataFusion writers or `parquet::arrow::ArrowWriter`.
+Ballista can provide distributed execution when configured. The project does not write data anywhere itself (no sink layer): the caller consumes the batches — examples that write results locally use DataFusion writers or `parquet::arrow::ArrowWriter`.
 
 
 PostgreSQL is the implemented connector.
@@ -205,7 +208,7 @@ DataFusion's `TableProvider::supports_filters_pushdown` provides the semantic pa
 `Inexact` means the source can pre-filter the data, but DataFusion must evaluate the filter again to preserve correctness.
 
 
-For example, database collation can affect string comparison semantics. A case-insensitive source comparison such as `status = 'PAID'` may also match `'paid'`, while Arrow's comparison does not necessarily behave the same way. Such a predicate must therefore remain `Inexact`.
+For example, database collation can affect string comparison semantics. Under a case-insensitive collation `status = 'PAID'` also matches `'paid'`, while Arrow compares bytes. The connector therefore renders every pushed text comparison with an explicit binary collation — `("status" COLLATE "C") = $1` on Postgres — which compares exactly like Arrow, so it can be `Exact`. Comparisons that have no faithful source form (float ranges, `NOT` over an inexact child, numeric comparisons today) are not pushed at all.
 
 
 See [`docs/pushdown.md`](docs/pushdown.md) for the cost model, policy engine, and semantic compatibility rules.
@@ -269,17 +272,22 @@ design).
   Filters: [Single(Structured(FilterSpec { column: "status", op: Eq, value: String("PAID") })), Single(Structured(FilterSpec { column: "amount", op: Gt, value: Number(100) })), Single(Structured(FilterSpec { column: "updated_at", op: GtEq, value: String("2026-01-01T00:00:00Z") })), Single(Structured(FilterSpec { column: "user_id", op: GtEq, value: Number(500) }))]
 
 ► Step 2: Preview pushdown decisions
-  filter status = 'PAID' -> pushed_to_source=true (PUSH (Inexact; index available: orders_status_idx; ("status"::text = 'PAID')))
-  filter amount > 100 -> pushed_to_source=false (KEEP (selectivity too high: 33.00% >= 30.00%))
+  filter status = 'PAID' -> pushed_to_source=true (PUSH (Exact; low selectivity (20.00%) and cost (848) within budget (50000); ((CAST("status" AS text) COLLATE "C") = 'PAID')))
+  filter amount > 100 -> pushed_to_source=false (KEEP (no exact or superset source form (expression, type, or operator not supported); stays in Arrow))
   filter updated_at >= '2026-01-01T00:00:00Z' -> pushed_to_source=true (PUSH (Exact; index available: orders_updated_at_idx; ("updated_at" >= '2026-01-01T00:00:00+00:00'::timestamptz)))
-  filter user_id >= 500 -> pushed_to_source=true (PUSH (Exact; index available: orders_user_id_idx; ("user_id" >= 500)))
+  filter user_id >= 500 -> pushed_to_source=true (PUSH (Exact; EXPLAIN index path; ("user_id" >= 500)))
 
 ► Step 3: Extract with pushdown
   ✓ Filtered extraction complete: 28 row(s) in 1 batch(es)
 
 ► Step 4: Operational run (split checkpointing)
-2026-09-22T00:21:25.295Z [INFO ] rust_ballista_extraction_layer::checkpoint::json_store: job 'orders_extract' split 'split-0' completed (rows_extracted=28)
-  ✓ Run outcome: 28 row(s), splits 1/1
+2026-09-24T09:41:14.830Z [INFO ] rust_ballista_extraction_layer::checkpoint::lock: job 'orders_extract': acquired run lock ./.checkpoints/orders_extract.lock (owner 9125fa32033d48939771daca898fb1dd)
+2026-09-24T09:41:14.863Z [INFO ] rust_ballista_extraction_layer::connector::postgres::pipeline::run: job 'orders_extract': 1 split(s), 1 pending, 0 already completed (concurrency 4)
+    split-0: 28 row(s) consumed
+2026-09-24T09:41:14.870Z [INFO ] rust_ballista_extraction_layer::checkpoint::json_store: job 'orders_extract' split 'split-0' completed (rows=28)
+2026-09-24T09:41:14.870Z [INFO ] rust_ballista_extraction_layer::connector::postgres::pipeline::run: job 'orders_extract' split=split-0 done rows=28 elapsed_ms=6
+2026-09-24T09:41:14.871Z [INFO ] rust_ballista_extraction_layer::checkpoint::lock: job 'orders_extract': released run lock
+  ✓ Run outcome: 28 row(s) delivered, splits 1/1 (0 skipped from an earlier run)
 
 ═══════════════════════════════════════════════════════════
   ✓ Filtered extraction example complete
@@ -288,10 +296,12 @@ design).
 
 What this shows: the orchestrator supplies predicates (Step 1); the layer
 decides per predicate whether the source can answer it exactly, approximately
-(`Inexact`, re-checked in Arrow), or not at all (Step 2 — note `amount > 100`
-stays in Arrow on cost grounds while the indexed predicates push); extraction
-returns Arrow batches (Step 3); the operational run tracks the split so a
-retry skips it (Step 4).
+(`Inexact`, re-checked in Arrow), or not at all (Step 2 — `status` pushes as an `Exact`
+byte-wise comparison on cost grounds, the indexed range predicates push, and `amount > 100`
+stays in Arrow because a `numeric` comparison has no exact source form yet); extraction
+returns Arrow batches (Step 3); the operational run (`run_with`) hands each
+split's stream to a consumer and records the split completed only after the
+consumer returned `Ok`, so a retry skips it (Step 4).
 
 
 ---
@@ -317,7 +327,7 @@ let batches = ctx
 ```
 
 
-The result is a stream of Arrow `RecordBatch`es that can be consumed by DataFusion or another downstream component.
+`collect()` materializes the whole result as `Vec<RecordBatch>`; for large tables use the connector's bounded-memory `stream()` / `run_with(consumer)` terminals (below) or DataFusion's `execute_stream()`.
 
 
 Declarative jobs use the same extraction model through JSON configuration:
@@ -376,22 +386,31 @@ Declarative jobs use the same extraction model through JSON configuration:
 See [`QUICKSTART.md`](QUICKSTART.md) for complete setup, configuration, distributed execution, benchmarks, and testing.
 
 
-**TL;DR — single-node extraction:**
+**TL;DR — single-node extraction** against the seeded `app` database (500 users, 20k
+`orders`) that the examples' configs point at (`localhost:5432`, database `app`):
 
 
 ```bash
-docker run -d --name pg \
-  -e POSTGRES_PASSWORD=postgres \
-  -p 5433:5432 \
-  postgres:17
-
-
+docker compose -f benchmark/PostgresDB/compose.yaml up -d
 export ORDERS_PG_PASSWORD=postgres
 
-
+# Diagnostic run: scans with the config's filters pushed down, counts rows, discards them.
 cargo run --bin rust-ballista-extraction-layer -- run \
   --config examples/configs/extract.example.json
+# -> job 'orders_extract' (filtered, diagnostic): counted 28 row(s) in 1 split(s); ...
 ```
+
+Or against the test stack (Postgres + MySQL with the dvdrental dataset, database `test`):
+
+```bash
+docker compose -f tests/docker/compose.yaml up -d --wait
+export ORDERS_PG_PASSWORD=postgres
+cargo run --bin rust-ballista-extraction-layer -- run \
+  --config examples/configs/full_extract.dvd_rental.json
+# -> job 'dvd_rental_full' (full, diagnostic): counted 14596 row(s) in 1 split(s); ...
+```
+
+Both compose files publish Postgres on port 5432, so run one at a time.
 
 
 ### Runnable Examples
@@ -435,7 +454,7 @@ cargo run --bin rust-ballista-extraction-layer -- run \
   --config examples/configs/full_extract.example.json
 ```
 
-`rel run` extracts the full table by default; add `filters` to the config (or pass `--filter 'col=value'` flags) for a filtered extraction whose predicates push to the source when possible (see [`examples/configs/extract.example.json`](examples/configs/extract.example.json)). At `--log-level debug` the generated `SELECT ... FROM <table>` is logged with strategy `full` or `full+pushdown`. `execution.batch_size` sets the server-side cursor FETCH size, and `parallel_scan` with `strategy: "keyset"` and `partitions > 1` splits the table into non-overlapping `partition_column` ranges and extracts each — sequentially on single-node `rel run`, and across workers on `rel distribute`. `run()` records per-split progress so a retry skips completed splits.
+`rel run` and `rel distribute` are **diagnostic**: they scan the job (the full table by default; add `filters` to the config or pass `--filter 'col=value'` flags for a filtered extraction whose predicates push to the source when possible — see [`examples/configs/extract.example.json`](examples/configs/extract.example.json)), count the rows and discard them. They deliver no data and read or write no checkpoint: this project is not a sink. The operational, checkpointed job is the library's `run_with(consumer)` (below). At `--log-level debug` the generated `SELECT ... FROM <table>` is logged with strategy `full` or `full+pushdown`, plus one line per Arrow batch (`split=`, `rows=`, `batch_bytes=`). `execution.batch_size` sets the source fetch size, and `parallel_scan` with `strategy: "keyset"` and `partitions > 1` splits the table into non-overlapping `partition_column` ranges; single-node splits are scanned up to `execution.concurrent_partitions` (capped at `source.pool_max`) at a time, and `rel distribute` spreads them across Ballista workers. `rel plan` prints each filter's pushdown decision — through the same schema-coerced filter path as a run — and previews at most `--limit` rows (default 20).
 
 Filters come in two forms that lower to the same predicate — structured objects
 (the recommended JSON form) or shorthand strings (handy for `--filter` flags):
@@ -452,10 +471,41 @@ Values follow JSON types (number → int/float, boolean, string, null; `is_null`
 `is_not_null` need no value). RFC3339 strings on timestamp columns coerce to real
 timestamp literals that push to the source. Programmatically, `connector.pipeline()`
 exposes `filter_exprs()` (parsed predicates) and `explain_filters()` (per-filter
-pushdown preview — the same decision `scan()` uses). Split progress is inspectable
-via `rel checkpoint show --config <path>` and resettable via `rel checkpoint reset`.
+pushdown preview — the same decision `scan()` uses). A shorthand value in quotes
+stays a string (`zip='007'` compares against the text `007`, not the integer 7).
+Split progress of `run_with` jobs is inspectable via `rel checkpoint show --config <path>`
+and resettable via `rel checkpoint reset --config <path>`.
 
-Both the CLI and library callers go through one path: a `Pipeline` built from a `JobConfig`. `Pipeline::from_config_file(path)` (or `from_config(cfg)`) parses the config into a runnable job; `extract()` returns the Arrow `RecordBatch`es with no checkpoint side effects, while `run()` performs the operational job (split-execution checkpointing) and returns a `RunOutcome`. The connector is the single entry point: `PostgresConnector::from_config(cfg).extract()` then `.standalone()` or `.distributed()`, finishing with `.collect()` (Arrow batches) or `.run()` (operational job). `.distributed()` defaults to the standard scheduler URL (`http://localhost:50050`) unless the config or `.scheduler(url)` sets one, and `.in_process()` runs a local Ballista cluster. `rel run` and `rel distribute` are thin wrappers over this builder. All Postgres code lives under `src/connector/postgres/` (see AGENTS.md — Postgres connector modularization). See [`examples/pipeline_extraction.rs`](examples/pipeline_extraction.rs).
+The job spec is strict: unknown fields anywhere (including a leftover `"sink"` or
+`"watermark"` block) are a load error, `parallel_scan.strategy` must be one of
+`none`/`keyset`/`ctid` and `pushdown.policy` one of
+`always`/`never`/`cost_based`/`strict`/`hinted` (exact lowercase), `job_id` must be
+non-empty (max 128 bytes, no control characters or surrounding whitespace), and every
+construction path validates the values (`batch_size >= 1`, …).
+
+The connector is the single entry point for library callers and the CLI: `PostgresConnector::from_config(cfg)?` (validates the config; or `from_config_file(path)?`), then `.extract()`, `.standalone()` or `.distributed()`, and a terminal:
+
+| Terminal | Returns | Checkpoints | Memory |
+| --- | --- | --- | --- |
+| `.run_with(consumer)` | `RunOutcome` | yes — each split is recorded Completed only after `consumer(split, stream)` returned `Ok` having read the stream to the end | bounded |
+| `.stream()` | `SendableRecordBatchStream` | no | bounded |
+| `.collect()` | `Vec<RecordBatch>` | no | whole result |
+| `.run()` | `RunOutcome` (row counts) | no — diagnostic only | bounded |
+
+```rust
+let outcome = PostgresConnector::from_config(config)?
+    .extract()
+    .standalone()
+    .run_with(|split, mut stream| async move {
+        while let Some(batch) = stream.try_next().await? {
+            // write `batch` for `split.split_id` somewhere durable (idempotently per split)
+        }
+        Ok(())
+    })
+    .await?;
+```
+
+`run_with` holds an exclusive per-job lock file (heartbeat; a stale lock is taken over after `checkpoint.lock_ttl_secs`, default 1800), binds the checkpoint to a fingerprint of the plan (table, schema, projection, resolved filters, strategy, partitions, partition column), stores each split's key range and reuses those ranges on retry, runs pending splits concurrently and records a failed split without stopping the others (the run then fails with the list of failed split ids). Re-running a job id with a different plan (e.g. a new filter) is a typed `PlanMismatch` error — use a new `job_id` or `rel checkpoint reset`. Delivery is at-least-once per split: a split that failed mid-stream is re-delivered in full. A distributed run is one split. `.distributed()` defaults to the standard scheduler URL (`http://localhost:50050`) unless the config or `.scheduler(url)` sets one, and `.in_process()` runs a local Ballista cluster (one executor task slot per budgeted source connection); against a remote scheduler, each worker process must run with the same `distributed.workers` and at most `pool_max / workers` concurrent tasks (not verified — logged as a warning). All Postgres code lives under `src/connector/postgres/` (see AGENTS.md — Postgres connector modularization). See [`examples/pipeline_extraction.rs`](examples/pipeline_extraction.rs).
 
 
 ---
@@ -480,9 +530,9 @@ cargo run --bin rust-ballista-extraction-layer -- run \
   --config examples/configs/extract.example.json \
   --log-level debug --log-file logs/run.log
 
-# Equivalent via environment (also works for the no-arg demo pipeline)
+# Equivalent via environment
 RUST_LOG=debug REL_LOG_FILE=logs/run.log \
-  cargo run --bin rust-ballista-extraction-layer
+  cargo run --bin rust-ballista-extraction-layer -- demo
 ```
 
 A debug line looks like:
@@ -491,7 +541,7 @@ A debug line looks like:
   2026-09-16T08:12:04.531Z [DEBUG] rust_ballista_extraction_layer::connector::postgres::extractor: generated query [full]: SELECT "order_id", ... FROM "public"."orders"
 ```
 
-> Note: with the no-argument **demo** pipeline, pass level and file via the `RUST_LOG` / `REL_LOG_FILE` environment variables (a leading `--log-file` would be treated as a subcommand).
+> Note: `rel` with no arguments prints usage; the demo pipeline runs only as `rel demo` (it reads the database password from `PGPASSWORD`). Global flags go after the subcommand (a leading `--log-file` would be treated as a subcommand).
 
 ---
 
@@ -499,14 +549,14 @@ A debug line looks like:
 ## Current Scope
 
 
-**Phases 1–4 implemented** — PostgreSQL connector (cursor streaming, type mapping), full/filtered extraction with split-execution checkpointing, cost-based pushdown (`always`/`never`/`cost_based`/`strict`/`hinted`) with keyset/`ctid` partitioning, bounded-memory streaming (`RowBatchBuilder`, `batch_size` 8192), and distributed execution (Ballista scheduler/workers, serializable plans, budgeted pools). Connector SPI (`SourceDescriptor`, `TableStatsSource`, `SqlDialect`/`Predicate::render_to`) is ready for additional backends; PostgreSQL is the implemented connector.
+**Phases 1–4 implemented** — PostgreSQL connector (binary-format cursor `FETCH` and binary `COPY` scans, one decoder per column, typed errors for unrepresentable values such as `±infinity` or NUMERIC overflow), full/filtered extraction with split-execution checkpointing (`run_with`: plan fingerprint, stored split bounds, per-job lock), cost-based pushdown (`always`/`never`/`cost_based`/`strict`/`hinted`) with keyset/`ctid` partitioning, bounded-memory streaming on the scan paths (`stream()`, `run_with`, `execute_stream()`; `batch_size` 8192 and a `max_batch_bytes` cap), and distributed execution (Ballista scheduler/workers, serializable plans, budgeted pools). Materializing helpers (`collect()`, `PostgresExtractor::extract_full_table`) remain for small results. Connector SPI (`SourceDescriptor`, `TableStatsSource`, `SqlDialect`/`Predicate::render_to`) is shared; PostgreSQL is the implemented connector and MySQL a prototype.
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/pushdown.md`](docs/pushdown.md), and [`docs/connectors/postgres.md`](docs/connectors/postgres.md) for details. The watermark/backfill design is deferred under `docs/deferred/`.
 
 
 **Testing**
 
-129 library unit tests cover pushdown, config/filter deserialization, type mapping, partitioning, split checkpoints, filter lowering and timestamp coercion, and codecs. Integration and e2e tests run against the Docker compose stack (`tests/docker/compose.yaml`; `scripts/e2e.sh` handles up/down automatically) with a deterministic hostile fixture (NULLs, distinct types, enum, arrays, edge timestamps) and verify extraction, filtered extraction, pushdown, split retry, and distributed execution. See [`docs/testing-plan.md`](docs/testing-plan.md) for the full matrix and how to run (`cargo test --test pg_*`, `cargo test --test e2e`).
+215 library unit tests (no database) cover pushdown translation/policy/cost, strict config parsing, type mapping and decoding, partition math, split checkpoints and the job lock, filter lowering, and codecs; 48 doc tests cover the `# Examples` (47 run or compile-check, 1 is an ignored sketch). 88 integration tests in 15 files (`tests/*.rs`) run against the Docker compose stack (`tests/docker/compose.yaml`; `scripts/e2e.sh` handles up/down) with a deterministic hostile fixture (`tests/data/hostile.sql`: NULLs, `''` vs NULL, MIN/MAX ints, bytea `0x00`/`0xFF`, 1970/2038/9999 timestamps, a 5-row timestamp tie, enum, arrays) and the dvdrental dataset on both engines; they verify decode fidelity, cursor vs COPY, pushdown (`always` vs `never` differential), checkpoint retry and crash recovery, 1 vs 3 workers, and MySQL. Counts are from `cargo test … -- --list` on 2026-09-24; all pass with `cargo test --tests -- --test-threads=1`. See [`docs/testing-plan.md`](docs/testing-plan.md) for the per-file matrix and oracles.
 
 
 **Deferred**
@@ -516,7 +566,7 @@ See [`docs/architecture.md`](docs/architecture.md), [`docs/pushdown.md`](docs/pu
 * Log-based CDC
 * Additional connectors beyond PostgreSQL
 * Metrics and tracing
-* Sink implementations
+* Output writers (sinks) — writing the batches is the caller's job
 
 
 ---
@@ -528,7 +578,10 @@ See [`docs/architecture.md`](docs/architecture.md), [`docs/pushdown.md`](docs/pu
 Full initial load, Rust vs PySpark on the same Postgres, both containerized.
 Spec (equal-spec rule — a number is only quotable with all of this attached):
 10M rows, best of 3, tool-default batching, containers pinned to cores 0-3,
-bench-pg fixed on cores 4-5 + 2g, 157/157 scan fan-out both sides.
+bench-pg 2g, 157/157 scan fan-out both sides. **Caveat:** these numbers were recorded while
+`benchmark/run.sh` started bench-pg under a `--cpus=4` quota instead of its documented 4-5 pin
+(since restored), so the source database may have shared cores with the engines; re-run before
+quoting them.
 
 
 | Component | Version |
@@ -571,7 +624,7 @@ totals — the way to tell a pushdown win from a fast scan):
 - **Memory (full):** distributed Rust ~1.5–1.65 GiB vs PySpark 2.0–4.3 GiB (heap-dependent).
 - **Budgets 2g → 8g barely moved times** — the workloads are not memory-bound.
 
-> These are measurements of the current implementation on this workload/hardware — not a general Rust-vs-PySpark claim. Never compare `output_bytes` across engines (different Parquet writers); the gate compares row *sets*.
+> These are measurements of the current implementation on this workload/hardware — not a general Rust-vs-PySpark claim. Never compare `output_bytes` across engines (different Parquet writers); the gate compares row counts and row *multisets*.
 
 See [`benchmark/README.md`](benchmark/README.md) for the 2g/8g tables, per-container breakdowns, correctness checks, and the full equal-spec methodology.
 
@@ -600,11 +653,12 @@ The overall architecture, requirements, design decisions, technical trade-offs, 
 | [`QUICKSTART.md`](QUICKSTART.md)                                       | Setup, configuration, distributed execution, benchmarks, and testing             |
 | [`docs/architecture.md`](docs/architecture.md)                     | Module layout, plan lifecycle, Arrow data model, execution and memory management |
 | [`docs/connectors/README.md`](docs/connectors/README.md)           | Connector SPI, capabilities, scan planning, partitioning, and type mapping       |
+| [`docs/connector-abstraction.md`](docs/connector-abstraction.md)   | Multi-connector plan: what is shared, what stays per backend, migration steps    |
 | [`docs/connectors/postgres.md`](docs/connectors/postgres.md)       | PostgreSQL-specific implementation details                                       |
 | [`docs/connectors/mysql.md`](docs/connectors/mysql.md)             | MySQL prototype status and design reference                                      |
 | [`docs/pushdown.md`](docs/pushdown.md)                             | Pushdown rules, semantic compatibility, cost model, and policy engine            |
 | [`docs/deferred/incremental-extraction.md`](docs/deferred/incremental-extraction.md) | Deferred watermark/backfill design (out of scope)              |
-| [`docs/testing-plan.md`](docs/testing-plan.md)                     | Unit and integration testing                                                     |
+| [`docs/testing-plan.md`](docs/testing-plan.md)                     | Test files, what each proves and its oracle, how to run, measured counts         |
 | [`docs/python-bindings.md`](docs/python-bindings.md)               | Future PyO3 wrapper design                                                       |
 
 
@@ -618,7 +672,7 @@ The overall architecture, requirements, design decisions, technical trade-offs, 
 * A database or storage engine.
 * A log-based CDC platform.
 * A benchmark claiming a fixed performance multiplier over PySpark.
-* A sink implementation for every downstream storage system.
+* A writer (sink) for downstream storage systems — it hands out Arrow batches and stops.
 
 
 The focus is the extraction layer between operational databases and analytical execution.

@@ -27,7 +27,8 @@
 #   CPU defaults to a hard pin on cores 0-3 (--cpuset-cpus 0-3). Equality is enforced
 #   ONLY at this container boundary: inside, every runtime runs unrestricted (Spark
 #   local[*], DataFusion defaults, Ballista visible-CPU slots) and takes all the CPUs
-#   the container offers. A host with fewer than 4 cores fails fast here instead of
+#   the container offers. A host with fewer cores than the pins name (default layout:
+#   6 — engines 0-3 + bench-pg 4-5) fails fast before any container starts, instead of
 #   silently benchmarking the wrong budget. --cpuset-cpus RANGE pins a different set
 #   ("" lifts the pin); --cpus N replaces the pin with a softer CFS quota.
 #   Never cap a runtime from the inside (--spark-cores, BENCH_CONCURRENT_TASKS) for
@@ -37,8 +38,10 @@
 #   standalone Rust client each get it in full; the distributed deployment (scheduler +
 #   client + workers) SHARES it — scheduler/client take --scheduler-memory/--client-memory
 #   (512m each) and each worker gets --worker-memory (default: the remainder split evenly).
-#   Postgres is NOT on this budget: bench-pg is hardcoded to --cpuset-cpus=4-5 --memory=512m
-#   (PG_CPU_FLAGS/PG_MEM_FLAGS) so the shared fixture never changes shape between runs.
+#   Postgres is NOT on this budget: bench-pg is hardcoded to --cpuset-cpus=4-5 --memory=2g
+#   (PG_CPUSET/PG_MEM) so the shared fixture never changes shape between runs. The script
+#   checks the Docker host's core count against every pin (engines and bench-pg) before
+#   starting anything, so the default layout needs a host with >= 6 cores.
 #   Pass an empty value to lift any default (e.g. --memory "" = unconstrained).
 #   Also settable via CPUSET_CPUS / CPUS / MEMORY / SCHEDULER_MEMORY / CLIENT_MEMORY /
 #   WORKER_MEMORY env.
@@ -81,15 +84,16 @@ PGDATA="bench-pgdata"
 PG_PORT="${PG_PORT:-5433}"
 PG_PASSWORD="${BENCH_PG_PASSWORD:-postgres}"
 # Postgres test budget — HARDCODED, not a flag: every benchmark run faces the same
-# source database (cores 4-5, 512m RAM). A hard pin, not a quota: like the engines, PG
-# gets named cores or the run fails fast on a smaller host instead of silently
-# benchmarking a different fixture. Cores sit clear of the engine pin (0-3) so the
-# fixture never contends with the engines. A shared fixture must never change shape
-# between runs; override by editing here, never per invocation, so results stay
-# comparable.
-#PG_CPU_FLAGS="--cpuset-cpus=4-5"
-PG_CPU_FLAGS="--cpus=4"
-PG_MEM_FLAGS="--memory=2g"
+# source database (cores 4-5, 2g RAM). A hard pin, not a quota: like the engines, PG
+# gets named cores or the run fails fast (host core check below) on a smaller host
+# instead of silently benchmarking a different fixture. Cores sit clear of the engine
+# pin (0-3) so the fixture never contends with the engines. A shared fixture must never
+# change shape between runs; override by editing here, never per invocation, so results
+# stay comparable. PG_CPUSET and PG_MEM are what verify_pin checks bench-pg against.
+PG_CPUSET="4-5"
+PG_MEM="2g"
+PG_CPU_FLAGS="--cpuset-cpus=$PG_CPUSET"
+PG_MEM_FLAGS="--memory=$PG_MEM"
 WORKERS=4
 # Batch size is the input knob (empty = auto, each tool's own default); partition
 # counts DERIVE from a reference batch size (64000 unless --batch-size overrides it)
@@ -211,6 +215,8 @@ cpuset_count() { # 0-3 -> 4, 0,2 -> 2, 0-1,3 -> 3
   [ "$count" -ge 1 ] || { echo "bad --cpuset-cpus range '$spec'" >&2; exit 2; }
   echo "$count"
 }
+# Pinned capacity in CPU% (validates --cpuset-cpus/--cpus early). No longer used to cap
+# peaks: per-interval CPU% is now exact, so a peak above this means a real measurement bug.
 PIN_MAX_PCT=""
 if [ -n "$CPUSET_CPUS" ]; then PIN_MAX_PCT=$(( $(cpuset_count "$CPUSET_CPUS") * 100 ));
 elif [ -n "$CPUS" ]; then PIN_MAX_PCT=$(python3 -c "import sys
@@ -317,6 +323,30 @@ if [ "$CLEAN" = "1" ]; then
   echo "clean."
   exit 0
 fi
+
+# Fail fast on a host too small for the pins: every cpuset (engine default 0-3, bench-pg
+# 4-5) must name cores the Docker host actually has. Checked here, before any container
+# starts, instead of surfacing as a `docker run` error (or a silently reused, differently
+# pinned container) mid-run.
+cpuset_max() { # highest core index in a cpuset spec: 0-3 -> 3, 0,2 -> 2, 4-5 -> 5
+  local spec=$1 max=0 part n
+  for part in ${spec//,/ }; do
+    n=${part#*-}
+    [ "$n" -gt "$max" ] && max=$n
+  done
+  echo "$max"
+}
+HOST_NCPU=$($CLI info --format '{{.NCPU}}' 2>/dev/null || echo 0)
+for spec in "$CPUSET_CPUS" "$PG_CPUSET"; do
+  [ -n "$spec" ] || continue
+  need=$(( $(cpuset_max "$spec") + 1 ))
+  if [ "$HOST_NCPU" -lt "$need" ]; then
+    echo "docker host has $HOST_NCPU CPU(s); cpuset [$spec] needs at least $need." >&2
+    echo "The spec card pins engines to --cpuset-cpus (default 0-3) and bench-pg to $PG_CPUSET;" >&2
+    echo "run on a host with >= $need cores, or edit the pins (results are then not comparable)." >&2
+    exit 1
+  fi
+done
 
 # --- distributed cluster (scheduler + workers) -------------------------------
 # Started once per run when MODE includes distributed; torn down afterwards (and by
@@ -473,68 +503,94 @@ def api_json(method, target):
         raise RuntimeError("docker API %s %s -> %s" % (method, target, status))
     return json.loads(body)
 
+def read_ns(stamp):
+    # Daemon-side read time ("2026-09-24T15:23:10.123456789Z") -> epoch ns, or None.
+    try:
+        import calendar
+        base, _, frac = stamp.rstrip("Z").partition(".")
+        secs = calendar.timegm(time.strptime(base, "%Y-%m-%dT%H:%M:%S"))
+        if secs <= 0:
+            return None
+        return secs * 1_000_000_000 + int((frac + "000000000")[:9] or 0)
+    except (ValueError, AttributeError):
+        return None
+
 def raw_stats(name):
-    # Cumulative counters (never a point-in-time guess): the caller differences
-    # consecutive reads, so every interval after the first is exact even when a burst
-    # falls between polls. (The old `docker stats --no-stream` CLI loop reported 0 for
-    # exactly those.) Previous counters are tracked here, not taken from precpu_stats:
-    # the daemon omits zero-valued previous fields, which would corrupt the delta.
+    # Cumulative CPU counter + the daemon's read timestamp. CPU% per interval is
+    # delta(container CPU ns) / delta(wall ns): both nanosecond-precise, so there are no
+    # granularity artifacts (the old denominator, system_cpu_usage, advances in 10 ms
+    # jiffies and produced impossible one-tick spikes). 100% = one full core.
     doc = api_json("GET", BASE + "/containers/%s/stats?stream=false&one-shot=true"
                    % urllib.parse.quote(name))
     if doc is None:
         return None
     try:
         total = doc["cpu_stats"]["cpu_usage"]["total_usage"]
-        sysc = doc["cpu_stats"]["system_cpu_usage"]
-        # Normalization base: host-wide online_cpus is the CORRECT base for the
-        # standard convention (100% = one full core) — verified live: a pinned
-        # single-core busy loop reads 100%. (An earlier revision normalized by the
-        # pin size and read 50% for the same load — wrong units.) Single-tick spikes
-        # from counter-granularity mismatch are handled downstream: finalize_json
-        # takes peaks over a 500ms rolling window, not raw ticks.
-        ncpu = (doc["cpu_stats"].get("online_cpus")
-                or len(doc["cpu_stats"]["cpu_usage"].get("percpu_usage") or [1]))
-        mem = doc["memory_stats"].get("usage", 0) / 1048576.0
+        ts = read_ns(doc.get("read", "")) or time.time_ns()
+        m = doc.get("memory_stats") or {}
+        st = m.get("stats") or {}
+        usage = m.get("usage", 0)
+        # Working set = usage - inactive file cache: what `docker stats` shows (cgroup v2
+        # key `inactive_file`, v1 `total_inactive_file`). Raw `usage` counts page cache,
+        # e.g. the Parquet the engine just wrote, which is not engine memory.
+        inactive = st.get("inactive_file", st.get("total_inactive_file", 0))
+        ws = max(usage - inactive, 0) / 1048576.0
+        # Process memory proper: anonymous pages (v2 `anon`, v1 `total_rss`/`rss`).
+        anon = st.get("anon", st.get("total_rss", st.get("rss")))
+        rss = (anon / 1048576.0) if anon is not None else ws
     except (KeyError, TypeError):
         return None
-    return (total, sysc, ncpu, mem)
+    return (total, ts, ws, rss)
 
 def running(name):
     doc = api_json("GET", BASE + "/containers/%s/json" % urllib.parse.quote(name))
     return bool(doc) and doc.get("State", {}).get("Running", False)
 
 prev = {}
+last = {}  # name -> (cumulative cpu ns, read ts ns): carried forward on a failed read
 
 def sample_one(name):
+    """-> (cpu_pct, working_set_mib, rss_mib, cumulative_cpu_ns, ts_ns)."""
     try:
         r = raw_stats(name)
     except Exception:
         r = None
     if r is None:
-        return (0.0, 0.0)
-    total, sysc, ncpu, mem = r
+        c, t = last.get(name, (0, time.time_ns()))
+        return (0.0, 0.0, 0.0, c, t)
+    total, ts, ws, rss = r
     p = prev.get(name)
-    if p is None or sysc <= p[1]:
+    if p is not None and total < p[0]:
+        # Counter went backwards: the container exited (stats read as zeros). Carry the
+        # last reading forward so cumulative sums stay monotonic.
+        return (0.0, 0.0, 0.0, p[0], p[1])
+    if p is None or ts <= p[1]:
         pct = 0.0
     else:
-        pct = (total - p[0]) / (sysc - p[1]) * ncpu * 100.0
-        if pct < 0.0:
-            pct = 0.0
-    prev[name] = (total, sysc)
-    return (pct, mem)
+        pct = (total - p[0]) / (ts - p[1]) * 100.0
+    prev[name] = (total, ts)
+    last[name] = (total, ts)
+    return (pct, ws, rss, total, ts)
 
 def sample_all():
     return {c: sample_one(c) for c in containers}
 
+HEADER = ["t_ms", "cpu_pct", "mem_mib", "rss_mib", "cpu_ns", "ts_ms"]
+
+def fmt(t, v):
+    pct, ws, rss, cpu_ns, ts = v
+    return [t, round(pct, 1), round(ws), round(rss), cpu_ns, ts // 1_000_000]
+
 def write_row(writers, aw, rows, t):
-    cpu = mem = 0.0
+    cpu = ws = rss = 0.0
+    cpu_ns = 0
+    ts = 0
     for c in containers:
-        a, b = rows[c]
-        cpu += a
-        mem += b
+        v = rows[c]
+        cpu += v[0]; ws += v[1]; rss += v[2]; cpu_ns += v[3]; ts = max(ts, v[4])
         if c in writers:
-            writers[c].writerow([t, round(a, 1), round(b)])
-    aw.writerow([t, round(cpu, 1), round(mem)])
+            writers[c].writerow(fmt(t, v))
+    aw.writerow(fmt(t, (cpu, ws, rss, cpu_ns, ts)))
 
 t0 = time.time()
 cls = {} if single else {c: open("{}_c_{}.csv".format(prefix, c), "w", newline="")
@@ -545,13 +601,13 @@ pgw = None
 try:
     agg = open(prefix + "_cluster.csv", "w", newline="")
     aw = csv.writer(agg)
-    aw.writerow(["t_ms", "cpu_pct", "mem_mib"])
+    aw.writerow(HEADER)
     if pgf is not None:
         pgw = csv.writer(pgf)
-        pgw.writerow(["t_ms", "cpu_pct", "mem_mib"])
+        pgw.writerow(HEADER)
     for c, fh in cls.items():
         w = csv.writer(fh)
-        w.writerow(["t_ms", "cpu_pct", "mem_mib"])
+        w.writerow(HEADER)
         writers[c] = w
     n = 0
     while True:
@@ -565,12 +621,13 @@ try:
             rows = sample_all()
             pgrow = sample_one(pg) if pg else None
         except Exception:
-            rows = {c: (0.0, 0.0) for c in containers}
-            pgrow = None
+            n += 1
+            time.sleep(INTERVAL)
+            continue
         t = int((time.time() - t0) * 1000)
         write_row(writers, aw, rows, t)
         if pgw is not None and pgrow is not None:
-            pgw.writerow([t, round(pgrow[0], 1), round(pgrow[1])])
+            pgw.writerow(fmt(t, pgrow))
         agg.flush()
         for fh in cls.values():
             fh.flush()
@@ -583,12 +640,13 @@ try:
         rows = sample_all()
         pgrow = sample_one(pg) if pg else None
     except Exception:
-        rows = {c: (0.0, 0.0) for c in containers}
+        rows = None
         pgrow = None
-    t = int((time.time() - t0) * 1000)
-    write_row(writers, aw, rows, t)
-    if pgw is not None and pgrow is not None:
-        pgw.writerow([t, round(pgrow[0], 1), round(pgrow[1])])
+    if rows is not None:
+        t = int((time.time() - t0) * 1000)
+        write_row(writers, aw, rows, t)
+        if pgw is not None and pgrow is not None:
+            pgw.writerow(fmt(t, pgrow))
     agg.flush()
 finally:
     agg.close()
@@ -648,7 +706,7 @@ done
 echo; $CLI exec "$PG" pg_isready -U postgres -d app
 # Verify even when reusing an existing container: a stale bench-pg from an earlier
 # run would otherwise silently benchmark a different spec.
-verify_pin "$PG" "4-5" "2g"
+verify_pin "$PG" "$PG_CPUSET" "$PG_MEM"
 
 if [ "$SCALE" = "1" ]; then
   echo "== scale dataset toward $SCALE_ROWS rows"
@@ -716,6 +774,16 @@ run_rust() { # $1=tag $2=scenario $3=filter $4=columns $5=mode $6=stats prefix
   fi
   local code; code=$($CLI wait "$name")
   wait
+  if [ "$mode" = "distributed" ]; then
+    # Exact cgroup high-water marks of the long-lived cluster containers (the client
+    # reports its own in its JSON). Lifetime peaks: they span every scenario served.
+    local c peaks="{"
+    for c in bench-scheduler $(seq -f "bench-worker-%g" 1 "$WORKERS"); do
+      local v; v=$($CLI exec "$c" cat /sys/fs/cgroup/memory.peak 2>/dev/null | tr -dc 0-9)
+      peaks="$peaks\"$c\": ${v:-null},"
+    done
+    echo "${peaks%,}}" > "${sprefix}_mempeak.json"
+  fi
   local json; json=$($CLI logs "$name" 2>/dev/null | grep '^{' | tail -1)
   if [ "$code" != "0" ]; then
     echo "--- $name logs (tail) ---" >&2
@@ -773,68 +841,140 @@ import csv, glob, json, os, sys
 jpath, prefix = sys.argv[1], sys.argv[2]
 doc = json.load(open(jpath))
 
-def peaks(path):
-    cpu, mem = [], []
+# Statistics cover the engine's TIMED SECTION (t_start/t_end_epoch_ms in its JSON, same
+# clock as the daemon's sample timestamps), so CPU and memory describe the same work as
+# elapsed_ms — not container start-up (JVM boot, Ballista start, schema discovery).
+# Older engine JSON without the bounds falls back to the whole sampled series.
+T0 = doc.get("t_start_epoch_ms")
+T1 = doc.get("t_end_epoch_ms")
+
+def load(path):
+    out = []
     with open(path) as f:
         for row in csv.DictReader(f):
             try:
-                cpu.append(float(row["cpu_pct"])); mem.append(float(row["mem_mib"]))
+                out.append({k: float(v) for k, v in row.items() if v not in ("", None)})
             except ValueError:
                 pass
-    if not cpu:
+    return out
+
+def interp(rows, t):
+    # Cumulative CPU ns at time t (ms), linear between the bracketing samples.
+    if t <= rows[0]["ts_ms"]:
+        return rows[0]["cpu_ns"]
+    for a, b in zip(rows, rows[1:]):
+        if a["ts_ms"] <= t <= b["ts_ms"]:
+            if b["ts_ms"] == a["ts_ms"]:
+                return b["cpu_ns"]
+            frac = (t - a["ts_ms"]) / (b["ts_ms"] - a["ts_ms"])
+            return a["cpu_ns"] + (b["cpu_ns"] - a["cpu_ns"]) * frac
+    return rows[-1]["cpu_ns"]
+
+def peaks(path):
+    rows = load(path)
+    if not rows:
         return None
-    # CPU peak is the max over a 5-tick (~500ms) rolling mean, not the raw single-tick
-    # max: counter-granularity mismatch between the container and system counters can
-    # spike one 100ms tick far above anything physical (observed: 643% on a 4-core
-    # pin, where 400% is the ceiling). A real sustained burst spans many ticks and
-    # survives the smoothing; a one-tick artifact does not. The smoothed peak is then
-    # capped at PIN_MAX_PCT (the run's CPU budget x 100, exported by run.sh): the pin
-    # is kernel-enforced, so no true peak can exceed it — the cap only ever removes
-    # artifact, never real signal. Memory stays a raw max — it is an instantaneous
-    # gauge, not a ratio, so its spikes are real.
-    w = 5
-    smooth = [sum(cpu[i:i + w]) / len(cpu[i:i + w]) for i in range(len(cpu))]
-    peak = max(smooth)
-    try:
-        cap = float(os.environ.get("PIN_MAX_PCT", "") or 0.0)
-    except ValueError:
-        cap = 0.0
-    if cap and peak > cap:
-        peak = cap
-    return {"avg_cpu_pct": round(sum(cpu) / len(cpu), 1),
-            "peak_cpu_pct": round(peak, 1),
-            "peak_rss_mib": round(max(mem))}
+    exact = all("cpu_ns" in r and "ts_ms" in r for r in rows)
+    if exact:
+        rows.sort(key=lambda r: r["ts_ms"])
+        t0 = T0 if T0 is not None else rows[0]["ts_ms"]
+        t1 = T1 if T1 is not None else rows[-1]["ts_ms"]
+        # Samples inside the window, plus one on each side so a short window still has
+        # data and end-of-run memory (writer close) is seen.
+        inside = [i for i, r in enumerate(rows) if t0 <= r["ts_ms"] <= t1]
+        lo = max(0, (inside[0] if inside else 0) - 1)
+        hi = min(len(rows), (inside[-1] if inside else len(rows) - 1) + 2)
+        win = rows[lo:hi]
+        span_ms = max(t1 - t0, 1.0)
+        # Exact CPU work in the window from the cumulative counter (no sampling error).
+        cpu_s = max(interp(rows, t1) - interp(rows, t0), 0.0) / 1e9
+        avg = cpu_s * 1000.0 / span_ms * 100.0
+        # Per-interval rates are exact (ns / ns), so the peak is the raw max — no
+        # smoothing or capping needed any more.
+        peak = max(r["cpu_pct"] for r in win)
+    else:
+        # Legacy CSV (t_ms,cpu_pct,mem_mib only): mean of the sampled rates.
+        win = rows
+        cpu_s = None
+        avg = sum(r["cpu_pct"] for r in rows) / len(rows)
+        peak = max(r["cpu_pct"] for r in rows)
+    out = {"avg_cpu_pct": round(avg, 1),
+           "peak_cpu_pct": round(peak, 1),
+           # Process memory (anonymous pages) — the "RSS" name now means what it says.
+           "peak_rss_mib": round(max(r.get("rss_mib", r["mem_mib"]) for r in win)),
+           # Working set = usage - inactive page cache (what `docker stats` shows).
+           "peak_mem_mib": round(max(r["mem_mib"] for r in win))}
+    if cpu_s is not None:
+        out["cpu_seconds"] = round(cpu_s, 2)
+    return out
 
 cluster = peaks(prefix + "_cluster.csv")
-doc["avg_cpu_pct"] = cluster["avg_cpu_pct"]
-doc["peak_cpu_pct"] = cluster["peak_cpu_pct"]
-doc["peak_rss_mib"] = cluster["peak_rss_mib"]
+if cluster is None:
+    cluster = {"avg_cpu_pct": 0.0, "peak_cpu_pct": 0.0, "peak_rss_mib": 0, "peak_mem_mib": 0}
+doc.update(cluster)
+doc["stats_window"] = ("timed section" if (T0 is not None and T1 is not None)
+                       else "container lifetime")
 doc["containers"] = {}
 for path in sorted(glob.glob(prefix + "_c_*.csv")):
     name = os.path.basename(path)[len(os.path.basename(prefix)) + 3:-4]
     p = peaks(path)
     if p is not None:
         doc["containers"][name] = p
+
+# Exact cgroup memory high-water marks (memory.peak, includes page cache — the figure a
+# --memory limit / OOM kill applies to), immune to the 100 ms sampling gaps. The engine
+# container reports its own; long-lived cluster containers are read by run.sh (lifetime
+# peaks: they span every scenario the cluster served).
+exact = {}
+if doc.get("mem_peak_bytes"):
+    exact["engine"] = doc["mem_peak_bytes"]
+if os.path.exists(prefix + "_mempeak.json"):
+    for name, v in json.load(open(prefix + "_mempeak.json")).items():
+        if v:
+            exact[name] = v
+            if name in doc["containers"]:
+                doc["containers"][name]["mem_peak_exact_mib"] = round(v / 1048576)
+if exact:
+    # Per-container peaks need not be simultaneous: the sum is an upper bound.
+    doc["mem_peak_exact_mib"] = round(sum(exact.values()) / 1048576)
+
 # Source-database series (same ticks, never mixed into engine totals): answers whether
 # Postgres was the bottleneck on this run. Missing file (older runs) simply omits it.
 if os.path.exists(prefix + "_pg.csv"):
     pgp = peaks(prefix + "_pg.csv")
     if pgp is not None:
-        doc["pg"] = {"avg_cpu_pct": pgp["avg_cpu_pct"],
-                     "peak_cpu_pct": pgp["peak_cpu_pct"],
-                     "peak_rss_mib": pgp["peak_rss_mib"]}
+        doc["pg"] = pgp
 json.dump(doc, open(jpath, "w"), indent=2)
-print("{} avg_cpu={} peak_cpu={} peak_rss={}MiB containers={}".format(
-    doc.get("engine"), doc["avg_cpu_pct"], doc["peak_cpu_pct"],
-    doc["peak_rss_mib"], sorted(doc["containers"])))
+print("{} window={} cpu_s={} avg_cpu={} peak_cpu={} peak_rss={}MiB peak_mem={}MiB "
+      "exact_peak={}MiB containers={}".format(
+          doc.get("engine"), doc["stats_window"], doc.get("cpu_seconds"),
+          doc["avg_cpu_pct"], doc["peak_cpu_pct"], doc["peak_rss_mib"],
+          doc["peak_mem_mib"], doc.get("mem_peak_exact_mib"), sorted(doc["containers"])))
 EOF
+}
+
+# A case (engine x scenario) that fails is recorded and the run moves on, so the other
+# cases' numbers still reach the summary. The first failed attempt ends that case — its
+# remaining attempts are skipped (retrying a deterministic failure such as an OOM only
+# burns time). If an earlier attempt of the case succeeded, its best result is kept and
+# the case is marked partial; otherwise the case is FAILED and leaves only
+# $RESULTS/<tag>_<scenario>.failed (the reason) and no output file, so the correctness
+# check never compares a half-written Parquet. The script exits non-zero at the end if
+# any case failed.
+FAILED_CASES=()
+fail_case() { # $1=tag $2=scenario $3=reason
+  echo "$3" > "$RESULTS/${1}_${2}.failed"
+  FAILED_CASES+=("$1/$2")
+  echo "!! $1/$2 FAILED: $3 — skipping its remaining attempts, continuing with the next case" >&2
 }
 
 best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
   # tag namespaces files, e.g. rust_standalone / rust_distributed / spark.
   # Each attempt writes to its own stats prefix; only the winner is promoted.
   local tag=$1 engine=$2 mode=$3 scenario=$4 filter=$5 columns=$6
-  local ms best_ms="" best_i=0 i json sprefix
+  local ms best_ms="" best_i=0 i json sprefix rc failure=""
+  rm -f "$RESULTS/${tag}_${scenario}.failed" "$RESULTS/${tag}_${scenario}.partial" \
+    "$RESULTS/${tag}_${scenario}.json" "$RESULTS/${tag}_${scenario}_mempeak.json"
   for i in $(seq 1 "$REPEAT"); do
     echo "-- $tag/$scenario attempt $i/$REPEAT"
     # Clear BEFORE the attempt, not after: Spark refuses to write over an existing
@@ -844,18 +984,37 @@ best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
     # silently gut the cross-engine file check down to one file.
     rm -rf "$OUTPUT"/orders_${tag}_${scenario}.parquet
     sprefix="$RESULTS/.${tag}_${scenario}_try${i}"
-    if [ "$engine" = "rust" ]; then json=$(run_rust "$tag" "$scenario" "$filter" "$columns" "$mode" "$sprefix");
-    else json=$(run_spark "$tag" "$scenario" "$filter" "$columns" "$sprefix"); fi
+    rc=0
+    if [ "$engine" = "rust" ]; then
+      json=$(run_rust "$tag" "$scenario" "$filter" "$columns" "$mode" "$sprefix") || rc=$?
+    else
+      json=$(run_spark "$tag" "$scenario" "$filter" "$columns" "$sprefix") || rc=$?
+    fi
+    ms=""
+    if [ "$rc" = "0" ]; then
+      ms=$(echo "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["elapsed_ms"])' 2>/dev/null) || ms=""
+    fi
+    if [ "$rc" != "0" ] || [ -z "$ms" ]; then
+      failure="attempt $i/$REPEAT failed ($([ "$rc" != "0" ] && echo "exit $rc" || echo "unparseable JSON summary"))"
+      # The failed attempt's partial output must not reach the correctness check.
+      rm -rf "$OUTPUT"/orders_${tag}_${scenario}.parquet
+      break
+    fi
     echo "$json" > "$RESULTS/.${tag}_${scenario}_try${i}.json"
-    ms=$(echo "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["elapsed_ms"])')
     if [ -z "$best_ms" ] || [ "$ms" -lt "$best_ms" ]; then
       best_ms=$ms
       best_i=$i
     fi
   done
+  if [ -z "$best_ms" ]; then
+    rm -f "$RESULTS"/."${tag}_${scenario}"_try*.json "$RESULTS"/."${tag}_${scenario}"_try*.csv
+    fail_case "$tag" "$scenario" "$failure"
+    return 0
+  fi
   cp "$RESULTS/.${tag}_${scenario}_try${best_i}.json" "$RESULTS/${tag}_${scenario}.json"
   mv "$RESULTS/.${tag}_${scenario}_try${best_i}_cluster.csv" "$RESULTS/${tag}_${scenario}_cluster.csv"
-  mv "$RESULTS/.${tag}_${scenario}_try${best_i}_pg.csv" "$RESULTS/${tag}_${scenario}_pg.csv"
+  mv "$RESULTS/.${tag}_${scenario}_try${best_i}_pg.csv" "$RESULTS/${tag}_${scenario}_pg.csv" 2>/dev/null || true
+  mv "$RESULTS/.${tag}_${scenario}_try${best_i}_mempeak.json" "$RESULTS/${tag}_${scenario}_mempeak.json" 2>/dev/null || true
   shopt -s nullglob
   for f in "$RESULTS"/."${tag}_${scenario}"_try"${best_i}"_c_*.csv; do
     name=${f##*_c_}; name=${name%.csv}
@@ -864,6 +1023,13 @@ best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
   shopt -u nullglob
   rm -f "$RESULTS"/."${tag}_${scenario}"_try*.json "$RESULTS"/."${tag}_${scenario}"_try*.csv
   finalize_json "$RESULTS/${tag}_${scenario}.json" "$RESULTS/${tag}_${scenario}"
+  if [ -n "$failure" ]; then
+    # Keep the successful attempts' best, but say the case did not complete all attempts.
+    echo "!! $tag/$scenario: $failure; keeping the best of the earlier successful attempt(s)" >&2
+    echo "partial: $failure" > "$RESULTS/${tag}_${scenario}.partial"
+  else
+    rm -f "$RESULTS/${tag}_${scenario}.partial"
+  fi
   echo "$tag/$scenario best: ${best_ms}ms"
 }
 
@@ -927,9 +1093,6 @@ cat > "$BENCH_DIR/bench-config.json" <<EOF
   "checkpoint": {
     "dir": "/tmp/.checkpoints"
   },
-  "sink": {
-    "path": "/tmp/bench_sink"
-  },
   "pushdown": {
     "policy": "cost_based",
     "deny": [],
@@ -951,8 +1114,15 @@ EOF
 run_mode() { # $1=mode(standalone|distributed)
   local mode=$1 tag
   if [ "$mode" = "distributed" ]; then
-    start_cluster
     tag=rust_distributed
+    # A cluster that never comes up fails both distributed cases, not the whole run.
+    # Subshell: helpers like verify_pin `exit` on mismatch.
+    if ! ( start_cluster ); then
+      stop_cluster
+      fail_case "$tag" full "cluster did not start"
+      fail_case "$tag" selective "cluster did not start"
+      return 0
+    fi
   else
     tag=rust_standalone
   fi
@@ -986,27 +1156,42 @@ report_table() { # $1=results dir -> padded markdown comparison table on stdout
   python3 - "$1" <<'EOF'
 import glob, json, os, sys
 results = sys.argv[1]
-header = ["engine", "scenario", "rows", "component",
-          "elapsed_ms", "avg_cpu_pct", "peak_cpu_pct", "peak_rss_mib"]
+header = ["engine", "scenario", "rows", "component", "elapsed_ms", "cpu_seconds",
+          "avg_cpu_pct", "peak_cpu_pct", "peak_rss_mib", "peak_mem_mib", "mem_peak_exact_mib"]
+def v(d, k):
+    x = d.get(k)
+    return "" if x is None else str(x)
 rows = []
+def case_paths(pat):
+    # Completed cases (.json) and failed ones (.failed), in one sorted list.
+    base = os.path.join(results, pat)
+    return sorted(glob.glob(base) + glob.glob(base[:-len(".json")] + ".failed"))
+def elapsed(path, d):
+    partial = path[:-len(".json")] + ".partial"
+    return str(d["elapsed_ms"]) + (" (partial)" if os.path.exists(partial) else "")
 for pat in ("rust_*_full.json", "spark_full.json",
             "rust_*_selective.json", "spark_selective.json"):
-    for path in sorted(glob.glob(os.path.join(results, pat))):
+    for path in case_paths(pat):
+        if path.endswith(".failed"):
+            tag, scenario = os.path.basename(path)[:-len(".failed")].rsplit("_", 1)
+            reason = open(path).read().strip()
+            rows.append([tag, scenario, "", "", "FAILED"] + [""] * 6)
+            rows.append(["", "", "", "`" + reason + "`"] + [""] * 7)
+            continue
         d = json.load(open(path))
-        rows.append([d["engine"], d["scenario"], str(d["rows"]), "",
-                     str(d["elapsed_ms"]),
-                     str(d["avg_cpu_pct"]), str(d["peak_cpu_pct"]),
-                     str(d["peak_rss_mib"])])
+        rows.append([d["engine"], d["scenario"], str(d["rows"]), "", elapsed(path, d),
+                     v(d, "cpu_seconds"), v(d, "avg_cpu_pct"), v(d, "peak_cpu_pct"),
+                     v(d, "peak_rss_mib"), v(d, "peak_mem_mib"), v(d, "mem_peak_exact_mib")])
         for name in sorted(d.get("containers", {})):
             c = d["containers"][name]
-            rows.append(["", "", "", "`{}`".format(name), "",
-                         str(c["avg_cpu_pct"]), str(c["peak_cpu_pct"]),
-                         str(c["peak_rss_mib"])])
+            rows.append(["", "", "", "`{}`".format(name), "", v(c, "cpu_seconds"),
+                         v(c, "avg_cpu_pct"), v(c, "peak_cpu_pct"), v(c, "peak_rss_mib"),
+                         v(c, "peak_mem_mib"), v(c, "mem_peak_exact_mib")])
         if "pg" in d:
             p = d["pg"]
-            rows.append(["", "", "", "`postgres`", "",
-                         str(p["avg_cpu_pct"]), str(p["peak_cpu_pct"]),
-                         str(p["peak_rss_mib"])])
+            rows.append(["", "", "", "`postgres`", "", v(p, "cpu_seconds"),
+                         v(p, "avg_cpu_pct"), v(p, "peak_cpu_pct"), v(p, "peak_rss_mib"),
+                         v(p, "peak_mem_mib"), ""])
 widths = [len(h) for h in header]
 for r in rows:
     widths = [max(w, len(c)) for w, c in zip(widths, r)]
@@ -1025,14 +1210,27 @@ summary_table() { # $1=results dir -> totals-only table on stdout: one row per t
   python3 - "$1" <<'EOF'
 import glob, json, os, sys
 results = sys.argv[1]
-header = ["engine", "scenario", "elapsed_ms", "peak_rss_mib"]
+header = ["engine", "scenario", "elapsed_ms", "cpu_seconds", "peak_rss_mib",
+          "mem_peak_exact_mib"]
+def v(d, k):
+    x = d.get(k)
+    return "" if x is None else str(x)
 rows = []
+def case_paths(pat):
+    base = os.path.join(results, pat)
+    return sorted(glob.glob(base) + glob.glob(base[:-len(".json")] + ".failed"))
 for pat in ("rust_*_full.json", "spark_full.json",
             "rust_*_selective.json", "spark_selective.json"):
-    for path in sorted(glob.glob(os.path.join(results, pat))):
+    for path in case_paths(pat):
+        if path.endswith(".failed"):
+            tag, scenario = os.path.basename(path)[:-len(".failed")].rsplit("_", 1)
+            rows.append([tag, scenario, "FAILED", "", "", ""])
+            continue
         d = json.load(open(path))
+        partial = path[:-len(".json")] + ".partial"
         rows.append([d["engine"], d["scenario"],
-                     str(d["elapsed_ms"]), str(d["peak_rss_mib"])])
+                     str(d["elapsed_ms"]) + (" (partial)" if os.path.exists(partial) else ""),
+                     v(d, "cpu_seconds"), v(d, "peak_rss_mib"), v(d, "mem_peak_exact_mib")])
 widths = [len(h) for h in header]
 for r in rows:
     widths = [max(w, len(c)) for w, c in zip(widths, r)]
@@ -1053,7 +1251,9 @@ EOF
   echo
   report_table "$RESULTS"
   echo
-  echo "## Summary (engine totals only: elapsed time and summed peak memory per test variant)"
+  echo "## Summary (engine totals per test variant: elapsed time, CPU work, memory)"
+  echo
+  echo "Stats cover each engine's timed section. \`cpu_seconds\`: exact CPU time (cumulative counters). \`peak_rss_mib\`: peak process memory (anonymous pages, 100 ms samples, summed across containers per sample). \`peak_mem_mib\` (detail table): peak working set (usage − inactive page cache, as \`docker stats\`). \`mem_peak_exact_mib\`: exact cgroup high-water mark incl. page cache — what a \`--memory\` limit applies to; for distributed runs a sum of per-container lifetime peaks (upper bound)."
   echo
   summary_table "$RESULTS"
   echo
@@ -1073,11 +1273,16 @@ for f in "$RESULTS"/rust_*_selective.json "$RESULTS"/spark_selective.json; do
   check_gate "$f" "$EXPECTED_SELECTIVE" "$(basename "$f" .json)"
 done
 echo "Correctness gate: **$GATE**" | tee -a "$RESULTS/summary.md"
+if [ "${#FAILED_CASES[@]}" -gt 0 ]; then
+  echo "Failed cases (no result, excluded from the gate and the file check): ${FAILED_CASES[*]}" \
+    | tee -a "$RESULTS/summary.md"
+fi
 
 [ "$GATE" = "PASS" ] || exit 1
 
 if [ "$SKIP_CORRECTNESS" = "1" ]; then
   echo "correctness check skipped (--skip-correctness)" | tee -a "$RESULTS/summary.md"
+  [ "${#FAILED_CASES[@]}" -eq 0 ] || exit 1
   exit 0
 fi
 
@@ -1089,11 +1294,14 @@ if ! python3 -c "import duckdb" 2>/dev/null; then
 fi
 
 echo "== independent row-by-row correctness check (benchmark/correctness.py)"
-if python3 "$BENCH_DIR/correctness.py" "$OUTPUT" "$RESULTS/correctness.json"; then
+if python3 "$BENCH_DIR/correctness.py" "$OUTPUT" "$RESULTS/correctness.json" \
+     "$EXPECTED_FULL" "$EXPECTED_SELECTIVE"; then
   {
     echo
     echo "Row-by-row file check (independent DuckDB read of every output): **PASS**"
   } | tee -a "$RESULTS/summary.md"
+  # Results are complete for the cases that ran; still signal failed cases to callers/CI.
+  [ "${#FAILED_CASES[@]}" -eq 0 ] || exit 1
 else
   {
     echo

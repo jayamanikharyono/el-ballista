@@ -15,7 +15,7 @@ pub struct PgParamSink<'q> {
 }
 
 impl<'q> PgParamSink<'q> {
-    pub fn new(query: &'q mut QueryBuilder<Postgres>) -> Self {
+    pub(crate) fn new(query: &'q mut QueryBuilder<Postgres>) -> Self {
         Self { query }
     }
 }

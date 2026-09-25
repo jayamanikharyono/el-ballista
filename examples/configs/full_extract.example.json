@@ -14,9 +14,6 @@
     "application_name": "rust-extract-layer-full",
     "schema": "public"
   },
-  "sink": {
-    "path": "./output/orders_full"
-  },
   "checkpoint": {
     "dir": "./.checkpoints"
   },

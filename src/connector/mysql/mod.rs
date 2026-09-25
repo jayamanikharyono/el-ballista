@@ -6,24 +6,27 @@
 //! reading — through a non-Postgres backend so we can see which abstractions hold and which leak.
 //!
 //! Scope (prototype): connect, read schema from `information_schema`, and full-table extract to
-//! Arrow. NOT included yet: pushdown, parallel/distributed execution,
-//! or bounded-memory cursor streaming. Columns decode to typed Arrow arrays via [`row_adapter`]
-//! (width-preserving integers, `Decimal128`, `Boolean`, dates/timestamps, `Binary`, `Utf8`
-//! otherwise); `fetch_all` still materializes the whole result in memory — prototype only.
+//! Arrow — streamed in `batch_size` batches ([`MysqlExtractor::extract_full_table_for_each_batch`])
+//! or materialized into one batch ([`MysqlExtractor::extract_full_table`]). NOT included yet:
+//! filters/pushdown, parallel/distributed execution, a `TableProvider`, or checkpointed jobs.
+//! Columns decode to typed Arrow arrays via [`row_adapter`] per the table in [`type_mapper`]
+//! (lossless unsigned integers, `BOOLEAN` → `Boolean`, `Decimal128`, dates/timestamps, `TIME` →
+//! `Duration`, `Binary`, `Utf8` otherwise). Errors are the typed [`MysqlError`].
 //!
-//! Abstraction findings this prototype surfaces (act on these when promoting MySQL past prototype):
-//! - [`SqlDialect`] and `Fidelity` live under `connector::postgres::pushdown`; a second dialect
-//!   needs them, so they should be lifted to a shared, connector-agnostic module.
-//! - [`ExtractorError`](crate::connector::errors::ExtractorError) messages are Postgres-worded;
-//!   make them backend-neutral.
+//! Abstraction findings this prototype surfaced (see `docs/connector-abstraction.md`):
+//! - [`SqlDialect`] had to be shared: it now lives in the connector-agnostic
+//!   `crate::pushdown::dialect` (done).
+//! - [`ExtractorError`](crate::connector::errors::ExtractorError) messages were Postgres-worded;
+//!   they are backend-neutral now (done).
 //! - MySQL uses `?` placeholders and backtick quoting and has no `ctid` — parallel partitioning
-//!   must be keyset-only for MySQL.
+//!   must be keyset-only for MySQL (still open: no parallel MySQL scans yet).
 //!
 //! [`SqlDialect`]: crate::pushdown::dialect::SqlDialect
 //! [`TableMetadata`]: crate::types::TableMetadata
 //! [`ColumnMetadata`]: crate::types::ColumnMetadata
 
 pub mod dialect;
+pub mod error;
 pub mod extractor;
 pub mod query_builder;
 pub mod row_adapter;
@@ -31,4 +34,5 @@ pub mod schema_reader;
 pub mod type_mapper;
 
 pub use dialect::MysqlDialect;
+pub use error::MysqlError;
 pub use extractor::MysqlExtractor;

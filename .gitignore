@@ -39,6 +39,8 @@ target/
 
 # Data Testing
 data/
+# ...but the integration-test fixtures under tests/data/ are source (hostile.sql, dvdrental).
+!tests/data/
 
 
 output/

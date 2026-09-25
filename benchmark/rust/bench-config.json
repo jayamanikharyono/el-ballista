@@ -15,9 +15,6 @@
   "checkpoint": {
     "dir": "/tmp/.checkpoints"
   },
-  "sink": {
-    "path": "/tmp/bench_sink"
-  },
   "pushdown": {
     "policy": "cost_based",
     "deny": [],

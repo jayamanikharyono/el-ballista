@@ -2,18 +2,21 @@
 
 Reads the actual files (no shared code with either engine), groups by scenario from the
 filename (`*_full.parquet`, `*_selective.parquet`), and proves:
-  1. every file's row count (recomputed from the file, not trusted from summaries),
-  2. all engines' outputs are row-identical per scenario (order-insensitive set equality),
+  1. every file's row count (recomputed from the file, not trusted from summaries) equals
+     the expected source count for its scenario (when given — run.sh always passes it),
+  2. all engines' outputs are row-identical per scenario: order-insensitive MULTISET
+     equality (`EXCEPT ALL` both directions, plus equal row counts), so a duplicated row
+     (e.g. overlapping partitions) or a dropped duplicate fails the gate,
   3. selective outputs satisfy the predicate and carry exactly the projected columns,
   4. selective rows are a subset of the same engine's full rows,
-  5. jsonb `metadata` matches semantically (key order differs: serde_json sorts keys,
-     pgjdbc preserves storage order, so raw-string compare would false-fail).
+  5. jsonb `metadata` matches semantically, by extracted fields (the engines' text
+     renderings need not be byte-identical, so raw-string compare could false-fail).
 
 Timestamps compare as instants (`epoch_us`) so tz-aware vs tz-naive representations
 (Rust writes UTC-annotated, Spark writes naive) cannot false-fail either.
 
 Usage:
-    python3 correctness.py <output_dir> <results_json_out>
+    python3 correctness.py <output_dir> <results_json_out> [<expected_full> <expected_selective>]
 Exit 0 on PASS, 1 on FAIL. Needs the `duckdb` package:
     pip install duckdb   (or: benchmark/run.sh --skip-correctness to bypass)
 """
@@ -56,7 +59,17 @@ def compare_select(path, columns):
 def main():
     import duckdb
 
+    if len(sys.argv) not in (3, 5):
+        sys.exit("usage: correctness.py <output_dir> <results_json_out> "
+                 "[<expected_full> <expected_selective>]")
     out_dir, results_path = sys.argv[1], sys.argv[2]
+    expected = {}
+    if len(sys.argv) == 5:
+        try:
+            expected = {"full": int(sys.argv[3]), "selective": int(sys.argv[4])}
+        except ValueError:
+            sys.exit("expected counts must be integers, got {!r} {!r}".format(
+                sys.argv[3], sys.argv[4]))
     duckdb.execute("SET TimeZone='UTC'")
     checks = []
 
@@ -91,13 +104,29 @@ def main():
         overall &= check("all files readable", True,
                          "{} files".format(len(counts)))
 
-    def sets_equal(a, b, columns):
+    # Each output's row count against the source's count for that scenario.
+    for scenario, paths in (("full", full_files), ("selective", sel_files)):
+        if scenario not in expected:
+            continue
+        for path in paths:
+            if path not in counts:
+                continue  # unreadable: already failed above
+            overall &= check(
+                "{} row count: {}".format(scenario, os.path.basename(path)),
+                counts[path] == expected[scenario],
+                "{} rows, expected {}".format(counts[path], expected[scenario]))
+
+    def multisets_equal(a, b, columns):
+        # EXCEPT ALL keeps duplicates (multiset difference): a row present twice in one
+        # output and once in the other survives the difference. Plain EXCEPT would
+        # de-duplicate first and let a duplicated row pass. The count check makes the
+        # equality explicit even for outputs whose duplicates cancel out.
         qa = compare_select(a, columns)
         qb = compare_select(b, columns)
         diff = duckdb.execute(
-            "SELECT count(*) FROM (({} EXCEPT {}) UNION ALL ({} EXCEPT {})) t"
+            "SELECT count(*) FROM (({} EXCEPT ALL {}) UNION ALL ({} EXCEPT ALL {})) t"
             .format(qa, qb, qb, qa)).fetchone()[0]
-        return diff == 0
+        return diff == 0 and counts.get(a) == counts.get(b), diff
 
     for scenario, paths, columns in (("full", full_files, FULL_COLUMNS),
                                      ("selective", sel_files, SELECTIVE_COLUMNS)):
@@ -112,8 +141,9 @@ def main():
         base = paths[0]
         for other in paths[1:]:
             try:
-                eq = sets_equal(base, other, columns)
-                detail = "{} rows each".format(counts.get(base, "?"))
+                eq, diff = multisets_equal(base, other, columns)
+                detail = "{} vs {} rows, {} differing (multiset)".format(
+                    counts.get(base, "?"), counts.get(other, "?"), diff)
             except Exception as e:  # noqa: BLE001
                 eq, detail = False, str(e)[:160]
             overall &= check(

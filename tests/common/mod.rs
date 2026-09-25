@@ -14,8 +14,10 @@
 //! ```
 //!
 //! Design: schema isolation (not database isolation) inside the one server — each `TestDb`
-//! gets `test_<pid>_<n>`, builds the hostile fixture inside it, and drops the schema on
-//! `Drop`. Tests can run in parallel.
+//! gets `test_<pid>_<n>`, loads the hostile fixture (`tests/data/hostile.sql`) inside it, and
+//! drops the schema on `Drop` (fresh connection, bounded timeout, failures logged) or via
+//! `TestDb::cleanup().await`.
+//! Tests can run in parallel.
 //!
 //! Single implementation: [`postgres.rs`] holds the harness; this module re-exports it so
 //! every suite shares one fixture, one provisioning rule, and one cleanup path.

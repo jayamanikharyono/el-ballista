@@ -8,6 +8,7 @@
 
 pub mod connection;
 pub mod context;
+pub mod executors;
 pub mod plan_codec;
 pub mod pool_registry;
 pub mod table_codec;

@@ -18,10 +18,9 @@
 use uuid::Uuid;
 
 /// A pipeline + run identity shared by every query issued through one session (one
-/// `PostgresExtractor` connection, or one `PostgresExecutionPlan`). `run_id` is either a
-/// fresh id generated once for the session, or the caller's real checkpoint `run_id` when
-/// one exists — either way it stays fixed for the session's lifetime, so every query it
-/// tags carries the same value.
+/// `PostgresExtractor` connection, or one `PostgresExecutionPlan`). `run_id` is generated
+/// once for the session (or carried over from a serialized plan) and stays fixed for the
+/// session's lifetime, so every query it tags carries the same value.
 #[derive(Debug, Clone)]
 pub struct QuerySession {
     pipeline: String,
@@ -29,25 +28,14 @@ pub struct QuerySession {
 }
 
 impl QuerySession {
-    /// A fresh session with a generated `run_id`. Used whenever no checkpointed run is in
-    /// progress (ad-hoc `rel plan`, the demo pipeline, table-scan sessions) — `pipeline` is
+    /// A fresh session with a generated `run_id` — `pipeline` is
     /// typically the job's `application_name`, which is already threaded through config for
     /// an unrelated reason (identifying the Postgres connection) and doubles as a stable
     /// pipeline label here.
-    pub fn new(pipeline: impl Into<String>) -> Self {
+    pub(crate) fn new(pipeline: impl Into<String>) -> Self {
         Self {
             pipeline: sanitize(&pipeline.into()),
             run_id: fresh_run_id(),
-        }
-    }
-
-    /// A session tied to a real checkpoint run: reuses the caller's actual `run_id` so the
-    /// SQL comment matches the checkpoint file / application logs for that run, rather than
-    /// inventing an unrelated one.
-    pub fn for_run(pipeline: impl Into<String>, run_id: Uuid) -> Self {
-        Self {
-            pipeline: sanitize(&pipeline.into()),
-            run_id: format!("r_{}", &run_id.simple().to_string()[..8]),
         }
     }
 
@@ -55,24 +43,36 @@ impl QuerySession {
     /// a serialized/deserialized execution plan) — used so a plan built on the scheduler and
     /// executed elsewhere tags every partition's query with the *same* run_id, rather than
     /// generating a new one per process.
-    pub fn from_parts(pipeline: impl Into<String>, run_id: impl Into<String>) -> Self {
+    pub(crate) fn from_parts(pipeline: impl Into<String>, run_id: impl Into<String>) -> Self {
         Self {
             pipeline: sanitize(&pipeline.into()),
             run_id: run_id.into(),
         }
     }
 
-    pub fn run_id(&self) -> &str {
+    pub(crate) fn run_id(&self) -> &str {
         &self.run_id
     }
 
+    /// The sanitized pipeline label every query tagged by this session carries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_ballista_extraction_layer::connector::query_tag::QuerySession;
+    ///
+    /// fn label(session: &QuerySession) -> &str {
+    ///     session.pipeline()
+    /// }
+    /// # let _ = label;
+    /// ```
     pub fn pipeline(&self) -> &str {
         &self.pipeline
     }
 
     /// Build the tag for one query: a fresh `query_id`, this session's `pipeline`/`run_id`,
     /// and the caller-supplied `strategy` (e.g. "full", "full+pushdown", "cursor", "keyset").
-    pub fn tag(&self, strategy: impl Into<String>) -> QueryTag {
+    pub(crate) fn tag(&self, strategy: impl Into<String>) -> QueryTag {
         QueryTag {
             query_id: format!("q_{}", short_id()),
             pipeline: self.pipeline.clone(),
@@ -83,7 +83,7 @@ impl QuerySession {
     }
 }
 
-/// One query's rendered debug identity. Build via [`QuerySession::tag`].
+/// One query's rendered debug identity. Build via `QuerySession::tag`.
 #[derive(Debug, Clone)]
 pub struct QueryTag {
     query_id: String,
@@ -96,7 +96,7 @@ pub struct QueryTag {
 impl QueryTag {
     /// Record which partition (1-based) of how many this query covers, for parallel/keyset
     /// or ctid-split scans. Omitted from the rendered comment for unpartitioned queries.
-    pub fn with_partition(mut self, index_one_based: usize, total: usize) -> Self {
+    pub(crate) fn with_partition(mut self, index_one_based: usize, total: usize) -> Self {
         self.partition = Some((index_one_based, total));
         self
     }
@@ -106,7 +106,7 @@ impl QueryTag {
     /// short config identifier already sanitized in [`QuerySession::new`] — never raw user
     /// input — but `sanitize` runs again defensively so a surprising config value (an
     /// `application_name` containing `*/`) can never break out of the comment early.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut out = format!(
             "/* rust-extract query_id={} pipeline={} run_id={} strategy={}",
             sanitize(&self.query_id),
@@ -136,7 +136,7 @@ fn short_id() -> String {
 /// A fresh, correctly-prefixed run id string, for callers that need to generate one to
 /// pass around (e.g. across a serialization boundary) before a [`QuerySession`] exists —
 /// see `PostgresExecutionPlan::try_new`'s `run_id` parameter.
-pub fn fresh_run_id() -> String {
+pub(crate) fn fresh_run_id() -> String {
     format!("r_{}", short_id())
 }
 
@@ -177,15 +177,6 @@ mod tests {
             "two calls must not render identically (query_id must differ)"
         );
         assert!(a.contains("run_id=r_fixed") && b.contains("run_id=r_fixed"));
-    }
-
-    #[test]
-    fn test_for_run_uses_the_given_uuid_not_a_random_one() {
-        let run_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
-        let session = QuerySession::for_run("p", run_id);
-        // First 8 hex chars of the simple (no-dashes) representation, deterministically --
-        // not a freshly generated random id.
-        assert_eq!(session.run_id(), "r_11111111");
     }
 
     #[test]

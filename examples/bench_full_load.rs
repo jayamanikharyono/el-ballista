@@ -33,7 +33,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::distributed::DistributedContext;
+use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
 
     let t_scan = Instant::now();
+    let t_start_epoch_ms = epoch_ms();
     let mut stream = df.execute_stream().await?;
     let mut rows = 0usize;
     let mut n_batches = 0usize;
@@ -132,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     writer.close()?;
     let elapsed_ms = t_scan.elapsed().as_millis();
+    let t_end_epoch_ms = epoch_ms();
     // scan_ms = everything that is not pure Parquet encode (scan, transport, planning);
     // write_ms = cumulative encode time. They partition elapsed by construction.
     let write_ms = write_ns / 1_000_000;
@@ -156,10 +158,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "scan_ms": scan_ms,
             "write_ms": write_ms,
             "elapsed_ms": scan_ms + write_ms,
+            // Timed-section bounds (wall clock, epoch ms): run.sh restricts CPU/memory
+            // statistics to this window so they describe the same work as elapsed_ms.
+            "t_start_epoch_ms": t_start_epoch_ms,
+            "t_end_epoch_ms": t_end_epoch_ms,
+            // Exact cgroup memory high-water mark of this container (includes page cache;
+            // the figure a --memory limit / OOM kill applies to). Null outside cgroup v2.
+            "mem_peak_bytes": cgroup_memory_peak(),
             "output_bytes": output_bytes,
             "output": output_path,
         })
     );
 
     Ok(())
+}
+
+/// Wall clock in epoch milliseconds (0 if the clock is before 1970).
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// `/sys/fs/cgroup/memory.peak` of this container (cgroup v2, kernel >= 5.19), if readable.
+fn cgroup_memory_peak() -> Option<u64> {
+    std::fs::read_to_string("/sys/fs/cgroup/memory.peak")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
 }

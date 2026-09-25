@@ -11,54 +11,50 @@ Detailed implementation: **[PostgreSQL](postgres.md)**.
 
 The implementation does not have a separate `Source` trait hierarchy. Instead, each connector
 implements DataFusion's `TableProvider` and `ExecutionPlan` directly, plus these supporting
-abstractions in `src/connector/`:
+abstractions (see `src/connector/mod.rs` for the contract):
 
 ```rust
-/// Capability declaration surfaced to the planner
-pub struct SourceCapabilities {
-    pub filter_pushdown: bool,
-    pub projection_pushdown: bool,
-    pub limit_pushdown: bool,
-    pub parallel_scan: ParallelScan,      // None | KeysetRange | CtidRange
-}
-```
-
-```rust
-/// Per-connector dialect: quoting, placeholders, and fidelity rules
-/// (`src/pushdown/dialect.rs`; implemented per backend)
+/// Rendering conventions for the pushdown IR (`src/pushdown/dialect.rs`; implemented per
+/// backend: `connector::postgres::dialect::PostgresDialect`, `connector::mysql::MysqlDialect`).
 pub trait SqlDialect: Send + Sync {
     fn quote_ident(&self, name: &str) -> String;
     fn placeholder(&self, param_index: usize) -> String;   // "$1" for pg, "?" for MySQL
-    fn column_literal_fidelity(
-        &self,
-        column: &ColumnMetadata,
-        literal_is_text: bool,
-        literal_is_float: bool,
-    ) -> Fidelity; // Exact | Inexact
-    fn column_column_fidelity(
-        &self,
-        left_column: &ColumnMetadata,
-        right_column: &ColumnMetadata,
-    ) -> Fidelity;
+    fn cast_type_name(&self, to: CastType) -> &'static str;
+    fn collation_name(&self, collation: Collation) -> &'static str; // Binary -> "\"C\"" on pg
 }
 ```
+
+Fidelity (`Exact` / `Inexact` / not pushable) is **not** a dialect method: it is decided once,
+during translation (`pushdown::translate`), from the engine-neutral `pushdown::ColumnKind` each
+connector assigns to its columns ([pushdown](../pushdown.md)). Literals never reach SQL text:
+`Predicate::render_to` hands them to a backend `SqlSink` (Postgres: `PgParamSink`) that binds them.
+
+- `pushdown::stats::TableStatsSource` — table/column statistics and index metadata for the cost
+  model (Postgres implementation: `connector::postgres::stats`, over `pg_class`/`pg_stats`/`pg_index`).
+- `SourceDescriptor` — identifies one budgeted source pool per process without carrying a
+  password (only the env-var name).
+- `checkpoint::CheckpointStore` — split-execution state, keyed by `JobId`:
 
 ```rust
-/// Checkpoint store abstraction
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
-    async fn begin(&self, key: &JobKey, split_ids: &[String]) -> Result<JobCheckpoint, AppError>;
-    async fn mark_running(&self, key: &JobKey, split_id: &str) -> Result<(), AppError>;
-    async fn mark_completed(&self, key: &JobKey, split_id: &str, rows_extracted: u64) -> Result<(), AppError>;
-    async fn mark_failed(&self, key: &JobKey, split_id: &str, err: &str) -> Result<(), AppError>;
-    async fn read(&self, key: &JobKey) -> Result<Option<JobCheckpoint>, AppError>;
+    async fn begin(&self, key: &JobId, plan: &SplitPlan) -> Result<JobCheckpoint, CheckpointError>;
+    async fn mark_running(&self, key: &JobId, split_id: &str) -> Result<(), CheckpointError>;
+    async fn mark_completed(&self, key: &JobId, split_id: &str, rows_extracted: u64) -> Result<(), CheckpointError>;
+    async fn mark_failed(&self, key: &JobId, split_id: &str, err: &str) -> Result<(), CheckpointError>;
+    async fn read(&self, key: &JobId) -> Result<Option<JobCheckpoint>, CheckpointError>;
+    async fn reset(&self, key: &JobId) -> Result<(), CheckpointError>;
 }
 ```
 
-The PostgreSQL connector implements `TableProvider` (for `scan`/`supports_filters`) and
-`ExecutionPlan` (streaming `RecordBatch` via `sqlx::query().fetch()`). There is no separate
-`Source` / `SourceTable` trait hierarchy — the SPI is DataFusion's native traits plus the
-abstractions above.
+`begin` binds the checkpoint to the plan (a fingerprint of table, projection, resolved filters,
+strategy, partitions and partition column, plus the stored split bounds): resuming with a
+different plan is a `CheckpointError::PlanMismatch`.
+
+The PostgreSQL connector implements `TableProvider` (`supports_filters_pushdown` + `scan`) and
+`ExecutionPlan` (`PostgresExecutionPlan`, streaming `RecordBatch`es from a `DECLARE … CURSOR` /
+`FETCH` loop or a binary `COPY`). A `SourceConnector` trait sketch exists in
+`src/connector/mod.rs` but nothing uses it yet ([connector-abstraction](../connector-abstraction.md)).
 
 ---
 
@@ -75,17 +71,27 @@ abstractions above.
 
 ## 3. Decoding to Arrow
 
-The PostgreSQL connector uses `sqlx` text protocol. Rows arrive as `sqlx::Row` values (an
-intermediate representation) which are then decoded into Arrow array builders:
+The PostgreSQL connector reads the **binary** wire format on both scan paths: sqlx requests
+binary results for every extended-protocol statement (the cursor `FETCH`es included), and
+`COPY (SELECT …) TO STDOUT (FORMAT BINARY)` frames the same per-type binary encodings. One
+decoder per column, chosen once per scan from the mapped Arrow type, appends each value's bytes
+straight into that column's Arrow builder (`connector::postgres::row_adapter`):
 
 ```
-text wire ──► sqlx::Row ──► per-column ArrayBuilder ──► RecordBatch (batch_size rows) ──► stream
+cursor: FETCH (binary) ──► PgRow raw value bytes ─┐
+                                                    ├─► per-column decoder ─► ArrayBuilder ─► RecordBatch ─► stream
+COPY:   binary COPY frames ──► field bytes ────────┘
 ```
 
-Builders are pre-sized from `batch_size` (default 8192) and, for variable-length columns,
-from an observed average width that adapts across batches. Batches are emitted as soon as
-`batch_size` rows are filled — never at the end of the result set — which is what makes
-backpressure work end to end (see [architecture](../architecture.md#5-execution-and-memory)).
+On the cursor path each row still passes through sqlx's `PgRow` (a driver-side row buffer), so
+"no intermediate row struct" holds for the Arrow side, not the driver side. `json`, `jsonb`,
+`uuid` and enum columns are selected as `::text` and arrive as Postgres' own text rendering.
+A batch is flushed when it reaches `batch_size` rows **or** `max_batch_bytes` bytes — never
+only at the end of the result set — which is what makes backpressure work end to end (see
+[architecture](../architecture.md#5-execution-and-memory)).
+
+The MySQL prototype selects raw columns and decodes them into typed builders
+(`connector::mysql::row_adapter`); see [mysql.md](mysql.md).
 
 ---
 
@@ -100,17 +106,18 @@ Three rules apply to both dialects:
 
 2. **Never widen silently to `Utf8`.** Falling back to a string for anything unrecognized produces
    a pipeline that "works" and a warehouse full of strings that nobody can aggregate. On Postgres
-   an unmapped type is an error at plan time, with an explicit per-column `cast_to` escape hatch
-   in the job spec for the cases where a string genuinely is the right answer. **NOT YET
-   IMPLEMENTED** for the `cast_to` hatch — and the MySQL prototype currently violates this rule
-   (unknown types fall back to `Utf8`; see [mysql.md](mysql.md)), which must be fixed when the
-   prototype is promoted.
+   an unmapped type is an `UnsupportedType` error before the scan starts. A per-column `cast_to`
+   escape hatch in the job spec is **NOT IMPLEMENTED** — and the MySQL prototype currently
+   violates this rule (types outside its mapping table fall back to `Utf8`; see
+   [mysql.md](mysql.md)), which must be fixed when the prototype is promoted.
 
-3. **Unrepresentable values become null, loudly.** Postgres `timestamp 'infinity'`, and a `NUMERIC`
-   exceeding the declared decimal precision have no Arrow representation. Each maps to null *and*
-   increments `rel_null_coerced_total{column, reason}`. A configurable
-   `on_unrepresentable = "error" | "null"` lets strict pipelines fail instead. **NOT YET
-   IMPLEMENTED** for the configurable hatch.
+3. **Unrepresentable values are errors, never silent nulls or truncation.** Postgres
+   `timestamp`/`date` `±infinity`, numeric `NaN`/`±Infinity`, and numeric digits beyond the
+   column's `Decimal128` precision or scale (unconstrained `numeric` maps to
+   `Decimal128(38, 10)`) fail the scan with `ExtractorError::UnsupportedValue` naming the
+   column, on both the cursor and the COPY path. A configurable
+   `on_unrepresentable = "error" | "null"` (with a `rel_null_coerced_total` counter) is **NOT
+   IMPLEMENTED**.
 
 Per-dialect mapping tables live in each connector document.
 
@@ -123,7 +130,7 @@ production database. It is off by default and opt-in per job.
 
 | Strategy | Mechanism | Notes |
 | --- | --- | --- |
-| `keyset` | `pk >= :a AND pk < :b`, bounds from min/max or histogram percentiles | Works everywhere; skewed if the key is not uniform. Histogram-derived bounds fix most skew. |
+| `keyset` | `pk >= :a AND pk < :b`, bounds split evenly over `[MIN(pk), MAX(pk)]` (first partition also takes `pk IS NULL`, last is open-ended) | Works everywhere; skewed if the key is not uniform. Histogram-derived bounds are **not implemented**. Postgres only today (the MySQL prototype is serial). |
 | `ctid` | Postgres `ctid` ranges over `relpages` | Fastest and evenly sized; only valid within one snapshot. Postgres only. **Exported snapshots not implemented.** |
 | `modulo` | `hash(pk) % n = i` | **NOT IMPLEMENTED** |
 | `native` | one partition per declarative table partition | **NOT IMPLEMENTED** |
@@ -141,12 +148,13 @@ production incident:
 
 - **`statement_timeout` is always set.** A query that has run for twenty minutes is a bug, not a
   slow query.
-- **Idle-in-transaction timeout is always set.** A forgotten open transaction blocks Postgres
-  autovacuum and pins undo log on other engines.
+- **Idle-in-transaction timeout is always set** (Postgres). A forgotten open transaction blocks
+  Postgres autovacuum and pins undo log on other engines.
 - **Connections are identifiable.** `application_name` / connection attributes carry the job id, so
   a DBA looking at `pg_stat_activity` or `performance_schema` can attribute every query.
-- **Session settings are explicit.** UTC time zone, UTF-8 client encoding, read-only where supported.
-  Never inherit a server default that could change underneath the pipeline.
+- **Session settings are explicit.** Postgres pools set `TIME ZONE 'UTC'`, `statement_timeout`,
+  `idle_in_transaction_session_timeout = '60s'` and `lock_timeout = '5s'` on every connection.
+  Read-only transactions are **not** set yet (the scans only `SELECT`/`COPY TO`).
 - **Failures are recorded per split, retry is orchestrator-driven.** A failed split is marked
   `Failed` with its error without touching completed splits; re-running the job skips
   completed splits and retries the rest. There is no in-layer retry-with-backoff and no

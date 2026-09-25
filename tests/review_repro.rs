@@ -1,15 +1,15 @@
 //! Reproductions for `claude/comprehensive-review-2026-09-24.md`.
 //!
-//! Every test asserts the **correct** behaviour, so a FAILING test means the finding is
-//! CONFIRMED and a passing test means it is not (or no longer) reproducible.
+//! Every test asserts the **correct** behaviour. All findings are fixed, so every test passes:
+//! a passing test means the finding is FIXED, a failing one means its fix REGRESSED.
 //! Test names carry the finding id from the review (b1_, b2_, c3_, ...).
 //!
 //! Oracles (AGENTS.md §7): differential = same SQL with pushdown policy `always` vs `never`;
 //! reference = direct SQL against the source; trivial = hand-written expected value.
 //!
-//! Self-contained on purpose: it does NOT use `tests/common` because `TestDb::drop` can
-//! deadlock (review finding B6). Each test creates its own schema / database and removes it
-//! with an explicit async cleanup.
+//! Self-contained on purpose: it does NOT use `tests/common` because `TestDb::drop` could
+//! deadlock when these were written (review finding B6, since fixed). Each test creates its
+//! own schema / database and removes it with an explicit async cleanup.
 //!
 //! Needs the compose stack: `docker compose -f tests/docker/compose.yaml up -d --wait`
 //! Run: `cargo test --test review_repro -- --test-threads=1`
@@ -18,16 +18,20 @@
 use arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
+use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
+use rust_ballista_extraction_layer::checkpoint::{CheckpointError, CheckpointStore};
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
-    ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
+    ParallelScanConfig, PushdownConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
 use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
+use rust_ballista_extraction_layer::errors::AppError;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 type R = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -75,8 +79,14 @@ impl Pg {
     async fn new(setup: &[&str]) -> Pg {
         let url = pg_url();
         let (host, port, user, password, database) = parse_pg(&url);
-        // SAFETY: tests are run with --test-threads=1; the value never changes.
-        unsafe { std::env::set_var(PW_ENV, &password) };
+        // Set once per process, before any connector reads it (T-6: no repeated env
+        // mutation while other threads may be reading the environment).
+        static PASSWORD_ONCE: std::sync::Once = std::sync::Once::new();
+        PASSWORD_ONCE.call_once(|| {
+            // SAFETY: runs once, at the first fixture creation, before this process starts
+            // any connector work that reads the variable.
+            unsafe { std::env::set_var(PW_ENV, &password) };
+        });
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
@@ -134,7 +144,7 @@ impl Pg {
 
     fn job(&self, table: &str) -> JobConfig {
         JobConfig {
-            job_id: format!("review-{}-{}", self.schema, table),
+            job_id: format!("review-{}-{}", self.schema, table).parse().unwrap(),
             table: table.to_string(),
             columns: None,
             filters: Vec::new(),
@@ -148,9 +158,6 @@ impl Pg {
                 statement_timeout_ms: 60_000,
                 application_name: "review-repro".to_string(),
                 schema: self.schema.clone(),
-            },
-            sink: SinkConfig {
-                path: "/tmp/review_repro_sink".to_string(),
             },
             checkpoint: CheckpointConfig {
                 dir: std::env::temp_dir()
@@ -172,7 +179,7 @@ impl Pg {
     /// `SELECT id FROM <table> WHERE <filter>` through DataFusion with the given pushdown policy.
     async fn ids_where(&self, table: &str, policy: &str, filter: &str) -> Result<Vec<i64>, String> {
         let mut cfg = self.job(table);
-        cfg.pushdown.policy = policy.to_string();
+        cfg.pushdown.policy = policy.parse().unwrap();
         let ctx = DistributedContext::standalone(&cfg, 1)
             .await
             .map_err(|e| e.to_string())?;
@@ -272,6 +279,8 @@ async fn b1_negative_zero_float_range_loses_rows() -> R {
 async fn b5_not_is_null_rendered_sql_has_wrong_precedence() -> R {
     use datafusion::prelude::col;
     use rust_ballista_extraction_layer::pushdown::translate;
+    // `render_inline` (Postgres inline SQL) moved to the Postgres connector (review A1).
+    use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
     let pg = Pg::new(&[
         "CREATE TABLE $S.t (id bigint PRIMARY KEY, flag boolean)",
         "INSERT INTO $S.t VALUES (1,true),(2,false),(3,NULL)",
@@ -340,6 +349,24 @@ async fn c5_uuid_equality_fails_when_pushed() -> R {
 // B2 — checkpoint not tied to the filter that produced it
 // ---------------------------------------------------------------------------------------
 
+/// The checkpointed terminal (`run_with`) with a consumer that counts what it receives.
+/// (`run()` is a checkpoint-free diagnostic since B3, so it cannot reproduce B2.)
+async fn delivered_rows(c: JobConfig) -> Result<u64, AppError> {
+    let delivered = AtomicU64::new(0);
+    let delivered = &delivered;
+    PostgresConnector::from_config(c)?
+        .extract()
+        .standalone()
+        .run_with(move |_split, mut stream| async move {
+            while let Some(batch) = stream.try_next().await? {
+                delivered.fetch_add(batch.num_rows() as u64, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(delivered.load(Ordering::SeqCst))
+}
+
 #[tokio::test]
 async fn b2_rerun_with_different_filter_is_skipped() -> R {
     let pg = Pg::new(&[
@@ -349,31 +376,34 @@ async fn b2_rerun_with_different_filter_is_skipped() -> R {
     .await;
     let mk = |f: &str| {
         let mut c = pg.job("t");
-        c.job_id = format!("review-b2-{}", pg.schema); // same job, as an orchestrator would reuse it
+        // same job, as an orchestrator would reuse it
+        c.job_id = format!("review-b2-{}", pg.schema).parse().unwrap();
         c.filters = vec![FilterEntry::Single(FilterInput::Shorthand(f.to_string()))];
         c
     };
-    let first = PostgresConnector::from_config(mk("id>8"))
-        .extract()
-        .standalone()
-        .run()
-        .await?;
-    let second = PostgresConnector::from_config(mk("id>2"))
-        .extract()
-        .standalone()
-        .run()
-        .await?;
+    let first = delivered_rows(mk("id>8")).await?;
+    let second = delivered_rows(mk("id>2")).await;
     let sql = format!("SELECT count(*) FROM {}.t WHERE id > 2", pg.schema);
     let (expected,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .fetch_one(&pg.pool)
         .await?;
-    println!(
-        "  run 1 (id>8): {} rows; run 2 (id>2): {} rows; source says {expected}",
-        first.rows_extracted, second.rows_extracted
-    );
+    // The only acceptable outcomes: the second run delivers exactly the new range, or it
+    // refuses with a typed plan-mismatch error — never "already completed" with run 1's rows.
+    let second = match second {
+        Ok(rows) => rows,
+        Err(AppError::Checkpoint(CheckpointError::PlanMismatch { .. })) => {
+            println!("  run 2 refused: plan mismatch (correct); resetting and re-running");
+            let c = mk("id>2");
+            let store = JsonCheckpointStore::new(&c.checkpoint.dir)?;
+            store.reset(&c.job_id).await?;
+            delivered_rows(c).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    println!("  run 1 (id>8): {first} rows; run 2 (id>2): {second} rows; source says {expected}");
     pg.cleanup().await;
     assert_eq!(
-        second.rows_extracted as i64, expected,
+        second as i64, expected,
         "second run reused the first run's completed split"
     );
     Ok(())
@@ -458,11 +488,12 @@ async fn b4_neg_infinity_timestamp_copy_path_is_not_garbage() -> R {
 async fn keyset_count(pg: &Pg, column: &str) -> Result<usize, String> {
     let mut c = pg.job("t");
     c.parallel_scan = ParallelScanConfig {
-        strategy: "keyset".to_string(),
+        strategy: "keyset".parse().unwrap(),
         partitions: 2,
         partition_column: column.to_string(),
     };
     let batches = PostgresConnector::from_config(c)
+        .map_err(|e| e.to_string())?
         .extract()
         .standalone()
         .collect()
@@ -582,6 +613,7 @@ async fn c8_projection_typo_is_an_error() -> R {
     let mut c = pg.job("t");
     c.columns = Some(vec!["id".to_string(), "nmae".to_string()]);
     let r = PostgresConnector::from_config(c)
+        .expect("valid job config")
         .extract()
         .standalone()
         .collect()
@@ -615,11 +647,12 @@ async fn r4_batch_size_zero_is_rejected_not_zero_rows() -> R {
     let mut c = pg.job("t");
     c.execution.batch_size = 0;
     c.execution.use_copy = false;
-    let r = PostgresConnector::from_config(c)
-        .extract()
-        .standalone()
-        .run()
-        .await;
+    // Rejected either when the connector is built (config validation) or at run time —
+    // never a "successful" run with zero rows.
+    let r = match PostgresConnector::from_config(c) {
+        Ok(connector) => connector.extract().standalone().run().await,
+        Err(e) => Err(e),
+    };
     pg.cleanup().await;
     match r {
         Err(e) => {

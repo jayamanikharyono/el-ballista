@@ -76,6 +76,7 @@ def main():
     assert bounds["lo"] is not None, "benchmark table is empty"
 
     t0 = time.time()
+    t_start_epoch_ms = int(t0 * 1000)
     df = spark.read.jdbc(
         url,
         table,
@@ -91,7 +92,8 @@ def main():
         df = df.filter(filt)
     df.write.mode("overwrite").option("compression", "snappy").parquet(output)
     rows = spark.read.parquet(output).count()
-    elapsed_ms = int((time.time() - t0) * 1000)
+    t_end = time.time()
+    elapsed_ms = int((t_end - t0) * 1000)
 
     print(
         json.dumps(
@@ -104,12 +106,26 @@ def main():
                 "partitions": partitions,
                 "rows": rows,
                 "elapsed_ms": elapsed_ms,
+                # Timed-section bounds (epoch ms): run.sh restricts CPU/memory stats to it.
+                "t_start_epoch_ms": t_start_epoch_ms,
+                "t_end_epoch_ms": int(t_end * 1000),
+                # Exact cgroup high-water mark of this container (includes page cache).
+                "mem_peak_bytes": cgroup_memory_peak(),
                 "output_bytes": output_bytes(output),
                 "output": output,
             }
         )
     )
     spark.stop()
+
+
+def cgroup_memory_peak():
+    """/sys/fs/cgroup/memory.peak of this container (cgroup v2), or None."""
+    try:
+        with open("/sys/fs/cgroup/memory.peak") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 if __name__ == "__main__":

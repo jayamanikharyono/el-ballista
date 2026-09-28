@@ -11,7 +11,8 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run --example filtered_extraction
+//! cargo run --example filtered_extraction -- [config.json]
+//! # default: examples/configs/extract.example.json
 //! ```
 
 use el_ballista::config::JobConfig;
@@ -35,7 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   { "column": "payment_date", "op": ">=", "value": "2007-04-06T00:00:00Z" }
     // No watermark state, no backfill orchestration — just filters.
     println!("► Step 1: Job spec + caller-provided filters");
-    let config = JobConfig::from_file("examples/configs/extract.example.json")?;
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "examples/configs/extract.example.json".to_string());
+    let config = JobConfig::from_file(&config_path)?;
     println!("  Table: {}", config.resolved_table());
     println!("  Filters: {} (decisions below)", config.filters.len());
 

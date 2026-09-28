@@ -63,6 +63,10 @@ All of them read `public.payment` on `localhost:5432/test`:
 Suggested path: `full` → `filtered` → `pipeline` → `parquet_export` → `dataframe` → `parallel` →
 `distributed`. `bench_full_load` is the benchmark harness, not a demo.
 
+To run all of them in one go and check each one's output, use `scripts/examples.sh`. It starts
+the demo Postgres and, for the distributed examples, a local scheduler with two workers, and
+prints a PASS/FAIL summary (`--no-db` to use a Postgres you already run, `--help` for the rest).
+
 ### 1. `full_extraction`: the basic contract, DB → Arrow
 
 ```bash
@@ -221,6 +225,7 @@ cargo test --lib                                           # unit tests, no data
 docker compose -f tests/docker/compose.yaml up -d --wait   # the same stack as the demo
 cargo test --tests -- --test-threads=1                     # every integration file
 cargo test --test pg_pushdown -- --test-threads=1          # or one file
+scripts/examples.sh                                        # every example, checked, PASS/FAIL summary
 cd benchmark && ./run.sh --skip-scale --repeat 1           # smoke benchmark (needs a >= 8-core Docker host)
 ```
 

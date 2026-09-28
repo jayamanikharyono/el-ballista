@@ -242,7 +242,7 @@ async fn my_pool() -> MySqlPool {
 }
 async fn pg_extractor() -> PostgresExtractor {
     let (h, p, u, pw, db) = parse(&pg_url(), 5432);
-    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "rbel-matrix")
+    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "el-ballista-matrix")
         .await
         .unwrap_or_else(|e| panic!("PostgresExtractor::connect: {e}"))
 }
@@ -566,7 +566,7 @@ async fn pg_filtered_extraction_matches_direct_sql() {
             database: db,
             pool_max: 4,
             statement_timeout_ms: 30_000,
-            application_name: "rbel-matrix".to_string(),
+            application_name: "el-ballista-matrix".to_string(),
             schema: "public".to_string(),
         },
         checkpoint: CheckpointConfig::default(),

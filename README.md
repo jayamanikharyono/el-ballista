@@ -273,6 +273,9 @@ job skips the splits already completed; for a fresh export use a new `job_id` or
 | `parallel_extraction` | Keyset partitioning across concurrent scans |
 | `distributed_extraction` | The same job on a Ballista cluster, streamed to Parquet |
 
+`scripts/examples.sh` runs every example (including the distributed ones and the benchmark
+harness) against the demo database and checks each one's output.
+
 Setup details, the job spec in 60 seconds and common errors: [`QUICKSTART.md`](QUICKSTART.md).
 
 ---

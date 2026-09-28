@@ -121,7 +121,7 @@ async fn my_pool() -> MySqlPool {
 
 async fn pg_extractor() -> PostgresExtractor {
     let (h, p, u, pw, db) = parse(&pg_url(), 5432);
-    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "rbel-cross-engine")
+    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "el-ballista-cross-engine")
         .await
         .unwrap_or_else(|e| panic!("PostgresExtractor::connect: {e}"))
 }

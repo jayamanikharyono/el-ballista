@@ -34,6 +34,10 @@ docker compose -f tests/docker/compose.yaml down -v
 ```
 
 - `scripts/e2e.sh` does steps 1 + 4 + teardown in one go (`cargo test --all -- --test-threads=1`).
+- `scripts/examples.sh` runs every example against the compose Postgres (plus a local scheduler
+  and two workers for the distributed ones), checks each one's output, and prints a PASS/FAIL
+  summary. Each run works in a fresh `target/examples-run/<timestamp>/`, so checkpointed
+  examples always start from zero.
 - Endpoints default to the compose services: Postgres
   `postgres://postgres:postgres@127.0.0.1:5432/test`, MySQL
   `mysql://root:password@127.0.0.1:3306/test`. `DATABASE_URL` / `MYSQL_URL` point the suites

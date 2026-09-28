@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Never hard-code credentials: the password comes from the environment.
     let password = std::env::var("PGPASSWORD")
-        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/app")?;
+        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/test (the dvdrental demo database)")?;
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Parallel Extraction Example");
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         5432,
         "postgres",
         &password,
-        "app",
+        "test",
         10, // Increased pool size for parallel extraction
         30000,
         "parallel_extraction_example",
@@ -55,11 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Define extraction parameters
     println!("\n► Step 2: Define extraction parameters");
-    let table_name = "public.orders";
+    let table_name = "public.payment";
     let schema_name = "public";
-    let table_name_only = "orders";
-    let columns = Some(vec!["order_id", "amount", "status", "updated_at"]);
-    let partition_column = "order_id";
+    let table_name_only = "payment";
+    let columns = Some(vec!["payment_id", "amount", "staff_id", "payment_date"]);
+    let partition_column = "payment_id";
     let num_partitions = 4;
 
     println!("  Table: {}", table_name);
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             5432,
             "postgres",
             &password,
-            "app",
+            "test",
             5,
             30000,
             &format!("parallel_extraction_p{}", partition_id),

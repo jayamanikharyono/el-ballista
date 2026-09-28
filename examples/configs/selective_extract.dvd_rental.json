@@ -1,19 +1,30 @@
 {
   "job_id": "dvd_rental_selective",
   "table": "payment",
-  "columns": ["payment_id", "customer_id", "staff_id", "rental_id", "amount", "payment_date"],
+  "columns": [
+    "payment_id",
+    "customer_id",
+    "staff_id",
+    "rental_id",
+    "amount",
+    "payment_date"
+  ],
   "filters": [
-    { "column": "amount", "op": ">", "value": 1 }
+    {
+      "column": "amount",
+      "op": ">",
+      "value": 1
+    }
   ],
   "source": {
     "host": "localhost",
     "port": 5432,
     "user": "postgres",
-    "password_env": "ORDERS_PG_PASSWORD",
+    "password_env": "PGPASSWORD",
     "database": "test",
     "pool_max": 8,
     "statement_timeout_ms": 300000,
-    "application_name": "rust-extract-dvd-rental-selective",
+    "application_name": "el-ballista-dvd-rental-selective",
     "schema": "public"
   },
   "checkpoint": {

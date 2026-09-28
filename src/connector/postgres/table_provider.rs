@@ -75,6 +75,10 @@ pub struct PostgresTableProviderModel {
     /// Pre-computed scan partitions (see `PostgresTableProvider::with_fixed_partitions`).
     #[serde(default)]
     pub fixed_partitions: Option<Vec<ScanPartition>>,
+    /// Run id every scan query of this run is tagged with (see `with_run_id`). `None` (and
+    /// old payloads): each `scan()` generates its own.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// Cost-model inputs cached by a provider. Swapped as a whole on refresh, so one decision
@@ -142,6 +146,9 @@ pub struct PostgresTableProvider {
     /// of computing bounds from the live table — how a resumed job re-scans the splits its
     /// checkpoint stored.
     fixed_partitions: Option<Vec<ScanPartition>>,
+    /// When set, every `scan()` tags its queries with this run id (the run report's), so a
+    /// run's queries and its report share one id. `None`: a fresh id per `scan()`.
+    run_id: Option<String>,
 }
 
 /// Best-effort statistics + index fetch. Missing statistics only make `cost_based`
@@ -284,6 +291,7 @@ impl PostgresTableProvider {
             partition_column: None,
             strategy: ParallelStrategy::None,
             fixed_partitions: None,
+            run_id: None,
         })
     }
 
@@ -329,6 +337,7 @@ impl PostgresTableProvider {
             partition_column: model.partition_column,
             strategy: model.strategy,
             fixed_partitions: model.fixed_partitions,
+            run_id: model.run_id,
         }
     }
 
@@ -351,6 +360,7 @@ impl PostgresTableProvider {
             enum_columns,
             server_utf8: self.server_utf8,
             fixed_partitions: self.fixed_partitions.clone(),
+            run_id: self.run_id.clone(),
         }
     }
 
@@ -437,6 +447,14 @@ impl PostgresTableProvider {
         self
     }
 
+    /// Tag every query this provider's scans issue with `run_id` instead of a fresh id per
+    /// scan — how a run's queries carry the same id as its run report.
+    #[must_use]
+    pub(crate) fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
     /// The catalog metadata of the whole table (every column), as discovered.
     pub(crate) fn table_metadata(&self) -> &TableMetadata {
         &self.table_metadata
@@ -470,6 +488,13 @@ impl PostgresTableProvider {
     /// cached EXPLAIN estimate. The EXPLAIN cache is read-only here: warming happens explicitly
     /// (`warm_explain`), and `scan` never re-decides, so a warm-up can only affect later plans.
     fn decide_explained(&self, expr: &Expr) -> (Decision, String) {
+        self.decide_explained_among(expr, &[])
+    }
+
+    /// [`Self::decide_explained`] for one filter of a set: `siblings` are the other filters'
+    /// translations (all ANDed with this one), so a range filter is estimated together with
+    /// the ranges on the same column — see [`CostInputs::siblings`].
+    fn decide_explained_among(&self, expr: &Expr, siblings: &[Predicate]) -> (Decision, String) {
         let Some((fidelity, predicate)) = self.translate_filter(expr) else {
             return (
                 Decision::Keep,
@@ -492,6 +517,7 @@ impl PostgresTableProvider {
             indexes: &snapshot.indexes,
             explain,
             column_kinds: &self.column_kinds,
+            siblings,
         };
         pushdown::decide_explained(
             fidelity,
@@ -503,8 +529,11 @@ impl PostgresTableProvider {
         )
     }
 
-    /// The single policy decision point for this provider: `supports_filters_pushdown` and
-    /// `rel plan --explain` both funnel through here. (`scan` does not re-decide — see there.)
+    /// The policy decision for one filter judged **alone** (translation fidelity × policy × cost
+    /// model). `supports_filters_pushdown` and `rel plan` decide the whole filter set instead
+    /// (see [`Self::explain_decisions`]): a range filter is estimated together with the other
+    /// ranges on its column there, so a lone half of a window can be kept here yet pushed as
+    /// part of the set. (`scan` does not re-decide — see there.)
     ///
     /// # Examples
     ///
@@ -524,8 +553,9 @@ impl PostgresTableProvider {
         self.decide_explained(expr).0
     }
 
-    /// Human-readable decision for `rel plan --explain`. Computed in the same call as the
-    /// verdict, so the explanation can never describe a different decision than the one taken.
+    /// Human-readable decision for one filter judged alone, computed in the same call as
+    /// [`Self::decide_cost`]'s verdict. For filters that run together, use
+    /// [`Self::explain_decisions`], which matches what `supports_filters_pushdown` decides.
     ///
     /// # Examples
     ///
@@ -539,19 +569,55 @@ impl PostgresTableProvider {
     /// # }
     /// ```
     pub fn explain_decision(&self, expr: &Expr) -> String {
-        match self.decide_explained(expr) {
-            (
-                Decision::Push {
-                    fidelity,
-                    predicate,
-                },
-                reason,
-            ) => format!(
-                "PUSH ({fidelity:?}; {reason}; {})",
-                predicate.render_inline()
-            ),
-            (Decision::Keep, reason) => format!("KEEP ({reason})"),
-        }
+        describe_decision(self.decide_explained(expr))
+    }
+
+    /// Decisions for a whole filter set, as DataFusion hands it to
+    /// [`TableProvider::supports_filters_pushdown`]: each filter is decided with the others
+    /// as siblings (see [`CostInputs::siblings`]), so the two sides of a range window share one
+    /// estimate. Same order as `filters`.
+    fn decide_all(&self, filters: &[&Expr]) -> Vec<(Decision, String)> {
+        let translated: Vec<Option<Predicate>> = filters
+            .iter()
+            .map(|f| self.translate_filter(f).map(|(_, p)| p))
+            .collect();
+        (0..filters.len())
+            .map(|i| {
+                let siblings: Vec<Predicate> = translated
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .filter_map(|(_, p)| p.clone())
+                    .collect();
+                self.decide_explained_among(filters[i], &siblings)
+            })
+            .collect()
+    }
+
+    /// Human-readable decisions for a filter set, in order — what
+    /// [`TableProvider::supports_filters_pushdown`] decides for the same set, with the reason.
+    /// Prefer this over calling [`Self::explain_decision`] per filter when the filters run
+    /// together: a range filter's estimate depends on the sibling ranges on its column.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
+    /// # fn demo(provider: PostgresTableProvider) {
+    /// use datafusion::prelude::{col, lit};
+    ///
+    /// let lo = col("id").gt_eq(lit(100i64));
+    /// let hi = col("id").lt(lit(200i64));
+    /// for reason in provider.explain_decisions(&[&lo, &hi]) {
+    ///     println!("{reason}");
+    /// }
+    /// # }
+    /// ```
+    pub fn explain_decisions(&self, filters: &[&Expr]) -> Vec<String> {
+        self.decide_all(filters)
+            .into_iter()
+            .map(describe_decision)
+            .collect()
     }
 
     /// Warm the EXPLAIN estimate cache for a set of filter expressions (best-effort; failures
@@ -611,6 +677,20 @@ impl PostgresTableProvider {
     }
 }
 
+/// `PUSH (<fidelity>; <reason>; <sql>)` or `KEEP (<reason>)` — the `rel plan` wording.
+fn describe_decision((decision, reason): (Decision, String)) -> String {
+    match decision {
+        Decision::Push {
+            fidelity,
+            predicate,
+        } => format!(
+            "PUSH ({fidelity:?}; {reason}; {})",
+            predicate.render_inline()
+        ),
+        Decision::Keep => format!("KEEP ({reason})"),
+    }
+}
+
 #[async_trait]
 impl TableProvider for PostgresTableProvider {
     fn schema(&self) -> Arc<Schema> {
@@ -621,16 +701,18 @@ impl TableProvider for PostgresTableProvider {
         TableType::Base
     }
 
-    /// docs/pushdown.md §1/§2 — per-filter `Exact`/`Inexact`/`Unsupported` decisions, using
-    /// [`Self::decide_cost`] (translation fidelity × policy × cost model).
+    /// docs/pushdown.md §1/§2 — per-filter `Exact`/`Inexact`/`Unsupported` decisions for the
+    /// whole set (translation fidelity × policy × cost model, each filter with the others as
+    /// siblings — see [`Self::explain_decisions`]).
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|f| {
-                let (outcome, pushdown) = match self.decide_cost(f) {
+        Ok(self
+            .decide_all(filters)
+            .into_iter()
+            .map(|(decision, _)| {
+                let (outcome, pushdown) = match decision {
                     Decision::Push {
                         fidelity: Fidelity::Exact,
                         ..
@@ -765,7 +847,9 @@ impl TableProvider for PostgresTableProvider {
             pushed_limit,
             self.batch_size,
             partitions,
-            crate::connector::query_tag::fresh_run_id(),
+            self.run_id
+                .clone()
+                .unwrap_or_else(crate::connector::query_tag::fresh_run_id),
         )
         .map(|plan| {
             plan.with_max_batch_bytes(self.max_batch_bytes)
@@ -777,9 +861,103 @@ impl TableProvider for PostgresTableProvider {
     }
 }
 
+/// Register the job's table in a plain DataFusion `SessionContext` — **pure DataFusion, no
+/// Ballista**: one process, one Tokio runtime (one worker thread per visible CPU), and the
+/// whole `pool_max` connection budget for this process. The table is registered under
+/// `config.table`, split into `parallel_scan.partitions` keyset partitions on
+/// `parallel_scan.partition_column`; DataFusion runs the partitions concurrently and the
+/// process-wide scan limiter keeps at most `pool_max` of them querying the source at once
+/// (the rest wait without holding a connection). Pushdown, projection, batch size and the
+/// COPY/cursor choice all follow the job config.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+/// use datafusion::prelude::SessionContext;
+/// use rust_ballista_extraction_layer::config::JobConfig;
+/// use rust_ballista_extraction_layer::connector::postgres::register_table;
+///
+/// let config = JobConfig::from_file("job.json")?;
+/// let ctx = SessionContext::new();
+/// register_table(&ctx, &config).await?;
+/// let df = ctx.sql(&format!("SELECT count(*) FROM {}", config.table)).await?;
+/// df.show().await?;
+/// # Ok(()) }
+/// ```
+pub async fn register_table(
+    ctx: &datafusion::prelude::SessionContext,
+    config: &crate::config::JobConfig,
+) -> Result<(), crate::errors::AppError> {
+    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
+    register_job_table(
+        ctx,
+        config,
+        descriptor,
+        1,
+        Some(config.parallel_scan.partition_column.clone()),
+        None,
+    )
+    .await
+}
+
+/// Shared by [`register_table`] (this process uses the whole budget) and the distributed
+/// context (`descriptor` budgets `pool_max / workers` per executor process).
+/// `default_partitions` is the partition count when `parallel_scan.partitions <= 1`.
+pub(crate) async fn register_job_table(
+    ctx: &datafusion::prelude::SessionContext,
+    config: &crate::config::JobConfig,
+    descriptor: PostgresConnectionDescriptor,
+    default_partitions: usize,
+    partition_column: Option<String>,
+    run_id: Option<&str>,
+) -> Result<(), crate::errors::AppError> {
+    let configured = config.parallel_scan.partitions;
+    let partitions = if configured > 1 {
+        configured
+    } else {
+        default_partitions.max(1)
+    };
+    log::info!(
+        "registering {}.{}: {} source connection(s) for this process ({} process(es) share \
+         pool_max = {}), {} scan partition(s)",
+        config.source.schema,
+        config.table,
+        descriptor.budgeted_max_connections(),
+        descriptor.expected_workers,
+        config.source.pool_max,
+        partitions,
+    );
+    let provider = PostgresTableProvider::new(
+        descriptor,
+        &config.resolved_table(),
+        config.pushdown.policy,
+        config.pushdown.deny.clone(),
+        config.pushdown.push.clone(),
+        CostParams {
+            max_source_cost: config.pushdown.max_source_cost,
+            keep_threshold: config.pushdown.keep_threshold,
+        },
+        config.pushdown.statistics_ttl_secs,
+        config.execution.batch_size,
+    )
+    .await?
+    .with_parallel_workers(partitions, partition_column)
+    .with_max_batch_bytes(config.execution.max_batch_bytes)
+    .with_use_copy(config.execution.use_copy)
+    .with_copy_statement_timeout_ms(config.execution.copy_statement_timeout_ms)
+    .with_parallel_strategy(config.parallel_scan.strategy);
+    let provider = match run_id {
+        Some(run_id) => provider.with_run_id(run_id),
+        None => provider,
+    };
+    ctx.register_table(&config.table, Arc::new(provider))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    /// T-6: tests never mutate the process environment (other test threads read it). The
+    /// Tests never mutate the process environment (other test threads read it). The
     /// providers here are lazy and never connect, so any always-present variable works as
     /// the password source.
     const ALWAYS_SET_ENV: &str = "PATH";
@@ -845,6 +1023,7 @@ mod tests {
             enum_columns: vec!["status".to_string()],
             server_utf8: true,
             fixed_partitions: None,
+            run_id: None,
         };
         PostgresTableProvider::from_model(schema, model)
     }
@@ -881,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_side_strict_scan_pushes_planned_filters() {
-        // C7: a provider decoded from a plan (no statistics) under `strict` used to re-run the
+        // A provider decoded from a plan (no statistics) under `strict` used to re-run the
         // policy in `scan`, get Keep, and fail every query. It must trust the filters the
         // planning client accepted and push them.
         let provider = test_provider(ALWAYS_SET_ENV, PushdownPolicy::Strict);

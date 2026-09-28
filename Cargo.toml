@@ -65,6 +65,10 @@ path = "examples/bench_full_load.rs"
 name = "pipeline_extraction"
 path = "examples/pipeline_extraction.rs"
 
+[[example]]
+name = "parquet_export"
+path = "examples/parquet_export.rs"
+
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Integration/e2e tests run against the Docker compose stack

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::checkpoint::CheckpointError;
 use crate::connector::errors::ExtractorError;
+use crate::run_report::RunReport;
 use crate::types::InvalidJobId;
 use datafusion::error::DataFusionError;
 use sqlx::Error as SqlxError;
@@ -97,6 +98,67 @@ pub enum AppError {
         total: usize,
         failures: Vec<SplitFailure>,
     },
+
+    /// A run that started (it held the job lock, or began a diagnostic scan) and then failed.
+    /// Wraps the underlying error (`source`) with the run's id and its report, so a caller or
+    /// orchestrator can find the record of the failed run. Match on [`AppError::underlying`]
+    /// to handle the failure itself.
+    #[error("run {run_id} of job '{job_id}' failed")]
+    RunFailed {
+        job_id: String,
+        run_id: String,
+        /// The run report file, when one was written.
+        report_path: Option<PathBuf>,
+        /// The run report (also present when report files are off).
+        report: Box<RunReport>,
+        #[source]
+        source: Box<AppError>,
+    },
+}
+
+impl AppError {
+    /// The error behind a [`AppError::RunFailed`] wrapper (recursively); any other error is
+    /// returned as is. Use it to match on what went wrong in a run.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_ballista_extraction_layer::errors::AppError;
+    ///
+    /// let err = AppError::Config("bad value".into());
+    /// assert!(matches!(err.underlying(), AppError::Config(_)));
+    /// assert!(err.run_id().is_none());
+    /// ```
+    pub fn underlying(&self) -> &AppError {
+        match self {
+            AppError::RunFailed { source, .. } => source.underlying(),
+            other => other,
+        }
+    }
+
+    /// The id of the failed run, for a [`AppError::RunFailed`].
+    pub fn run_id(&self) -> Option<&str> {
+        match self {
+            AppError::RunFailed { run_id, .. } => Some(run_id),
+            _ => None,
+        }
+    }
+
+    /// The report of the failed run, for a [`AppError::RunFailed`].
+    pub fn run_report(&self) -> Option<&RunReport> {
+        match self {
+            AppError::RunFailed { report, .. } => Some(report),
+            _ => None,
+        }
+    }
+
+    /// The report file of the failed run, when one was written.
+    pub fn run_report_path(&self) -> Option<&std::path::Path> {
+        match self {
+            AppError::RunFailed { report_path, .. } => report_path.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// One failed split inside [`AppError::SplitsFailed`].
@@ -166,6 +228,49 @@ pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_failed_wraps_the_cause_with_the_run() {
+        use crate::run_report::{PlanSummary, RunKind, RunMode};
+        let mut report = RunReport::start(
+            crate::types::JobId::new("j").unwrap(),
+            "r_1".into(),
+            RunKind::Checkpointed,
+            RunMode::Standalone,
+            PlanSummary {
+                fingerprint: None,
+                table: "public.t".into(),
+                columns: None,
+                filters: Vec::new(),
+                strategy: "none".into(),
+                partitions: 1,
+                partition_column: "id".into(),
+            },
+        );
+        report.finish(Some("configuration error: bad".into()));
+        let err = AppError::RunFailed {
+            job_id: "j".into(),
+            run_id: "r_1".into(),
+            report_path: Some(PathBuf::from("cp/runs/j/r_1.json")),
+            report: Box::new(report),
+            source: Box::new(AppError::Config("bad".into())),
+        };
+        assert!(matches!(err.underlying(), AppError::Config(_)));
+        assert_eq!(err.run_id(), Some("r_1"));
+        assert_eq!(
+            err.run_report_path(),
+            Some(std::path::Path::new("cp/runs/j/r_1.json"))
+        );
+        assert_eq!(err.run_report().map(|r| r.run_id.as_str()), Some("r_1"));
+        // The chain names the run, then the cause.
+        assert_eq!(
+            error_chain(&err),
+            vec![
+                "run r_1 of job 'j' failed".to_string(),
+                "configuration error: bad".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn chain_keeps_sources_and_skips_embedded_duplicates() {

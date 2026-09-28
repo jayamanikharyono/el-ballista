@@ -27,7 +27,8 @@ CREATE TABLE public.orders (
   updated_at timestamptz         NOT NULL DEFAULT now()
 );
 
--- The watermark column an incremental run ranges over.
+-- Benchmark fixture (`orders`), loaded into bench-pg by benchmark/run.sh.
+-- The time column filtered extractions range over.
 CREATE INDEX orders_updated_at_idx ON public.orders (updated_at);
 CREATE INDEX orders_user_id_idx    ON public.orders (user_id);
 -- Deliberately indexed so `status = 'PAID'` is a pushdown candidate the cost
@@ -35,7 +36,7 @@ CREATE INDEX orders_user_id_idx    ON public.orders (user_id);
 CREATE INDEX orders_status_idx     ON public.orders (status);
 CREATE INDEX users_updated_at_idx  ON public.users (updated_at);
 
--- Makes UPDATEs advance the watermark, so incremental runs pick them up.
+-- Keeps updated_at current on UPDATE.
 CREATE FUNCTION public.set_updated_at() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN

@@ -23,4 +23,4 @@ pub mod api;
 pub use api::{DEFAULT_SCHEDULER_URL, PostgresConnector};
 
 pub use extractor::PostgresExtractor;
-pub use table_provider::PostgresTableProvider;
+pub use table_provider::{PostgresTableProvider, register_table};

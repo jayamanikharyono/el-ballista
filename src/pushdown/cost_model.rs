@@ -9,8 +9,8 @@
 //! decides *whether it is worth it*, never *whether it is correct*.
 
 use crate::pushdown::explain::ExplainEstimate;
-use crate::pushdown::stats::{ColumnStats, SourceStatistics};
-use crate::pushdown::{CmpOp, Collation, ColumnKind, ColumnKinds, Predicate};
+use crate::pushdown::stats::{ColumnStats, SourceStatistics, ordinal};
+use crate::pushdown::{CmpOp, Collation, ColumnKind, ColumnKinds, Literal, Predicate};
 
 pub use crate::pushdown::stats::IndexInfo;
 
@@ -58,6 +58,11 @@ pub struct CostInputs<'a> {
     /// Column kinds, for index usability (a binary-collated text comparison can only use an
     /// index whose column collation is already byte-wise) and the `strict` primitive gate.
     pub column_kinds: &'a ColumnKinds,
+    /// The other translated filters of the same scan (they are ANDed with this one). A range
+    /// comparison is estimated together with the sibling ranges on the same column, so the
+    /// two halves of a window like `updated_at >= a` / `updated_at < b` are each judged by
+    /// the window's selectivity, not by one open-ended side. Empty = judge alone.
+    pub siblings: &'a [Predicate],
 }
 
 impl CostInputs<'_> {
@@ -103,12 +108,14 @@ pub(crate) fn decide_push(predicate: &Predicate, inputs: &CostInputs<'_>) -> Cos
         };
     }
 
-    let selectivity = estimate_selectivity_from_stats(predicate, inputs.stats);
+    let estimate = estimate_selectivity(predicate, inputs.stats, inputs.siblings);
+    let selectivity = estimate.value;
+    let basis = estimate.describe_basis();
 
     if selectivity >= inputs.params.keep_threshold {
         return CostDecision::Keep {
             reason: format!(
-                "selectivity too high: {:.2}% >= {:.2}%",
+                "selectivity too high: {:.2}%{basis} >= {:.2}%",
                 selectivity * 100.0,
                 inputs.params.keep_threshold * 100.0
             ),
@@ -117,9 +124,7 @@ pub(crate) fn decide_push(predicate: &Predicate, inputs: &CostInputs<'_>) -> Cos
     }
 
     // A missing EXPLAIN cost is unknown, not free: fall back to the statistics heuristic.
-    let cost = inputs
-        .explain_cost()
-        .unwrap_or_else(|| estimate_source_cost(predicate, inputs.stats));
+    let cost = decision_cost(&estimate, inputs);
 
     if cost > inputs.params.max_source_cost {
         return CostDecision::Keep {
@@ -133,7 +138,7 @@ pub(crate) fn decide_push(predicate: &Predicate, inputs: &CostInputs<'_>) -> Cos
 
     CostDecision::Push {
         reason: format!(
-            "low selectivity ({:.2}%) and cost ({}) within budget ({})",
+            "low selectivity ({:.2}%{basis}) and cost ({}) within budget ({})",
             selectivity * 100.0,
             cost,
             inputs.params.max_source_cost
@@ -312,13 +317,328 @@ fn estimate_comparison_selectivity(
     }
 }
 
-/// Estimate source cost for a predicate.
-/// Simple heuristic: proportional to table size and selectivity.
-pub(crate) fn estimate_source_cost(predicate: &Predicate, stats: &SourceStatistics) -> u64 {
-    let selectivity = estimate_selectivity_from_stats(predicate, stats);
+/// Estimate source cost from a selectivity. Simple heuristic: table size in KB times the
+/// fraction of rows returned, at least 1.
+pub(crate) fn source_cost_for(selectivity: f64, stats: &SourceStatistics) -> u64 {
     let base_cost = stats.table_size_bytes / 1024; // Convert to KB
     let cost = (base_cost as f64 * selectivity) as u64;
     cost.max(1) // Minimum cost of 1
+}
+
+/// Default selectivity per bounded side for the share of a column that its most-common values
+/// do not cover, when the source has no histogram (the long-standing range default).
+const DEFAULT_RANGE_SELECTIVITY: f64 = 0.33;
+
+/// A selectivity estimate and what it was based on (for `rel plan` reasons).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SelectivityEstimate {
+    pub value: f64,
+    pub basis: EstimateBasis,
+}
+
+/// Where a [`SelectivityEstimate`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstimateBasis {
+    /// `n_distinct` / `null_frac` / fixed defaults — the per-predicate estimate.
+    Statistics,
+    /// The column's histogram and most-common values, over a range formed by `comparisons`
+    /// range comparisons (more than one when sibling filters on the same column joined in).
+    /// `most_common_only`: the source had no histogram, only most-common values (typical of a
+    /// low-cardinality date column).
+    Histogram {
+        comparisons: usize,
+        most_common_only: bool,
+    },
+}
+
+impl SelectivityEstimate {
+    /// A short suffix for decision reasons: empty for the plain statistics estimate.
+    pub(crate) fn describe_basis(&self) -> String {
+        let window = |n: usize| {
+            if n > 1 {
+                format!(", window of {n} range filters")
+            } else {
+                String::new()
+            }
+        };
+        match self.basis {
+            EstimateBasis::Statistics => String::new(),
+            EstimateBasis::Histogram {
+                comparisons,
+                most_common_only,
+            } => {
+                let source = if most_common_only {
+                    "most-common values"
+                } else {
+                    "histogram"
+                };
+                format!(" from {source}{}", window(comparisons))
+            }
+        }
+    }
+
+    /// Whether sibling filters joined this estimate into a window. The cost of such a filter
+    /// is the window's, so an `EXPLAIN` of the filter on its own (an open-ended half-range)
+    /// does not describe it.
+    pub(crate) fn is_window(&self) -> bool {
+        matches!(self.basis, EstimateBasis::Histogram { comparisons, .. } if comparisons > 1)
+    }
+}
+
+/// Source cost for a decision: the `EXPLAIN` estimate of the predicate when one is cached,
+/// except for a window estimate (see [`SelectivityEstimate::is_window`]), which — like a
+/// predicate without `EXPLAIN` — uses the table-size heuristic over its selectivity. That keeps
+/// both sides of a window on one cost, and `rel plan` (which warms `EXPLAIN`) in agreement with
+/// a first run (which has not).
+pub(crate) fn decision_cost(estimate: &SelectivityEstimate, inputs: &CostInputs<'_>) -> u64 {
+    let heuristic = || source_cost_for(estimate.value, inputs.stats);
+    if estimate.is_window() {
+        heuristic()
+    } else {
+        inputs.explain_cost().unwrap_or_else(heuristic)
+    }
+}
+
+/// Selectivity of `predicate`, refined for range comparisons on ordered columns (integer,
+/// timestamp, date):
+///
+/// - The predicate's own range comparisons on one column (a single `col < x`, or an `AND` of
+///   them) are joined with every range comparison on the same column among `siblings`, into
+///   one window `[lo, hi]` — the rows the source returns when the window is pushed.
+/// - With a histogram and/or most-common values, the window is estimated the way Postgres does
+///   it: the most-common values inside it, plus the histogram's share of the remaining rows
+///   (linear inside a bucket).
+/// - Without them (no statistics for the column, or none of its distribution), nothing changes:
+///   the plain per-predicate estimate. A window gets no discount from fixed factors, so a
+///   provider without the distribution keeps rather than pushes on a guess.
+///
+/// Everything else uses [`estimate_selectivity_from_stats`].
+pub(crate) fn estimate_selectivity(
+    predicate: &Predicate,
+    stats: &SourceStatistics,
+    siblings: &[Predicate],
+) -> SelectivityEstimate {
+    estimate_range(predicate, stats, siblings).unwrap_or_else(|| SelectivityEstimate {
+        value: estimate_selectivity_from_stats(predicate, stats),
+        basis: EstimateBasis::Statistics,
+    })
+}
+
+/// `column op literal` for a range comparison on a plain column, with the operator turned so
+/// the column is on the left (`5 < id` becomes `id > 5`). Equality and `<>` are not ranges.
+fn range_comparison(predicate: &Predicate) -> Option<(&str, CmpOp, &Literal)> {
+    let Predicate::Cmp { left, op, right } = predicate else {
+        return None;
+    };
+    let (column, op, literal) = match (left.as_ref(), right.as_ref()) {
+        (Predicate::Column(c), Predicate::Literal(l)) => (c, *op, l),
+        (Predicate::Literal(l), Predicate::Column(c)) => {
+            let flipped = match op {
+                CmpOp::Lt => CmpOp::Gt,
+                CmpOp::LtEq => CmpOp::GtEq,
+                CmpOp::Gt => CmpOp::Lt,
+                CmpOp::GtEq => CmpOp::LtEq,
+                CmpOp::Eq | CmpOp::NotEq => return None,
+            };
+            (c, flipped, l)
+        }
+        _ => return None,
+    };
+    matches!(op, CmpOp::Lt | CmpOp::LtEq | CmpOp::Gt | CmpOp::GtEq).then_some((
+        column.as_str(),
+        op,
+        literal,
+    ))
+}
+
+/// The range comparisons making up `predicate` when it is one range comparison or an `AND`
+/// tree of range comparisons on a single column; `None` for any other shape.
+fn range_leaves<'p>(
+    predicate: &'p Predicate,
+    out: &mut Vec<(&'p str, CmpOp, &'p Literal)>,
+) -> bool {
+    match predicate {
+        Predicate::And(l, r) => range_leaves(l, out) && range_leaves(r, out),
+        other => match range_comparison(other) {
+            Some(leaf) if out.first().is_none_or(|first| first.0 == leaf.0) => {
+                out.push(leaf);
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+/// One end of a range on a column's numeric axis.
+#[derive(Debug, Clone, Copy)]
+struct Bound {
+    at: f64,
+    inclusive: bool,
+}
+
+/// The intersection of range comparisons on one column.
+#[derive(Debug, Clone, Copy, Default)]
+struct Window {
+    lo: Option<Bound>,
+    hi: Option<Bound>,
+}
+
+impl Window {
+    /// Narrow the window by `column op at`.
+    fn tighten(&mut self, op: CmpOp, at: f64) {
+        let inclusive = matches!(op, CmpOp::LtEq | CmpOp::GtEq);
+        let bound = Bound { at, inclusive };
+        match op {
+            CmpOp::Gt | CmpOp::GtEq => {
+                // Keep the higher lower bound; at a tie the exclusive one is tighter.
+                let tighter = match self.lo {
+                    None => true,
+                    Some(lo) => at > lo.at || (at == lo.at && !inclusive),
+                };
+                if tighter {
+                    self.lo = Some(bound);
+                }
+            }
+            CmpOp::Lt | CmpOp::LtEq => {
+                let tighter = match self.hi {
+                    None => true,
+                    Some(hi) => at < hi.at || (at == hi.at && !inclusive),
+                };
+                if tighter {
+                    self.hi = Some(bound);
+                }
+            }
+            CmpOp::Eq | CmpOp::NotEq => {}
+        }
+    }
+
+    fn contains(&self, v: f64) -> bool {
+        let above_lo = self
+            .lo
+            .is_none_or(|lo| v > lo.at || (lo.inclusive && v == lo.at));
+        let below_hi = self
+            .hi
+            .is_none_or(|hi| v < hi.at || (hi.inclusive && v == hi.at));
+        above_lo && below_hi
+    }
+
+    fn bounded_sides(&self) -> i32 {
+        i32::from(self.lo.is_some()) + i32::from(self.hi.is_some())
+    }
+}
+
+fn estimate_range(
+    predicate: &Predicate,
+    stats: &SourceStatistics,
+    siblings: &[Predicate],
+) -> Option<SelectivityEstimate> {
+    let mut own = Vec::new();
+    if !range_leaves(predicate, &mut own) || own.is_empty() {
+        return None;
+    }
+    let column = own[0].0;
+    let col_stats = stats.columns.get(column)?;
+    let has_distribution =
+        col_stats.histogram_bounds.len() >= 2 || !col_stats.most_common_vals.is_empty();
+    if !has_distribution {
+        return None;
+    }
+
+    let mut window = Window::default();
+    let mut comparisons = 0;
+    for (_, op, literal) in &own {
+        window.tighten(*op, ordinal(literal)?);
+        comparisons += 1;
+    }
+    for sibling in siblings {
+        let mut leaves = Vec::new();
+        if range_leaves(sibling, &mut leaves) && leaves.first().is_some_and(|l| l.0 == column) {
+            for (_, op, literal) in leaves {
+                if let Some(at) = ordinal(literal) {
+                    window.tighten(op, at);
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+
+    let value = window_selectivity(col_stats, &window)?;
+    Some(SelectivityEstimate {
+        value,
+        basis: EstimateBasis::Histogram {
+            comparisons,
+            most_common_only: col_stats.histogram_bounds.len() < 2,
+        },
+    })
+}
+
+/// Share of the histogram population below `v`: `0` below the first bound, `1` above the
+/// last, linear inside the bucket that holds `v` (every bucket holds the same share).
+fn histogram_fraction_below(bounds: &[f64], v: f64) -> f64 {
+    let (first, last) = match (bounds.first(), bounds.last()) {
+        (Some(f), Some(l)) if bounds.len() >= 2 => (*f, *l),
+        _ => return 0.5,
+    };
+    if v <= first {
+        return 0.0;
+    }
+    if v >= last {
+        return 1.0;
+    }
+    // bounds[i] <= v < bounds[i + 1]
+    let i = bounds.partition_point(|b| *b <= v) - 1;
+    let (lo, hi) = (bounds[i], bounds[i + 1]);
+    let within = if hi > lo { (v - lo) / (hi - lo) } else { 0.5 };
+    (i as f64 + within) / (bounds.len() - 1) as f64
+}
+
+/// Selectivity of `window` from the column's most-common values and histogram, or `None`
+/// when the source has neither for the column. Postgres builds the histogram from the rows
+/// that are neither NULL nor a most-common value, so the two parts add up.
+fn window_selectivity(stats: &ColumnStats, window: &Window) -> Option<f64> {
+    let has_mcv = !stats.most_common_vals.is_empty()
+        && stats.most_common_vals.len() == stats.most_common_freqs.len();
+    let has_hist = stats.histogram_bounds.len() >= 2;
+    if !has_mcv && !has_hist {
+        return None;
+    }
+
+    let (mcv_total, mcv_inside) = if has_mcv {
+        stats
+            .most_common_vals
+            .iter()
+            .zip(&stats.most_common_freqs)
+            .fold((0.0, 0.0), |(total, inside), (v, f)| {
+                (
+                    total + f,
+                    if window.contains(*v) {
+                        inside + f
+                    } else {
+                        inside
+                    },
+                )
+            })
+    } else {
+        (0.0, 0.0)
+    };
+    let rest = (1.0 - f64::from(stats.null_frac) - mcv_total).max(0.0);
+
+    let hist_share = if has_hist {
+        let bounds = &stats.histogram_bounds;
+        let below_hi = window
+            .hi
+            .map_or(1.0, |hi| histogram_fraction_below(bounds, hi.at));
+        let below_lo = window
+            .lo
+            .map_or(0.0, |lo| histogram_fraction_below(bounds, lo.at));
+        (below_hi - below_lo).max(0.0)
+    } else {
+        // Only most-common values are known (typical for a low-cardinality date column): the
+        // rest, usually tiny, gets the default factor per bounded side.
+        DEFAULT_RANGE_SELECTIVITY.powi(window.bounded_sides())
+    };
+
+    Some((mcv_inside + rest * hist_share).clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -338,6 +658,7 @@ mod tests {
                     n_distinct,
                     null_frac: 0.0,
                     avg_width: 8,
+                    ..Default::default()
                 },
             );
         }
@@ -382,6 +703,7 @@ mod tests {
             indexes,
             explain: None,
             column_kinds: kinds,
+            siblings: &[],
         }
     }
 
@@ -647,6 +969,278 @@ mod tests {
             right: Box::new(Predicate::Literal(Literal::Text("PAID".to_string()))),
         };
         assert!((estimate_selectivity_from_stats(&p, &stats) - 0.2).abs() < 1e-9);
+    }
+
+    /// A timestamp comparison `column op <seconds since epoch>`.
+    fn ts_cmp(column: &str, op: CmpOp, secs: i64) -> Predicate {
+        Predicate::Cmp {
+            left: Box::new(Predicate::Column(column.to_string())),
+            op,
+            right: Box::new(Predicate::Literal(Literal::Timestamp(
+                chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            ))),
+        }
+    }
+
+    fn date_cmp(column: &str, op: CmpOp, days: i64) -> Predicate {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        Predicate::Cmp {
+            left: Box::new(Predicate::Column(column.to_string())),
+            op,
+            right: Box::new(Predicate::Literal(Literal::Date(
+                epoch + chrono::Duration::days(days),
+            ))),
+        }
+    }
+
+    /// Stats for a `ts` column spread uniformly over 100 days (histogram of 101 bounds, one
+    /// per day, no most-common values), a `d` date column whose 10 values are all
+    /// most-common (no histogram, 10% each), and an `n` column with statistics but no
+    /// distribution. 100 MB table.
+    fn distribution_stats() -> SourceStatistics {
+        const DAY: f64 = 86_400.0;
+        let mut columns = HashMap::new();
+        columns.insert(
+            "ts".to_string(),
+            ColumnStats {
+                column_name: "ts".to_string(),
+                n_distinct: 1_000_000.0,
+                histogram_bounds: (0..=100).map(|d| f64::from(d) * DAY).collect(),
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "d".to_string(),
+            ColumnStats {
+                column_name: "d".to_string(),
+                n_distinct: 10.0,
+                most_common_vals: (0..10).map(f64::from).collect(),
+                most_common_freqs: vec![0.1; 10],
+                ..Default::default()
+            },
+        );
+        columns.insert(
+            "n".to_string(),
+            ColumnStats {
+                column_name: "n".to_string(),
+                n_distinct: 1_000.0,
+                ..Default::default()
+            },
+        );
+        SourceStatistics {
+            table_name: "events".to_string(),
+            row_count_estimate: 1_000_000.0,
+            table_size_bytes: 100_000_000,
+            columns,
+            fetched_at: chrono::Utc::now(),
+        }
+    }
+
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn test_histogram_fraction_below() {
+        let bounds = [0.0, 10.0, 20.0, 40.0];
+        assert_eq!(histogram_fraction_below(&bounds, -5.0), 0.0);
+        assert_eq!(histogram_fraction_below(&bounds, 0.0), 0.0);
+        assert!((histogram_fraction_below(&bounds, 5.0) - 1.0 / 6.0).abs() < 1e-12);
+        assert!((histogram_fraction_below(&bounds, 10.0) - 1.0 / 3.0).abs() < 1e-12);
+        // Third bucket is wider: halfway through it is 2.5 of 3 buckets.
+        assert!((histogram_fraction_below(&bounds, 30.0) - 2.5 / 3.0).abs() < 1e-12);
+        assert_eq!(histogram_fraction_below(&bounds, 40.0), 1.0);
+        assert_eq!(histogram_fraction_below(&bounds, 99.0), 1.0);
+        // Repeated bounds (a heavy value) do not divide by zero.
+        let flat = [1.0, 1.0, 1.0, 2.0];
+        assert!(histogram_fraction_below(&flat, 1.5).is_finite());
+    }
+
+    #[test]
+    fn test_histogram_range_selectivity_one_side() {
+        let stats = distribution_stats();
+        // Last 25 of 100 days.
+        let est = estimate_selectivity(&ts_cmp("ts", CmpOp::GtEq, 75 * DAY), &stats, &[]);
+        assert!((est.value - 0.25).abs() < 1e-9, "{est:?}");
+        assert_eq!(
+            est.basis,
+            EstimateBasis::Histogram {
+                comparisons: 1,
+                most_common_only: false
+            }
+        );
+        // Literal on the left is the same range.
+        let flipped = Predicate::Cmp {
+            left: Box::new(Predicate::Literal(Literal::Timestamp(
+                chrono::DateTime::from_timestamp(75 * DAY, 0).unwrap(),
+            ))),
+            op: CmpOp::LtEq,
+            right: Box::new(Predicate::Column("ts".to_string())),
+        };
+        assert!((estimate_selectivity(&flipped, &stats, &[]).value - 0.25).abs() < 1e-9);
+        // Out of the histogram's range: nothing / everything.
+        assert_eq!(
+            estimate_selectivity(&ts_cmp("ts", CmpOp::Gt, 500 * DAY), &stats, &[]).value,
+            0.0
+        );
+        assert_eq!(
+            estimate_selectivity(&ts_cmp("ts", CmpOp::Lt, 500 * DAY), &stats, &[]).value,
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_window_with_sibling_filters() {
+        let stats = distribution_stats();
+        let lo = ts_cmp("ts", CmpOp::GtEq, 50 * DAY);
+        let hi = ts_cmp("ts", CmpOp::Lt, 51 * DAY);
+        // Alone, the lower bound keeps half the table...
+        assert!((estimate_selectivity(&lo, &stats, &[]).value - 0.5).abs() < 1e-9);
+        // ...judged with its sibling it is a one-day window: 1%.
+        let est = estimate_selectivity(&lo, &stats, std::slice::from_ref(&hi));
+        assert!((est.value - 0.01).abs() < 1e-9, "{est:?}");
+        assert_eq!(
+            est.basis,
+            EstimateBasis::Histogram {
+                comparisons: 2,
+                most_common_only: false
+            }
+        );
+        assert_eq!(
+            est.describe_basis(),
+            " from histogram, window of 2 range filters"
+        );
+        // Symmetric for the upper bound.
+        let est = estimate_selectivity(&hi, &stats, std::slice::from_ref(&lo));
+        assert!((est.value - 0.01).abs() < 1e-9);
+        // The same window as one AND predicate.
+        let and = Predicate::And(Box::new(lo.clone()), Box::new(hi.clone()));
+        assert!((estimate_selectivity(&and, &stats, &[]).value - 0.01).abs() < 1e-9);
+        // Siblings on other columns, equality siblings, and OR siblings are ignored.
+        let others = [
+            ts_cmp("other", CmpOp::Lt, 51 * DAY),
+            ts_cmp("ts", CmpOp::Eq, 51 * DAY),
+            Predicate::Or(Box::new(hi.clone()), Box::new(hi.clone())),
+        ];
+        assert!((estimate_selectivity(&lo, &stats, &others).value - 0.5).abs() < 1e-9);
+        // The tightest bound wins when several apply; an empty window is 0.
+        let tighter = ts_cmp("ts", CmpOp::GtEq, 50 * DAY + DAY / 2);
+        let est = estimate_selectivity(&lo, &stats, &[hi.clone(), tighter]);
+        assert!((est.value - 0.005).abs() < 1e-9);
+        let past = ts_cmp("ts", CmpOp::Lt, 10 * DAY);
+        assert_eq!(estimate_selectivity(&lo, &stats, &[past]).value, 0.0);
+    }
+
+    #[test]
+    fn test_most_common_values_window() {
+        let stats = distribution_stats();
+        // d in [3, 5): values 3 and 4 -> 20%.
+        let lo = date_cmp("d", CmpOp::GtEq, 3);
+        let hi = date_cmp("d", CmpOp::Lt, 5);
+        let est = estimate_selectivity(&lo, &stats, std::slice::from_ref(&hi));
+        assert!((est.value - 0.2).abs() < 1e-9, "{est:?}");
+        assert_eq!(
+            est.describe_basis(),
+            " from most-common values, window of 2 range filters"
+        );
+        // Inclusive vs exclusive bound on an exact most-common value.
+        let est = estimate_selectivity(&date_cmp("d", CmpOp::Gt, 8), &stats, &[]);
+        assert!((est.value - 0.1).abs() < 1e-9);
+        let est = estimate_selectivity(&date_cmp("d", CmpOp::GtEq, 8), &stats, &[]);
+        assert!((est.value - 0.2).abs() < 1e-9);
+        // A single day on a date column.
+        let est = estimate_selectivity(
+            &date_cmp("d", CmpOp::GtEq, 9),
+            &stats,
+            &[date_cmp("d", CmpOp::LtEq, 9)],
+        );
+        assert!((est.value - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_window_without_distribution_gets_no_discount() {
+        // Statistics but no histogram / most-common values (distribution query failed, or a
+        // type it does not cover): no push on fixed factors — the plain estimate, alone or not.
+        let stats = distribution_stats();
+        let lo = cmp("n", CmpOp::GtEq, 10);
+        let hi = cmp("n", CmpOp::Lt, 20);
+        let alone = estimate_selectivity(&lo, &stats, &[]);
+        let joint = estimate_selectivity(&lo, &stats, std::slice::from_ref(&hi));
+        assert_eq!(alone, joint);
+        assert_eq!(joint.basis, EstimateBasis::Statistics);
+        assert!((joint.value - DEFAULT_RANGE_SELECTIVITY).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_window_cost_ignores_explain_of_one_side() {
+        // A cached EXPLAIN of `ts >= a` alone costs the whole open-ended scan; the window's
+        // cost is the heuristic over the window, so plan preview and a cold run agree.
+        let stats = distribution_stats();
+        let params = CostParams::default();
+        let kinds = ColumnKinds::new();
+        let lo = ts_cmp("ts", CmpOp::GtEq, 50 * DAY);
+        let siblings = [ts_cmp("ts", CmpOp::Lt, 51 * DAY)];
+        let explain = ExplainEstimate {
+            access_method: AccessMethod::SequentialScan,
+            total_cost: Some(5_000_000.0),
+            plan_rows: Some(500_000.0),
+            index_name: None,
+            estimated_at: chrono::Utc::now(),
+        };
+        let mut warm = inputs(&stats, &params, &[], &kinds);
+        warm.explain = Some(explain.clone());
+        warm.siblings = &siblings;
+        let mut cold = inputs(&stats, &params, &[], &kinds);
+        cold.siblings = &siblings;
+        let (warm, cold) = (decide_push(&lo, &warm), decide_push(&lo, &cold));
+        assert_eq!(warm, cold);
+        assert!(matches!(warm, CostDecision::Push { .. }), "{warm:?}");
+        // Without a window, a cached EXPLAIN cost still decides.
+        let mut single = inputs(&stats, &params, &[], &kinds);
+        single.explain = Some(explain);
+        let narrow = ts_cmp("ts", CmpOp::GtEq, 99 * DAY); // 1% alone
+        assert!(matches!(
+            decide_push(&narrow, &single),
+            CostDecision::Keep { .. }
+        ));
+    }
+
+    #[test]
+    fn test_no_column_statistics_never_gets_window_credit() {
+        // A provider without statistics (e.g. rebuilt on a scheduler) must keep its
+        // conservative default: no sibling makes an unknown column look selective.
+        let stats = SourceStatistics::empty("events");
+        let lo = ts_cmp("ts", CmpOp::GtEq, 50 * DAY);
+        let hi = ts_cmp("ts", CmpOp::Lt, 51 * DAY);
+        let est = estimate_selectivity(&lo, &stats, std::slice::from_ref(&hi));
+        assert_eq!(est.basis, EstimateBasis::Statistics);
+        assert_eq!(est.value, estimate_selectivity_from_stats(&lo, &stats));
+    }
+
+    #[test]
+    fn test_decide_push_daily_window_on_unindexed_column() {
+        // The incremental-load case: no index on `ts`, 100 MB table.
+        let stats = distribution_stats();
+        let params = CostParams::default();
+        let kinds = ColumnKinds::new();
+        let lo = ts_cmp("ts", CmpOp::GtEq, 50 * DAY);
+        let hi = ts_cmp("ts", CmpOp::Lt, 51 * DAY);
+        // Judged alone, the lower bound keeps half the rows: keep.
+        let alone = decide_push(&lo, &inputs(&stats, &params, &[], &kinds));
+        assert!(matches!(alone, CostDecision::Keep { .. }), "{alone:?}");
+        // Judged as a window: 1% of ~97,656 KB = 976 cost units -> push, with the basis named.
+        let mut with_sibling = inputs(&stats, &params, &[], &kinds);
+        let siblings = [hi];
+        with_sibling.siblings = &siblings;
+        match decide_push(&lo, &with_sibling) {
+            CostDecision::Push {
+                reason,
+                cost_estimate,
+                ..
+            } => {
+                assert!(reason.contains("window of 2 range filters"), "{reason}");
+                assert!(cost_estimate < params.max_source_cost);
+            }
+            other => panic!("expected Push for a one-day window, got {other:?}"),
+        }
     }
 
     #[test]

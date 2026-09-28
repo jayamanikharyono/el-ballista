@@ -51,7 +51,7 @@ fn default_statement_timeout_ms() -> u64 {
 }
 
 fn default_application_name() -> String {
-    "rust-extract-layer".to_string()
+    "el-ballista".to_string()
 }
 
 fn default_schema() -> String {
@@ -77,6 +77,18 @@ pub struct CheckpointConfig {
     /// `lock_ttl_secs / 4`. Must be >= 4.
     #[serde(default = "default_lock_ttl_secs")]
     pub lock_ttl_secs: u64,
+    /// Write a run report (`<dir>/runs/<job>/<run_id>.json`) for every `run_with` run.
+    /// See `run_report`. Default `true`.
+    #[serde(default = "default_true")]
+    pub run_reports: bool,
+    /// Also write run reports for diagnostic runs (`run()`, `rel run`, `rel distribute`).
+    /// Default `false`: diagnostics leave no files behind.
+    #[serde(default)]
+    pub diagnostic_run_reports: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_checkpoint_dir() -> String {
@@ -102,6 +114,8 @@ impl Default for CheckpointConfig {
             flush_interval_secs: default_checkpoint_flush_secs(),
             flush_rows: default_checkpoint_flush_rows(),
             lock_ttl_secs: default_lock_ttl_secs(),
+            run_reports: true,
+            diagnostic_run_reports: false,
         }
     }
 }
@@ -203,10 +217,11 @@ pub struct ExecutionConfig {
     #[serde(default = "default_max_batch_bytes")]
     pub max_batch_bytes: usize,
     /// Upper bound on concurrent single-node split scans (and consumer calls in
-    /// `run_with`). Further capped at the source pool size, so a scan never waits on a
-    /// connection another scan of the same run holds.
-    #[serde(default = "default_concurrent_partitions")]
-    pub concurrent_partitions: usize,
+    /// `run_with`). Unset (the default) means the whole source budget, `source.pool_max`;
+    /// an explicit value is still capped at it, so a scan never waits on a connection
+    /// another scan of the same run holds.
+    #[serde(default)]
+    pub concurrent_partitions: Option<usize>,
     /// Use `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` instead of cursor `FETCH`
     /// for full/keyset scans. Same rows, less per-row protocol overhead. Falls back
     /// to cursors automatically when the shape is unsupported (pushed filters with
@@ -230,10 +245,6 @@ fn default_max_batch_bytes() -> usize {
     16 * 1024 * 1024
 }
 
-fn default_concurrent_partitions() -> usize {
-    4
-}
-
 fn default_use_copy() -> bool {
     false
 }
@@ -243,7 +254,7 @@ impl Default for ExecutionConfig {
         Self {
             batch_size: default_batch_size(),
             max_batch_bytes: default_max_batch_bytes(),
-            concurrent_partitions: default_concurrent_partitions(),
+            concurrent_partitions: None,
             use_copy: default_use_copy(),
             copy_statement_timeout_ms: None,
         }
@@ -262,6 +273,21 @@ pub struct DistributedConfig {
     /// only to budget the per-process source connection pools; see docs/roadmap.md Phase 4).
     #[serde(default = "default_workers")]
     pub workers: usize,
+    /// How many times a hung distributed job is cancelled and re-run before the extraction
+    /// aborts with `DistributedJobAborted` (0 = abort on the first hang). A job counts as
+    /// hung when a worker it started with stops heartbeating for `executor_timeout_secs` or
+    /// is dropped by the scheduler, or when `job_timeout_secs` passes. Only a job that has
+    /// not delivered any rows yet is re-run (Ballista delivers results after the job
+    /// finishes, so that is the whole run phase); later, the hang is an error.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    /// A worker whose heartbeat has not advanced for this long counts as dead. Keep it well
+    /// above the workers' `--heartbeat-secs` (default 5 s).
+    #[serde(default = "default_executor_timeout_secs")]
+    pub executor_timeout_secs: u64,
+    /// Optional wall-clock limit per attempt of a distributed job; unset = no limit.
+    #[serde(default)]
+    pub job_timeout_secs: Option<u64>,
 }
 
 fn default_scheduler_url() -> String {
@@ -272,11 +298,22 @@ fn default_workers() -> usize {
     1
 }
 
+fn default_max_retries() -> u32 {
+    2
+}
+
+fn default_executor_timeout_secs() -> u64 {
+    30
+}
+
 impl Default for DistributedConfig {
     fn default() -> Self {
         Self {
             scheduler_url: default_scheduler_url(),
             workers: default_workers(),
+            max_retries: default_max_retries(),
+            executor_timeout_secs: default_executor_timeout_secs(),
+            job_timeout_secs: None,
         }
     }
 }
@@ -470,8 +507,8 @@ impl JobConfig {
     /// use rust_ballista_extraction_layer::config::JobConfig;
     ///
     /// let config = JobConfig::from_file("examples/configs/full_extract.example.json")?;
-    /// assert_eq!(config.job_id, "orders_full");
-    /// assert_eq!(config.resolved_table(), "public.orders");
+    /// assert_eq!(config.job_id, "payment_full");
+    /// assert_eq!(config.resolved_table(), "public.payment");
     /// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
     /// ```
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AppError> {
@@ -522,11 +559,8 @@ impl JobConfig {
                 self.execution.max_batch_bytes
             ));
         }
-        if self.execution.concurrent_partitions < 1 {
-            bad.push(format!(
-                "execution.concurrent_partitions must be >= 1 (got {})",
-                self.execution.concurrent_partitions
-            ));
+        if self.execution.concurrent_partitions == Some(0) {
+            bad.push("execution.concurrent_partitions must be >= 1 (got 0)".to_string());
         }
         if self.parallel_scan.partitions < 1 {
             bad.push(format!(
@@ -539,6 +573,16 @@ impl JobConfig {
                 "distributed.workers must be >= 1 (got {})",
                 self.distributed.workers
             ));
+        }
+        if self.distributed.executor_timeout_secs < 1 {
+            bad.push("distributed.executor_timeout_secs must be >= 1 (got 0)".to_string());
+        }
+        if self.distributed.job_timeout_secs == Some(0) {
+            bad.push(
+                "distributed.job_timeout_secs must be >= 1 when set (got 0; omit it for no \
+                 limit)"
+                    .to_string(),
+            );
         }
         if self.checkpoint.lock_ttl_secs < 4 {
             bad.push(format!(
@@ -609,16 +653,16 @@ mod tests {
         // Tests run with CWD at the crate root, where examples/ lives.
         let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
 
-        assert_eq!(config.job_id, "orders_extract");
-        assert_eq!(config.table, "orders");
-        assert_eq!(config.resolved_table(), "public.orders");
-        assert_eq!(config.source.password_env, "ORDERS_PG_PASSWORD");
+        assert_eq!(config.job_id, "payment_extract");
+        assert_eq!(config.table, "payment");
+        assert_eq!(config.resolved_table(), "public.payment");
+        assert_eq!(config.source.password_env, "PGPASSWORD");
         assert!(
             config
                 .columns
                 .as_ref()
                 .unwrap()
-                .contains(&"tags".to_string())
+                .contains(&"payment_date".to_string())
         );
 
         // Spec blocks absent from older files fall back to defaults.
@@ -626,11 +670,12 @@ mod tests {
         assert_eq!(config.distributed.workers, 2);
         assert_eq!(config.execution.batch_size, 8192);
         assert_eq!(config.execution.max_batch_bytes, 16 * 1024 * 1024);
-        assert_eq!(config.execution.concurrent_partitions, 4);
+        // Unset: the whole source budget (resolved against pool_max at run time).
+        assert_eq!(config.execution.concurrent_partitions, None);
         assert!(!config.execution.use_copy);
         assert_eq!(config.checkpoint.flush_interval_secs, 5);
         assert_eq!(config.checkpoint.flush_rows, 100_000);
-        assert_eq!(config.parallel_scan.partition_column, "order_id");
+        assert_eq!(config.parallel_scan.partition_column, "payment_id");
     }
 
     #[test]
@@ -760,30 +805,63 @@ mod tests {
 
     #[test]
     fn test_benchmark_generated_configs_parse_strictly() {
-        // `benchmark/run.sh` writes `benchmark/bench-config.json` from a heredoc on every run
-        // (the file itself is a generated artifact); the heredoc, in each batch/COPY mode,
-        // must load under the strict (deny_unknown_fields, no `sink`) job spec.
+        // `benchmark/run.sh` writes `benchmark/bench-config-<scenario>.json` from one heredoc
+        // on every run (generated artifacts). The scenario lives in the config — structured
+        // `filters` + `columns`, never SQL — so every scenario, in each batch/COPY mode, must
+        // load under the strict (deny_unknown_fields, no `sink`) job spec.
         let script = std::fs::read_to_string("benchmark/run.sh").unwrap();
         let start = script
-            .find("cat > \"$BENCH_DIR/bench-config.json\" <<EOF\n")
-            .expect("run.sh generates bench-config.json from a heredoc");
+            .find("cat > \"$BENCH_DIR/bench-config-$1.json\" <<EOF\n")
+            .expect("run.sh generates bench-config-<scenario>.json from a heredoc");
         let body = &script[start..];
         let body = &body[body.find('\n').unwrap() + 1..];
         let template = &body[..body.find("\nEOF\n").expect("heredoc terminator")];
-        for (batch_json, copy_json) in [
-            ("", "\"use_copy\": true"),
-            ("\"batch_size\": 64000,", "\"use_copy\": false"),
-        ] {
-            let text = template
-                .replace("$PARALLEL_STRATEGY", "keyset")
-                .replace("$RUST_PARTITIONS", "4")
-                .replace("$WORKERS", "4")
-                .replace("${BATCH_JSON}", batch_json)
-                .replace("${COPY_JSON}", copy_json);
-            assert!(!text.contains('$'), "unsubstituted variable in:\n{text}");
-            let config = parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
-            config.validate().unwrap();
-            assert_eq!(config.parallel_scan.partitions, 4);
+        let scenarios = [
+            ("full", "[]", "null"),
+            (
+                "selective",
+                r#"[{"column": "status", "op": "=", "value": "REFUNDED"}]"#,
+                r#"["order_id", "amount", "status"]"#,
+            ),
+        ];
+        for (scenario, filters, columns) in scenarios {
+            for (batch_json, copy_json) in [
+                ("", "\"use_copy\": true"),
+                ("\"batch_size\": 64000,", "\"use_copy\": false"),
+            ] {
+                let text = template
+                    .replace("$1", scenario)
+                    .replace("$2", filters)
+                    .replace("$3", columns)
+                    .replace("$PARALLEL_STRATEGY", "keyset")
+                    .replace("$RUST_PARTITIONS", "4")
+                    .replace("$WORKERS", "3")
+                    .replace("$POOL_MAX", "12")
+                    .replace("${BATCH_JSON}", batch_json)
+                    .replace("${COPY_JSON}", copy_json);
+                assert!(!text.contains('$'), "unsubstituted variable in:\n{text}");
+                let config = parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+                config.validate().unwrap();
+                assert_eq!(config.parallel_scan.partitions, 4);
+                assert_eq!(config.source.pool_max, 12);
+                // run.sh retries a failed attempt on a fresh cluster itself; a re-run inside
+                // the client would finish on fewer workers and skew the time.
+                assert_eq!(config.distributed.max_retries, 0);
+                match scenario {
+                    "full" => {
+                        assert!(config.filters.is_empty());
+                        assert!(config.columns.is_none());
+                    }
+                    _ => {
+                        assert!(matches!(
+                            config.filters.as_slice(),
+                            [FilterEntry::Single(FilterInput::Structured(f))]
+                                if f.column == "status" && f.op == FilterOp::Eq
+                        ));
+                        assert_eq!(config.columns.as_ref().map(Vec::len), Some(3));
+                    }
+                }
+            }
         }
     }
 
@@ -791,7 +869,7 @@ mod tests {
     fn test_from_file_full_config() {
         // The full-extraction spec must parse and validate (no watermark/incremental blocks).
         let config = JobConfig::from_file("examples/configs/full_extract.example.json").unwrap();
-        assert_eq!(config.job_id, "orders_full");
+        assert_eq!(config.job_id, "payment_full");
         assert!(config.filters.is_empty());
         config.validate().unwrap();
     }
@@ -805,14 +883,18 @@ mod tests {
         let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
         assert_eq!(config.filters.len(), 4);
         for (entry, (column, op, value)) in config.filters.iter().zip([
-            ("status", FilterOp::Eq, serde_json::json!("PAID")),
-            ("amount", FilterOp::Gt, serde_json::json!(100)),
             (
-                "updated_at",
+                "payment_date",
                 FilterOp::GtEq,
-                serde_json::json!("2026-01-01T00:00:00Z"),
+                serde_json::json!("2007-04-06T00:00:00Z"),
             ),
-            ("user_id", FilterOp::GtEq, serde_json::json!(500)),
+            (
+                "payment_date",
+                FilterOp::Lt,
+                serde_json::json!("2007-04-13T00:00:00Z"),
+            ),
+            ("customer_id", FilterOp::GtEq, serde_json::json!(300)),
+            ("amount", FilterOp::Gt, serde_json::json!(5)),
         ]) {
             match entry {
                 FilterEntry::Single(FilterInput::Structured(spec)) => {
@@ -1033,7 +1115,7 @@ mod tests {
             distributed: DistributedConfig::default(),
         };
 
-        // T-6: no environment mutation — an unset name fails, an always-set one resolves.
+        // No environment mutation — an unset name fails, an always-set one resolves.
         assert!(config.resolve_password().is_err());
         let mut set = config.clone();
         set.source.password_env = "PATH".to_string();

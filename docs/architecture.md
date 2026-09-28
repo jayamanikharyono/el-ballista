@@ -1,9 +1,12 @@
 # Architecture
 
-Technical reference for the Rust Extract Layer. This document covers the crate layout, the
-lifecycle of a job from API call to split-checkpoint commit, the data model, execution and memory
-management, configuration, and observability. The core is a source-aware extraction layer on
+Technical reference for El Ballista. This document covers the crate layout, the lifecycle of a
+job from API call to split-checkpoint commit, the data model, execution and memory management,
+configuration, and observability. The core is a source-aware extraction layer on
 DataFusion/Ballista that outputs native Arrow.
+
+`rel` below is the `rust-ballista-extraction-layer` binary, e.g.
+`cargo run --release --bin rust-ballista-extraction-layer --`.
 
 For the reasoning behind the design, start with the [README](../README.md). For the parts that get
 their own documents, see [pushdown](pushdown.md)
@@ -21,9 +24,9 @@ public extension points:
 | Extension point | What we register | Status |
 | --- | --- | --- |
 | `TableProvider` | One per source table, wrapping a connector (`PostgresTableProvider`) | Implemented |
-| `supports_filters_pushdown` | Per-filter `Exact` / `Inexact` / `Unsupported` capability decisions | Implemented |
+| `supports_filters_pushdown` | `Exact` / `Inexact` / `Unsupported` for each filter, decided over the whole filter set so the sides of a range window share one estimate | Implemented |
 | `ExecutionPlan` | `PostgresExecutionPlan` — a streaming scan node with per-partition source queries | Implemented |
-| `OptimizerRule` | None. The cost-based push/keep decision runs inside `supports_filters_pushdown`, driven by DataFusion's own `PushDownFilter` (the earlier `SourceAwarePushdownRule` was deleted) | Not used |
+| `OptimizerRule` | None. The cost-based push/keep decision runs inside `supports_filters_pushdown`, driven by DataFusion's own `PushDownFilter`; there is no custom optimizer rule | Not used |
 | `TableProviderFactory` / `SchemaProvider` | Catalog binding for `ctx.source("ref", "table")` | Deferred — the engine registers providers directly |
 | `ScalarUDF` / `AggregateUDF` | Extraction-specific functions | Deferred |
 | `ObjectStore` registry | GCS, S3, local filesystem for writers | Not used — writing output is out of scope (see roadmap) |
@@ -56,41 +59,47 @@ sqlx        = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "p
 
 A single crate (`lib` + `bin`), organized by layer. There is no workspace; the split below
 is by module, chosen so a future extraction into crates (or a Python wrapper binding against
-one obvious surface) stays mechanical. The `rel-*` crate names from early planning are kept
-in comments where they map 1:1, but nothing is split yet.
+one obvious surface) stays mechanical.
 
 ```
 rust-ballista-extraction-layer/
 ├── Cargo.toml                  # single crate; exact pins, see §1 version policy
 ├── src/
-│   ├── lib.rs                  # pub mod checkpoint, config, connector, errors, logging, pushdown, types
+│   ├── lib.rs                  # pub mod checkpoint, config, connector, errors, logging, pushdown,
+│   │                           # telemetry, types
 │   ├── main.rs                 # `rel` binary: bin-only `cli/` + `demo.rs`, everything else from the lib
 │   ├── config/                 # strict JSON job spec (deny_unknown_fields), JobConfig + blocks
-│   ├── types/                  # TableMetadata / ColumnMetadata, JobId newtype
-│   ├── checkpoint/             # CheckpointStore trait, JsonCheckpointStore, plan fingerprint,
-│   │                           # per-job lock (heartbeat + TTL), progress file
+│   ├── types/                  # TableMetadata / ColumnMetadata, JobId newtype, ParallelStrategy
+│   ├── checkpoint/             # CheckpointStore trait, JsonCheckpointStore (json_store), plan
+│   │                           # fingerprint, per-job lock (heartbeat + TTL), progress file
+│   ├── run_report.rs           # one JSON record per run (runs/<job>/<run_id>.json)
 │   ├── pushdown/               # connector-agnostic: Predicate IR (ir), Expr→IR translation with
 │   │                           # fidelity (translate), policy, cost_model, SqlDialect trait,
 │   │                           # backend-neutral stats / explain types
 │   ├── connector/
 │   │   ├── mod.rs              # the Source SPI contract (see below)
 │   │   ├── errors.rs           # ExtractorError
-│   │   ├── query_tag.rs        # SQL comment tags for pg_stat_activity
+│   │   ├── query_tag.rs        # leading SQL comment tag (pipeline, run_id, query_id) on every query
 │   │   ├── postgres/           # everything Postgres-specific:
 │   │   │   ├── api.rs          #   PostgresConnector builder API (collect/stream/run/run_with)
 │   │   │   ├── pipeline/       #   job pipeline: filters, splits, run (checkpointed run_with)
 │   │   │   ├── engine/         #   ExtractContext: DataFusion session + DataFrame builder
-│   │   │   ├── distributed/    #   Ballista codecs, connection descriptor, pool registry, context
+│   │   │   ├── distributed/    #   Ballista plan/table codecs, connection descriptor, pool
+│   │   │   │                   #   registry + scan limiter, context, executors (remote executor
+│   │   │   │                   #   check), watchdog (re-runs a job whose worker died)
 │   │   │   ├── table_provider.rs, execution_plan.rs   # DataFusion TableProvider / ExecutionPlan
 │   │   │   ├── extractor.rs, copy.rs, row_adapter.rs  # cursor + binary COPY scans, decoders
 │   │   │   ├── schema_reader.rs, arrow_type_mapper.rs, query_builder.rs, parallel.rs
 │   │   │   └── dialect.rs, param_sink.rs, inline_sql.rs, stats.rs, explain.rs
-│   │   └── mysql/              # prototype: dialect, schema_reader, type_mapper, row_adapter,
-│   │                           # extractor, query_builder
+│   │   └── mysql/              # prototype: dialect, error, schema_reader, type_mapper,
+│   │                           # row_adapter, extractor, query_builder
 │   ├── cli/                    # (bin) run, distribute, plan, checkpoint show|reset, scheduler,
 │   │                           # worker, demo
+│   ├── demo.rs                 # (bin) `rel demo` walkthrough
+│   ├── telemetry.rs            # metric names + recording helpers (`metrics` facade, see §7)
 │   ├── logging.rs              # `log` + fern setup (stderr + optional file)
 │   └── errors.rs               # AppError (typed variants, #[source] kept)
+├── benchmark/                  # Rust vs PySpark load benchmark (benchmark/README.md)
 ├── docs/
 ├── examples/                   # runnable pipelines (see examples/configs/*.json)
 └── tests/                      # integration suites + fixtures (docs/testing-plan.md)
@@ -101,15 +110,23 @@ There are no crate-root re-exports of the Postgres modules: import
 distributed, …}` directly.
 
 The Source SPI contract lives in `src/connector/mod.rs`: every backend answers four questions
-without the rest of the system knowing which database it is — *what SQL?* (`Predicate::render_to`
-into a `SqlSink`, `SqlDialect` conventions),
-*what does it cost?* (`TableStatsSource`), *which pool?* (`SourceDescriptor`).
-Caller-provided filter predicates are the only range mechanism; the layer manages no watermarks. The planning SPI
-itself is DataFusion's (`TableProvider` / `ExecutionPlan`). Deliberately backend-concrete:
-`sqlx` pools and `QueryBuilder` binding — another backend would own an analogous registry over its
-own pool type following the same pattern. Pushed filters are decided per filter in
-`PostgresTableProvider::supports_filters_pushdown` and rendered with `COLLATE "C"` for text,
-bound parameters for every literal (see [pushdown](pushdown.md)).
+without the rest of the system knowing which database it is:
+
+1. *What SQL?* `Predicate::render_to` into a `SqlSink`, with `SqlDialect` conventions.
+2. *What filter?* Caller-provided predicates or ranges. The orchestrator decides what range to
+   extract; the layer decides how, and manages no watermarks.
+3. *What does it cost?* `TableStatsSource`.
+4. *Which pool?* `SourceDescriptor`.
+
+The planning SPI itself is DataFusion's (`TableProvider` / `ExecutionPlan`). Deliberately
+backend-concrete: `sqlx` pools and `QueryBuilder` binding — another backend would own an
+analogous registry over its own pool type following the same pattern.
+
+Push/keep decisions are made in `PostgresTableProvider::supports_filters_pushdown`, which
+decides the whole filter set at once (`decide_all`): each filter is judged with the others as
+siblings, so the two sides of a range window share one estimate. `explain_decisions` returns
+the same decisions with their reasons (what `rel plan` prints). Pushed filters are rendered with
+`COLLATE "C"` for text and bound parameters for every literal (see [pushdown](pushdown.md)).
 
 ---
 
@@ -123,8 +140,10 @@ bound parameters for every literal (see [pushdown](pushdown.md)).
         │                   config filters → typed DataFusion Exprs (schema-coerced literals);
         │                   splits = keyset/ctid partitions (or one whole-table split)
         ▼
-  (3) Pushdown decision     supports_filters_pushdown per filter: Exact / Inexact / keep,
-        │                   by fidelity (translate) + policy (cost_based, always, …)
+  (3) Pushdown decision     supports_filters_pushdown over the whole filter set (decide_all):
+        │                   Exact / Inexact / keep for each filter, by fidelity (translate)
+        │                   + policy (cost_based, always, …); range filters on one column are
+        │                   estimated together as a window
         ▼
   (4) Physical plan         PostgresExecutionPlan: one source query per partition
         │                   (DECLARE … CURSOR + FETCH, or binary COPY when no bound params)
@@ -135,6 +154,7 @@ bound parameters for every literal (see [pushdown](pushdown.md)).
         │                   run_with(consumer) — the operational, checkpointed job:
         ▼
   (6) run_with              take the per-job lock (O_EXCL file + heartbeat, lock_ttl_secs);
+        │                   write the run report stub (runs/<job>/<run_id>.json, `running`);
         │                   begin(plan): new → all splits Pending with their bounds;
         │                              same plan fingerprint → Completed kept, rest Pending;
         │                              different plan → CheckpointError::PlanMismatch
@@ -144,7 +164,9 @@ bound parameters for every literal (see [pushdown](pushdown.md)).
         │                   consumer Err / undrained stream / source error → mark Failed
         ▼
   (8) Finish                all splits Completed → Ok(RunOutcome); any Failed →
-                            AppError::SplitsFailed listing them; lock released (RAII)
+                            AppError::SplitsFailed listing them, wrapped in
+                            AppError::RunFailed with the run id and report; lock released;
+                            run report replaced with the final record (succeeded / failed)
 ```
 
 The checkpoint contract: **a split is Completed only after the consumer acknowledged it**, so
@@ -154,6 +176,16 @@ Delivery is at-least-once per split — a split whose consumer failed or whose p
 mid-stream is re-delivered in full — so consumers should write per `split_id` idempotently.
 `rel checkpoint reset` deletes a job's checkpoint (needed after changing its plan). The
 distributed path treats the whole cluster query as one split. Nothing here is exactly-once.
+
+The checkpoint and the run report are different records. The checkpoint is mutable state, one
+file per job, rewritten as splits finish so a retry can resume. The run report
+([`src/run_report.rs`](../src/run_report.rs)) is one file per run, kept after later runs: the
+plan fingerprint and filters, each filter's pushdown decision (captured with the same provider
+and cost snapshot the run plans with), and each split's outcome, rows, bytes, time and error.
+Its `run_id` is the one every source query of the run carries in its SQL comment tag (the
+provider is built with it, and it travels in the serialized provider model to a Ballista
+scheduler). Reports are observability only: nothing reads them to decide what to extract, and
+a write failure is logged, never fatal.
 
 ### Isolation semantics
 
@@ -167,43 +199,61 @@ open partition holds back vacuum's `xmin` horizon while it runs.
 
 ### Worked example
 
-```rust
-use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
+[`examples/configs/pushdown_showcase.json`](../examples/configs/pushdown_showcase.json) runs
+against the demo database (dvdrental `public.payment`, 14,596 rows; see
+[running](running.md)). Its filters:
 
-let ctx = ExtractContext::from_config(config).await?;
-let batches = ctx.source("postgres", "public.orders").await?
-    .filter(col("status").eq(lit("PAID")))?
-    .select(vec![col("order_id"), col("user_id"), col("amount")])?
-    .collect().await?;
+```json
+"filters": [
+  { "column": "customer_id",  "op": ">=", "value": 300 },
+  { "column": "payment_date", "op": ">=", "value": "2007-04-06T00:00:00Z" },
+  { "column": "payment_date", "op": "<",  "value": "2007-04-07T00:00:00Z" },
+  { "column": "staff_id",     "op": "!=", "value": 1 },
+  { "column": "amount",       "op": ">",  "value": 5 },
+  { "column": "rental_id",    "op": ">=", "value": 1000 }
+],
+"pushdown": { "policy": "cost_based", "deny": ["rental_id"], "push": [] }
 ```
 
-The planner considers each caller-provided predicate on its merits. `status = 'PAID'` on a
-text column translates to `("status" COLLATE "C") = $1`, which is `Exact` (byte-wise, like
-Arrow), so the only question is policy: under `cost_based` a low-cardinality column with no
-usable index may be **kept** in Arrow; under `always` it is pushed and DataFusion drops its
-own filter. When pushed, the per-partition source query is:
-
-```sql
-SELECT "order_id", "user_id", "amount"
-FROM   "public"."orders"
-WHERE  (("status" COLLATE "C") = $1)
-  AND  ("order_id" >= 25001 AND "order_id" < 50001)  -- keyset bounds (a middle partition)
-```
-
-(The first partition has no lower bound — `"order_id" < b1 OR "order_id" IS NULL` — and the last
-is open-ended, so a resumed run that reuses stored bounds still covers keys inserted below the
-planned MIN or above the planned MAX.)
-
-Change one input — say the table is on a hot production primary — and set
-`policy = "strict"`: only indexed, selective, primitive-typed predicates push. `rel plan` prints
-each decision with its reasoning (exact reasons depend on live statistics — illustrative
-output):
+`rel plan --config examples/configs/pushdown_showcase.json` prints each filter's decision with
+its reason:
 
 ```
 policy: cost_based
-  status='PAID'  -> Keep (KEEP (selectivity above keep threshold; stays in Arrow))
-  amount>=100    -> Keep (KEEP (selectivity above keep threshold; stays in Arrow))
+  customer_id >= 300                       -> Exact (PUSH (Exact; EXPLAIN index path; ("customer_id" >= 300)))
+  payment_date >= '2007-04-06T00:00:00Z'   -> Exact (PUSH (Exact; low selectivity (2.91% from histogram, window of 2 range filters) and cost (52) within budget (50000); ("payment_date" >= '2007-04-06T00:00:00+00:00'::timestamptz)))
+  payment_date < '2007-04-07T00:00:00Z'    -> Exact (PUSH (Exact; low selectivity (2.91% from histogram, window of 2 range filters) and cost (52) within budget (50000); ("payment_date" < '2007-04-07T00:00:00+00:00'::timestamptz)))
+  staff_id != 1                            -> Unsupported (KEEP (selectivity too high: 50.00% >= 30.00%))
+  amount > 5                               -> Unsupported (KEEP (no exact or superset source form (expression, type, or operator not supported); stays in Arrow))
+  rental_id >= 1000                        -> Unsupported (KEEP (denylisted column))
 ```
+
+- `customer_id >= 300` pushes because `EXPLAIN` chose an index path (`idx_fk_customer_id`).
+- The two `payment_date` filters have no index. Each is judged together with its sibling on the
+  same column: the one-day window is estimated at 2.91% of rows from the column's `pg_stats`
+  histogram, under the 30% keep threshold and within the cost budget, so both sides push.
+  Either side alone would be an open-ended range.
+- `staff_id != 1` could be pushed exactly, but it keeps half the rows, so pushing saves little
+  (the index on `staff_id` does not serve `<>`).
+- `amount` is `numeric`: no source form is proven to compare exactly like Arrow's
+  `Decimal128`, so it never pushes.
+- `rental_id` is on the job's deny list, which wins over the cost model even though the
+  column is indexed.
+
+DataFusion evaluates the kept filters itself. The pushed ones become the source query's
+`WHERE` clause, every literal a bound parameter:
+
+```sql
+SELECT "payment_id", "customer_id", "staff_id", "rental_id", "amount", "payment_date"
+FROM   "public"."payment"
+WHERE  ("customer_id" >= $1) AND ("payment_date" >= $2) AND ("payment_date" < $3)
+```
+
+With `parallel_scan.strategy: "keyset"`, each partition appends its key range in parentheses,
+e.g. `AND ("payment_id" >= b1 AND "payment_id" < b2)` for a middle partition. The first
+partition has no lower bound (`"payment_id" < b1 OR "payment_id" IS NULL`) and the last is
+open-ended, so a resumed run that reuses stored bounds still covers keys inserted below the
+planned MIN or above the planned MAX.
 
 ---
 
@@ -216,10 +266,10 @@ cursor path sqlx still hands each row over as a `PgRow`).
 ```
 Row-oriented (what we avoid)      Columnar (what we use)
 ────────────────────────────      ──────────────────────
-Row 1 → Row 2 → Row 3 → …         order_id: [1, 2, 3, 4, 5]
-per-row dispatch                  user_id:  [9, 4, 7, 7, 2]
-pointer chasing                   amount:   [10.2, 11.4, 9.2, 7.1, 8.3]
-no SIMD                           validity: [1,1,1,0,1] bitmaps
+Row 1 → Row 2 → Row 3 → …         payment_id:  [1, 2, 3, 4, 5]
+per-row dispatch                  customer_id: [9, 4, 7, 7, 2]
+pointer chasing                   amount:      [10.2, 11.4, 9.2, 7.1, 8.3]
+no SIMD                           validity:    [1,1,1,0,1] bitmaps
 ```
 
 This buys SIMD-friendly kernels, cache efficiency, cheap column pruning and better compression.
@@ -255,7 +305,7 @@ distinct knobs that are easy to conflate:
 - **DataFusion target partitions** — CPU parallelism for Arrow operators. Currently left at
   DataFusion defaults (never explicitly configured).
 - **Consumer concurrency** — `run_with` calls the consumer for up to
-  `min(execution.concurrent_partitions, pool size)` splits at a time. What the consumer does
+  `execution.concurrent_partitions` splits at a time (default: the whole pool size, `pool_max`; an explicit value is capped at it). What the consumer does
   with the batches (write Parquet, upload, …) is the caller's code; examples write one local
   Parquet file.
 
@@ -277,50 +327,69 @@ DataFusion's `MemoryPool` is not currently configured (no `FairSpillPool`, no `R
 tuning) — spills are unbounded by default. Likewise there is no per-connector cap on in-flight
 batches beyond `batch_size` accumulation. Both are known gaps, not design decisions.
 
-### Distributed execution (Phase 4, implemented)
+### Distributed execution
 
 Ballista distributes DataFusion across a scheduler and long-running workers (`rel scheduler` /
-`rel worker`), using Arrow IPC for shuffle exchange. The scan plan travels as JSON behind a
-magic prefix, decoded by per-process extension codecs; each process resolves a `SourceDescriptor`
-to its `pool_max / workers` share of source connections through a process-wide pool registry,
-so a three-worker deployment shows the source the same connection count as one machine. Within
-a process, a **scan limiter** (one permit per budgeted connection, `SourcePoolRegistry::scan_slots`)
-makes partition scans beyond the budget *wait* — cancellably, without the pool's acquire timeout —
-instead of failing. With a remote scheduler, `.distributed().scheduler(url)` checks the
-registered executors through the scheduler's REST API (`GET /api/executors`): more executors
-than `workers` is refused (the source would exceed `pool_max`); fewer executors, or more task
-slots than connections, only warns; an unreachable/disabled REST API means "not verified" (warning).
-The planning client uses the same per-process share for metadata queries. The
-constraint this imposes on new code is modest but real: keep physical plan nodes serializable
-and never smuggle non-serializable state (pools, passwords) into `ExecutionPlan`
-implementations. See [roadmap](roadmap.md#phase-4--distributed-execution) and
-`docs/roadmap/phase-four-implementation-plan.md`. For checkpointing, the whole distributed scan
-is a single split (`split-0`).
+`rel worker`), using Arrow IPC for shuffle exchange. Distributed always means a running
+cluster; there is no in-process Ballista. Single-process extraction is plain DataFusion
+(`register_table` into a `SessionContext`, or the connector's `.standalone()`): one Tokio
+runtime with one thread per visible CPU and the whole `pool_max` for the one process.
+
+- **Connection budget.** Each process resolves a `SourceDescriptor` to its `pool_max / workers`
+  share of source connections through a process-wide pool registry, so a three-worker
+  deployment shows the source the same connection count as one machine. The planning client
+  uses the same per-process share for metadata queries.
+- **Scan limiter.** Within a process, one permit per budgeted connection
+  (`SourcePoolRegistry::scan_slots`) makes partition scans beyond the budget *wait* —
+  cancellably, without the pool's acquire timeout — instead of failing. Standalone runs use the
+  same limiter.
+- **Executor check.** With a remote scheduler, `.distributed().scheduler(url)` checks the
+  registered executors through the scheduler's REST API (`GET /api/executors`). More executors
+  than `workers` is refused (the source would exceed `pool_max`); fewer executors, or more task
+  slots than connections, only warns; an unreachable or disabled REST API means "not verified"
+  (warning).
+- **Plan serializability.** The scan plan travels as JSON behind a magic prefix, decoded by
+  per-process extension codecs. New code must keep physical plan nodes serializable and never
+  smuggle non-serializable state (pools, passwords) into `ExecutionPlan` implementations.
+- **Watchdog.** Ballista 54 never re-offers the tasks of a worker that died, so the job would
+  stay "Running" forever. The client cancels and re-submits such a job, up to
+  `distributed.max_retries` times, as long as it has not delivered rows yet.
+
+For checkpointing, the whole distributed scan is a single split (`split-0`). Deployment, flags
+and watchdog details: [running](running.md#execution-modes-standalone-vs-distributed). The
+original phase plans are kept in [history](history/).
 
 ---
 
 ## 6. Configuration
 
-One JSON job spec per job (see `examples/configs/extract.example.json`) — no separate
-connection catalog, no TOML. Credentials are managed once, by name, never inline:
+One JSON job spec per job — no separate connection catalog, no TOML. Credentials are managed
+once, by name, never inline. The demo job
+[`examples/configs/extract.example.json`](../examples/configs/extract.example.json), with more
+of the optional settings spelled out:
 
 ```json
 {
-  "job_id": "orders_extract",
-  "table": "orders",
-  "columns": ["order_id", "user_id", "status", "amount", "created_at", "updated_at"],
+  "job_id": "payment_extract",
+  "table": "payment",
+  "columns": ["payment_id", "customer_id", "staff_id", "rental_id", "amount", "payment_date"],
+  "filters": [
+    { "column": "payment_date", "op": ">=", "value": "2007-04-06T00:00:00Z" },
+    { "column": "payment_date", "op": "<",  "value": "2007-04-13T00:00:00Z" },
+    { "column": "customer_id",  "op": ">=", "value": 300 },
+    { "column": "amount",       "op": ">",  "value": 5 }
+  ],
   "source": {
     "host": "localhost",
     "port": 5432,
     "user": "postgres",
-    "password_env": "ORDERS_PG_PASSWORD",
-    "database": "app",
+    "password_env": "PGPASSWORD",
+    "database": "test",
     "pool_max": 8,
     "statement_timeout_ms": 300000,
-    "application_name": "rust-extract-layer",
+    "application_name": "el-ballista",
     "schema": "public"
   },
-  "filters": [{ "column": "status", "op": "=", "value": "PAID" }],
   "checkpoint": { "dir": "./.checkpoints", "lock_ttl_secs": 1800 },
   "pushdown": {
     "policy": "cost_based",
@@ -330,13 +399,14 @@ connection catalog, no TOML. Credentials are managed once, by name, never inline
     "keep_threshold": 0.30,
     "statistics_ttl_secs": 900
   },
-  "parallel_scan": { "strategy": "none", "partitions": 1, "partition_column": "order_id" },
-  "execution": { "batch_size": 8192, "max_batch_bytes": 16777216, "concurrent_partitions": 4, "use_copy": false },
-  "distributed": { "scheduler_url": "", "workers": 2 }
+  "parallel_scan": { "strategy": "none", "partitions": 1, "partition_column": "payment_id" },
+  "execution": { "batch_size": 8192, "max_batch_bytes": 16777216, "use_copy": false },
+  "distributed": { "scheduler_url": "", "workers": 2, "max_retries": 2, "executor_timeout_secs": 30 }
 }
 ```
 
-Notes against the original TOML sketch this replaces:
+The full spec, with every field and its default, is in [running](running.md#job-spec-full-example).
+Points that shape the design:
 
 - `password_env` names the environment variable holding the password (resolved in whichever
   process opens the pool — scheduler, worker, and client each resolve it independently).
@@ -350,24 +420,26 @@ Notes against the original TOML sketch this replaces:
   leftover `"sink"` is a load error. Enumerations are lowercase strings
   (`parallel_scan.strategy`: `none`/`keyset`/`ctid`; `pushdown.policy`: `always`/`never`/
   `cost_based`/`strict`/`hinted`), and `job_id` is validated into a `JobId`.
-
-What survived from the sketch: every source connects with a distinct, identifiable
-`application_name` so a DBA can see exactly what this tool is doing in `pg_stat_activity`,
-and a statement timeout is effectively mandatory — an extraction job must never be the reason
-a production database holds a long-running query (enforced per-connection, plus lock and
-idle-in-transaction timeouts).
+- Every source connects with an identifiable `application_name` (default `el-ballista`) so a
+  DBA can see exactly what this tool is doing in `pg_stat_activity`.
+- A statement timeout is effectively mandatory — an extraction job must never be the reason a
+  production database holds a long-running query (enforced per-connection, plus lock and
+  idle-in-transaction timeouts).
 
 ---
 
 ## 7. Observability
 
-Logging today is the `log` crate (a `fern` backend in the binary writing to stderr plus an
+Logging is the `log` crate (a `fern` backend in the binary writing to stderr plus an
 optional file, level from `--log-level`/`RUST_LOG`, file from `--log-file`/`REL_LOG_FILE`) —
 one line per job, split, partition scan, and checkpoint commit, with every generated SQL query
 and one line per Arrow batch (`split=`, `rows=`, `batch_bytes=`) at `debug` level. There is no
 `tracing` and no spans.
 
-**Metrics (implemented)** go through the [`metrics`](https://docs.rs/metrics) facade
+**Run reports** (`<checkpoint.dir>/runs/<job>/<run_id>.json`, see §3) give a durable,
+per-run record that a scheduler or a person can read after the fact (`rel runs list|show`).
+
+**Metrics** go through the [`metrics`](https://docs.rs/metrics) facade
 (`src/telemetry.rs`): a no-op until the host process installs a recorder/exporter. Recorded per
 batch, per split and per pushdown decision — never per row:
 
@@ -379,15 +451,14 @@ batch, per split and per pushdown decision — never per row:
 | `rel_splits` | counter | `job`, `outcome` = `completed` / `failed` / `skipped` |
 | `rel_pushdown_decisions` | counter | `outcome` = `exact` / `inexact` / `kept` |
 
-The table below is further instrumentation we want, not what exists; each row is deferred work,
-with the code hook it would attach to in parentheses:
+The table below is further instrumentation that does not exist yet; each row is deferred work,
+with the code hook it would attach to in parentheses where one is clear:
 
 | Metric | Type | Why it matters |
 | --- | --- | --- |
 | `rel_bytes_from_source_total{source,table}` | counter | Directly measures pushdown effectiveness |
 | `rel_source_query_duration_seconds` | histogram | Detects a pushdown that made the DB slow (hook: `build_query` execution) |
-| `rel_pushdown_decision_total{operator,decision}` | counter | Per-operator breakdown of the implemented `rel_pushdown_decisions` (hook: `decide_cost`) |
-| `rel_checkpoint_commit_total{status}` | counter | Failed commits mean duplicate work next run |
+| `rel_pushdown_decision_total{operator,decision}` | counter | Per-operator breakdown of `rel_pushdown_decisions` (hook: `decide_all`, called by `supports_filters_pushdown`) |
+| `rel_checkpoint_commit_total{status}` | counter | A failed checkpoint write means duplicate work on the next run (hook: `CheckpointStore::mark_completed`) |
 
-`rel_checkpoint_commit_total{status=failed}` deserves a standing alert: failed split commits mean
-duplicate work on the next run.
+Failed splits are visible as `rel_splits{outcome="failed"}`.

@@ -1,13 +1,13 @@
 //! Checkpoint contract of `run_with` against a live Postgres.
 //!
-//! - **B2** — a checkpoint is bound to its plan: bounds stored at the first run are reused on
+//! - A checkpoint is bound to its plan: bounds stored at the first run are reused on
 //!   retry even after the table grew (oracle: direct SQL over the final table; the union of
 //!   delivered rows must equal it), and a changed filter is a typed plan mismatch.
-//! - **R1** — a failing split does not stop the others; the run returns an aggregate error
+//! - A failing split does not stop the others; the run returns an aggregate error
 //!   naming only the failed split (oracle: the split checkpoint).
-//! - **R2** — a second concurrent run of the same job fails with `LockHeld` (oracle: the
+//! - A second concurrent run of the same job fails with `LockHeld` (oracle: the
 //!   typed error) and the job lock is gone after the first run.
-//! - **B3** — a consumer that returns `Ok` without reading its stream to the end does not
+//! - A consumer that returns `Ok` without reading its stream to the end does not
 //!   complete the split (oracle: the split checkpoint).
 //!
 //! Needs the compose stack (`tests/docker/compose.yaml`); `DATABASE_URL` overrides it.
@@ -108,7 +108,7 @@ async fn setup_table(db: &TestDb, n: i64) {
 
 #[tokio::test]
 async fn b2_retry_reuses_stored_bounds_after_the_table_grew() -> R {
-    // Scenario B of the review: splits 0 and 1 complete over [1, 9], split 2 fails; rows
+    // Splits 0 and 1 complete over [1, 9], split 2 fails; rows
     // 10..30 arrive; the retry must scan split 2 with its STORED range [7, ∞) — recomputing
     // from MIN/MAX would re-plan split 2 as [21, ∞) and silently lose 7..20.
     let db = TestDb::connect().await;
@@ -130,7 +130,10 @@ async fn b2_retry_reuses_stored_bounds_after_the_table_grew() -> R {
         })
         .await;
     assert!(
-        matches!(first, Err(AppError::SplitsFailed { .. })),
+        matches!(
+            first.as_ref().map_err(AppError::underlying),
+            Err(AppError::SplitsFailed { .. })
+        ),
         "{first:?}"
     );
 
@@ -205,7 +208,10 @@ async fn b2_retry_covers_keys_below_the_stored_minimum() -> R {
         })
         .await;
     assert!(
-        matches!(first, Err(AppError::SplitsFailed { .. })),
+        matches!(
+            first.as_ref().map_err(AppError::underlying),
+            Err(AppError::SplitsFailed { .. })
+        ),
         "{first:?}"
     );
 
@@ -255,7 +261,7 @@ async fn b2_changed_filter_is_a_plan_mismatch() -> R {
         .run_with(count)
         .await
         .unwrap_err();
-    match &err {
+    match err.underlying() {
         AppError::Checkpoint(CheckpointError::PlanMismatch { differs, .. }) => {
             assert_eq!(differs, "filters")
         }
@@ -285,11 +291,11 @@ async fn r1_failed_split_does_not_block_the_others() -> R {
             Ok(())
         })
         .await;
-    match result {
+    match result.as_ref().map_err(AppError::underlying) {
         Err(AppError::SplitsFailed {
             failures, total, ..
         }) => {
-            assert_eq!(total, 3);
+            assert_eq!(*total, 3);
             let ids: Vec<_> = failures.iter().map(|f| f.split_id.clone()).collect();
             assert_eq!(ids, vec!["split-0".to_string()]);
         }
@@ -388,7 +394,7 @@ async fn b3_undrained_stream_does_not_complete_the_split() -> R {
             Ok(())
         })
         .await;
-    match result {
+    match result.as_ref().map_err(AppError::underlying) {
         Err(AppError::SplitsFailed { failures, .. }) => {
             assert!(
                 matches!(*failures[0].error, AppError::SplitIncomplete { .. }),
@@ -425,6 +431,195 @@ async fn b3_undrained_stream_does_not_complete_the_split() -> R {
     ids.sort_unstable();
     assert_eq!(ids, source_ids(&db).await);
     let _ = std::fs::remove_dir_all(&config.checkpoint.dir);
+    db.cleanup().await;
+    Ok(())
+}
+
+/// Run reports (`<checkpoint.dir>/runs/<job>/<run_id>.json`): one per `run_with` attempt,
+/// kept after later runs. Oracle: the reports against what each run actually did (the
+/// consumer's failure, the checkpoint's skipped splits, the delivered row counts).
+#[tokio::test]
+async fn run_reports_record_every_attempt() -> R {
+    use rust_ballista_extraction_layer::run_report::{
+        RunKind, RunMode, RunStatus, SplitOutcome, list_reports,
+    };
+
+    let db = TestDb::connect().await;
+    setup_table(&db, 30).await;
+    let mut config = job(&db, 3);
+    config.filters = vec![FilterEntry::Single(FilterInput::Shorthand("id>=1".into()))];
+    let dir = std::path::PathBuf::from(&config.checkpoint.dir);
+
+    // Run 1: split-1's consumer fails; splits 0 and 2 complete.
+    let result = PostgresConnector::from_config(config.clone())?
+        .extract()
+        .standalone()
+        .run_with(|split: SplitInfo, stream| async move {
+            if split.index == 1 {
+                return Err("warehouse write failed".into());
+            }
+            ids_of(stream).await.map(|_| ())
+        })
+        .await;
+    // The error carries the failed run's id, report file and report.
+    let err = result.unwrap_err();
+    assert!(matches!(err.underlying(), AppError::SplitsFailed { .. }));
+    let failed_report = err.run_report().expect("the failed run's report").clone();
+    assert!(err.run_report_path().is_some());
+
+    let reports = list_reports(&dir, &config.job_id).await?;
+    assert_eq!(reports.len(), 1);
+    let first = &reports[0];
+    assert_eq!(err.run_id(), Some(first.run_id.as_str()));
+    assert_eq!(&failed_report, first, "returned report == file");
+    assert_eq!(first.status, RunStatus::Failed);
+    assert_eq!(first.kind, RunKind::Checkpointed);
+    assert_eq!(first.mode, RunMode::Standalone);
+    assert!(first.run_id.starts_with("r_"), "{}", first.run_id);
+    assert!(first.plan.fingerprint.is_some());
+    assert_eq!(first.plan.filters, vec!["id >= 1".to_string()]);
+    assert_eq!(first.pushdown.len(), 1);
+    assert!(first.pushdown[0].pushed, "{:?}", first.pushdown);
+    let outcomes: Vec<_> = first.splits.iter().map(|s| s.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            SplitOutcome::Completed,
+            SplitOutcome::Failed,
+            SplitOutcome::Completed
+        ]
+    );
+    assert!(
+        first.splits[1]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("warehouse write failed"),
+        "{:?}",
+        first.splits[1].error
+    );
+    assert!(first.splits[0].bounds.is_some());
+    assert_eq!(first.totals.splits_failed, 1);
+    assert_eq!(first.totals.splits_total, 3);
+    assert!(first.error.is_some() && first.finished_at.is_some());
+    let delivered_first = first.totals.rows_delivered;
+
+    // Run 2: the retry scans only split-1; the others are reported as skipped.
+    let outcome = PostgresConnector::from_config(config.clone())?
+        .extract()
+        .standalone()
+        .run_with(|_: SplitInfo, stream| async move { ids_of(stream).await.map(|_| ()) })
+        .await?;
+    let path = outcome.report_path.clone().expect("a report path");
+    assert!(
+        path.ends_with(format!("{}.json", outcome.run_id)),
+        "{path:?}"
+    );
+
+    let reports = list_reports(&dir, &config.job_id).await?;
+    assert_eq!(reports.len(), 2, "the first run's report is kept");
+    let second = &reports[1];
+    assert_eq!(second.run_id, outcome.run_id);
+    assert_eq!(&outcome.report, second, "returned report == file");
+    assert_ne!(second.run_id, reports[0].run_id);
+    assert_eq!(second.status, RunStatus::Succeeded);
+    assert_eq!(second.plan.fingerprint, reports[0].plan.fingerprint);
+    let outcomes: Vec<_> = second.splits.iter().map(|s| s.outcome).collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            SplitOutcome::Skipped,
+            SplitOutcome::Completed,
+            SplitOutcome::Skipped
+        ]
+    );
+    assert_eq!(second.totals.rows_delivered, outcome.rows_delivered);
+    assert_eq!(second.totals.rows_extracted, 30);
+    assert_eq!(second.totals.splits_skipped, 2);
+    // Across both runs every row was delivered exactly once here (no mid-stream failure).
+    assert_eq!(delivered_first + second.totals.rows_delivered, 30);
+    assert!(second.error.is_none());
+
+    // Run 3 with a changed filter fails before scanning: reported with the error, no splits.
+    config.filters = vec![FilterEntry::Single(FilterInput::Shorthand("id>=2".into()))];
+    let err = PostgresConnector::from_config(config.clone())?
+        .extract()
+        .standalone()
+        .run_with(|_: SplitInfo, stream| async move { ids_of(stream).await.map(|_| ()) })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.underlying(),
+        AppError::Checkpoint(CheckpointError::PlanMismatch { .. })
+    ));
+    assert!(err.to_string().starts_with("run r_"), "{err}");
+    let reports = list_reports(&dir, &config.job_id).await?;
+    assert_eq!(reports.len(), 3);
+    let third = &reports[2];
+    assert_eq!(third.status, RunStatus::Failed);
+    assert!(third.splits.is_empty());
+    assert!(third.plan.fingerprint.is_some());
+    assert!(
+        third
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("filters")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    db.cleanup().await;
+    Ok(())
+}
+
+/// Diagnostic runs write a report only when `diagnostic_run_reports` is on, and
+/// `run_reports: false` turns `run_with` reports off. Oracle: the files on disk.
+#[tokio::test]
+async fn run_report_switches() -> R {
+    use rust_ballista_extraction_layer::run_report::{RunKind, RunStatus, list_reports, runs_dir};
+
+    let db = TestDb::connect().await;
+    setup_table(&db, 10).await;
+    let mut config = job(&db, 1);
+    let dir = std::path::PathBuf::from(&config.checkpoint.dir);
+
+    // Default: a diagnostic run leaves no report behind.
+    let outcome = PostgresConnector::from_config(config.clone())?
+        .extract()
+        .standalone()
+        .run()
+        .await?;
+    assert!(outcome.report_path.is_none());
+    assert!(!runs_dir(&dir, &config.job_id).exists());
+
+    // Opted in: the diagnostic run is recorded as such.
+    config.checkpoint.diagnostic_run_reports = true;
+    let outcome = PostgresConnector::from_config(config.clone())?
+        .extract()
+        .standalone()
+        .run()
+        .await?;
+    assert!(outcome.report_path.is_some());
+    let reports = list_reports(&dir, &config.job_id).await?;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].kind, RunKind::Diagnostic);
+    assert_eq!(reports[0].status, RunStatus::Succeeded);
+    assert_eq!(reports[0].totals.rows_delivered, 10);
+
+    // Reports off: `run_with` writes no file, but still returns the report.
+    config.checkpoint.run_reports = false;
+    let outcome = PostgresConnector::from_config(config.clone())?
+        .extract()
+        .standalone()
+        .run_with(|_: SplitInfo, stream| async move { ids_of(stream).await.map(|_| ()) })
+        .await?;
+    assert!(outcome.report_path.is_none());
+    assert_eq!(outcome.report.run_id, outcome.run_id);
+    assert_eq!(outcome.report.status, RunStatus::Succeeded);
+    assert_eq!(outcome.report.totals.rows_delivered, 10);
+    assert_eq!(list_reports(&dir, &config.job_id).await?.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
     db.cleanup().await;
     Ok(())
 }

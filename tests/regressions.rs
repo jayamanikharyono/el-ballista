@@ -1,19 +1,23 @@
-//! Reproductions for `claude/comprehensive-review-2026-09-24.md`.
+//! Regression tests for correctness bugs fixed in El Ballista:
+//! collation-sensitive text ranges, `NOT` over an inexact filter, `-0.0` float ranges, `NOT` /
+//! `IS NULL` precedence in rendered SQL, enum `OR` and uuid `=` filters, reruns with a changed
+//! filter, `±infinity` timestamps, NULL and `i64::MAX` keyset keys, unconstrained NUMERIC and
+//! big jsonb numbers, projection typos, `batch_size` 0, and unsigned / boolean / YEAR / TIME
+//! MySQL columns.
 //!
-//! Every test asserts the **correct** behaviour. All findings are fixed, so every test passes:
-//! a passing test means the finding is FIXED, a failing one means its fix REGRESSED.
-//! Test names carry the finding id from the review (b1_, b2_, c3_, ...).
+//! Every test asserts the **correct** behaviour, so every test passes; a failure means a fix
+//! regressed. The test-name prefixes (`b1_`, `b2_`, `c3_`, `r4_`, ...) are stable regression IDs
+//! (the section comments below list them); the rest of each name describes the bug.
 //!
 //! Oracles (AGENTS.md §7): differential = same SQL with pushdown policy `always` vs `never`;
 //! reference = direct SQL against the source; trivial = hand-written expected value.
 //!
-//! Self-contained on purpose: it does NOT use `tests/common` because `TestDb::drop` could
-//! deadlock when these were written (review finding B6, since fixed). Each test creates its
-//! own schema / database and removes it with an explicit async cleanup.
+//! Self-contained on purpose: it does not use `tests/common` (its `TestDb` teardown could
+//! deadlock when these tests were written; that is fixed). Each test creates its own schema /
+//! database and removes it with an explicit async cleanup.
 //!
 //! Needs the compose stack: `docker compose -f tests/docker/compose.yaml up -d --wait`
-//! Run: `cargo test --test review_repro -- --test-threads=1`
-//! (or `scripts/verify-review.sh`, which does all of it and prints a verdict table).
+//! Run: `cargo test --test regressions -- --test-threads=1`
 
 use arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
@@ -27,7 +31,6 @@ use rust_ballista_extraction_layer::config::{
 };
 use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
 use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 use rust_ballista_extraction_layer::errors::AppError;
 use sqlx::postgres::PgPoolOptions;
@@ -79,7 +82,7 @@ impl Pg {
     async fn new(setup: &[&str]) -> Pg {
         let url = pg_url();
         let (host, port, user, password, database) = parse_pg(&url);
-        // Set once per process, before any connector reads it (T-6: no repeated env
+        // Set once per process, before any connector reads it (no repeated env
         // mutation while other threads may be reading the environment).
         static PASSWORD_ONCE: std::sync::Once = std::sync::Once::new();
         PASSWORD_ONCE.call_once(|| {
@@ -93,7 +96,7 @@ impl Pg {
             .await
             .expect("Postgres not reachable — start tests/docker/compose.yaml");
         let schema = format!(
-            "review_{}_{}",
+            "regr_{}_{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::SeqCst)
         );
@@ -136,7 +139,7 @@ impl Pg {
             &self.database,
             2,
             60_000,
-            "review-repro",
+            "el-ballista-regressions",
         )
         .await
         .expect("extractor connect")
@@ -144,7 +147,7 @@ impl Pg {
 
     fn job(&self, table: &str) -> JobConfig {
         JobConfig {
-            job_id: format!("review-{}-{}", self.schema, table).parse().unwrap(),
+            job_id: format!("regr-{}-{}", self.schema, table).parse().unwrap(),
             table: table.to_string(),
             columns: None,
             filters: Vec::new(),
@@ -156,12 +159,12 @@ impl Pg {
                 database: self.database.clone(),
                 pool_max: 4,
                 statement_timeout_ms: 60_000,
-                application_name: "review-repro".to_string(),
+                application_name: "el-ballista-regressions".to_string(),
                 schema: self.schema.clone(),
             },
             checkpoint: CheckpointConfig {
                 dir: std::env::temp_dir()
-                    .join(format!("review_repro_{}", self.schema))
+                    .join(format!("el_ballista_regressions_{}", self.schema))
                     .to_string_lossy()
                     .to_string(),
                 ..CheckpointConfig::default()
@@ -172,6 +175,7 @@ impl Pg {
             distributed: DistributedConfig {
                 scheduler_url: String::new(),
                 workers: 1,
+                ..DistributedConfig::default()
             },
         }
     }
@@ -180,12 +184,11 @@ impl Pg {
     async fn ids_where(&self, table: &str, policy: &str, filter: &str) -> Result<Vec<i64>, String> {
         let mut cfg = self.job(table);
         cfg.pushdown.policy = policy.parse().unwrap();
-        let ctx = DistributedContext::standalone(&cfg, 1)
+        let ctx = datafusion::prelude::SessionContext::new();
+        rust_ballista_extraction_layer::connector::postgres::register_table(&ctx, &cfg)
             .await
             .map_err(|e| e.to_string())?;
-        ctx.register_source(&cfg).await.map_err(|e| e.to_string())?;
         let df = ctx
-            .session
             .sql(&format!("SELECT id FROM {table} WHERE {filter}"))
             .await
             .map_err(|e| e.to_string())?;
@@ -279,7 +282,7 @@ async fn b1_negative_zero_float_range_loses_rows() -> R {
 async fn b5_not_is_null_rendered_sql_has_wrong_precedence() -> R {
     use datafusion::prelude::col;
     use rust_ballista_extraction_layer::pushdown::translate;
-    // `render_inline` (Postgres inline SQL) moved to the Postgres connector (review A1).
+    // `render_inline` (Postgres inline SQL) lives in the Postgres connector.
     use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
     let pg = Pg::new(&[
         "CREATE TABLE $S.t (id bigint PRIMARY KEY, flag boolean)",
@@ -350,7 +353,7 @@ async fn c5_uuid_equality_fails_when_pushed() -> R {
 // ---------------------------------------------------------------------------------------
 
 /// The checkpointed terminal (`run_with`) with a consumer that counts what it receives.
-/// (`run()` is a checkpoint-free diagnostic since B3, so it cannot reproduce B2.)
+/// (`run()` is a checkpoint-free diagnostic, so it cannot reproduce this.)
 async fn delivered_rows(c: JobConfig) -> Result<u64, AppError> {
     let delivered = AtomicU64::new(0);
     let delivered = &delivered;
@@ -377,7 +380,7 @@ async fn b2_rerun_with_different_filter_is_skipped() -> R {
     let mk = |f: &str| {
         let mut c = pg.job("t");
         // same job, as an orchestrator would reuse it
-        c.job_id = format!("review-b2-{}", pg.schema).parse().unwrap();
+        c.job_id = format!("regr-b2-{}", pg.schema).parse().unwrap();
         c.filters = vec![FilterEntry::Single(FilterInput::Shorthand(f.to_string()))];
         c
     };
@@ -391,7 +394,12 @@ async fn b2_rerun_with_different_filter_is_skipped() -> R {
     // refuses with a typed plan-mismatch error — never "already completed" with run 1's rows.
     let second = match second {
         Ok(rows) => rows,
-        Err(AppError::Checkpoint(CheckpointError::PlanMismatch { .. })) => {
+        Err(e)
+            if matches!(
+                e.underlying(),
+                AppError::Checkpoint(CheckpointError::PlanMismatch { .. })
+            ) =>
+        {
             println!("  run 2 refused: plan mismatch (correct); resetting and re-running");
             let c = mk("id>2");
             let store = JsonCheckpointStore::new(&c.checkpoint.dir)?;
@@ -694,7 +702,7 @@ impl My {
             .await
             .expect("MySQL not reachable — start tests/docker/compose.yaml");
         let db = format!(
-            "review_{}_{}",
+            "regr_{}_{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::SeqCst)
         );

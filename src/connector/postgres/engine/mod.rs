@@ -272,7 +272,7 @@ mod tests {
         let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
         let ctx = ExtractContext::from_config(config).await.unwrap();
         let err = ctx
-            .source("postgress", "public.orders")
+            .source("postgress", "public.payment")
             .await
             .err()
             .unwrap();

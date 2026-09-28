@@ -1,5 +1,6 @@
-//! Decode and partition-coverage correctness against a live Postgres (review findings B4, C1,
-//! C2, C3, C6, C8, M6, N6, R5).
+//! Decode and partition-coverage correctness against a live Postgres: ±infinity and extreme
+//! timestamps, numeric precision, json/uuid text, keyset coverage, strict inputs, and scan
+//! cancellation.
 //!
 //! Oracles (AGENTS.md §7):
 //! - **reference**: the same value rendered/computed by Postgres itself
@@ -7,21 +8,22 @@
 //! - **differential**: cursor path vs binary COPY path;
 //! - **trivial**: hand-written expected values / typed error kinds.
 //!
-//! Self-contained (like `review_repro.rs`): each test creates its own schema and drops it with
+//! Self-contained (like `regressions.rs`): each test creates its own schema and drops it with
 //! an explicit async cleanup instead of relying on `Drop`.
 //! Run: `cargo test --test pg_decode -- --test-threads=1` (needs `tests/docker/compose.yaml`).
 
 use arrow::array::TimestampMicrosecondArray;
 use arrow::array::{Array, Date32Array, Decimal128Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
 use rust_ballista_extraction_layer::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
 use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
 use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
 use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
+use rust_ballista_extraction_layer::connector::postgres::register_table;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -69,7 +71,7 @@ impl Pg {
     async fn new(setup: &[&str]) -> Pg {
         let url = pg_url();
         let (host, port, user, password, database) = parse_pg(&url);
-        // Set once per process, before any connector reads it (T-6: no repeated env
+        // Set once per process, before any connector reads it (no repeated env
         // mutation while other threads may be reading the environment).
         static PASSWORD_ONCE: std::sync::Once = std::sync::Once::new();
         PASSWORD_ONCE.call_once(|| {
@@ -160,6 +162,7 @@ impl Pg {
             distributed: DistributedConfig {
                 scheduler_url: String::new(),
                 workers: 1,
+                ..DistributedConfig::default()
             },
         }
     }
@@ -227,7 +230,7 @@ fn assert_unsupported_value(r: Result<Vec<RecordBatch>, ExtractorError>, column:
 }
 
 // ---------------------------------------------------------------------------------------
-// B4 — ±infinity and extreme timestamps/dates
+// ±infinity and extreme timestamps/dates
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -321,7 +324,7 @@ async fn extreme_finite_timestamps_match_postgres_on_both_paths() -> R {
 }
 
 // ---------------------------------------------------------------------------------------
-// C3 — numeric never silently truncated
+// Numeric never silently truncated
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -401,7 +404,7 @@ async fn unconstrained_numeric_is_exact_or_a_typed_error_on_both_paths() -> R {
 }
 
 // ---------------------------------------------------------------------------------------
-// C6 — json/jsonb/uuid are Postgres' own text, identical on both paths
+// json/jsonb/uuid are Postgres' own text, identical on both paths
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -447,7 +450,7 @@ async fn json_jsonb_uuid_match_postgres_text_on_both_paths() -> R {
 }
 
 // ---------------------------------------------------------------------------------------
-// C1 / C2 — computed keyset partitions cover every row exactly once
+// Computed keyset partitions cover every row exactly once
 // ---------------------------------------------------------------------------------------
 
 async fn partitioned_ids(
@@ -519,8 +522,8 @@ async fn datafusion_keyset_scan_keeps_null_keys_under_pushed_filters() -> R {
         partition_column: "k".to_string(),
     };
     cfg.pushdown.policy = "always".parse().unwrap();
-    let ctx = DistributedContext::standalone(&cfg, 1).await?;
-    ctx.register_source(&cfg).await?;
+    let ctx = SessionContext::new();
+    register_table(&ctx, &cfg).await?;
     let ids = |batches: Vec<RecordBatch>| {
         let mut v: Vec<i64> = batches
             .iter()
@@ -532,10 +535,9 @@ async fn datafusion_keyset_scan_keeps_null_keys_under_pushed_filters() -> R {
         v.sort_unstable();
         v
     };
-    let all = ids(ctx.session.sql("SELECT id FROM t").await?.collect().await?);
+    let all = ids(ctx.sql("SELECT id FROM t").await?.collect().await?);
     // A pushed filter ANDed with `(range) OR k IS NULL` must stay correctly parenthesized.
     let even = ids(ctx
-        .session
         .sql("SELECT id FROM t WHERE flag = true")
         .await?
         .collect()
@@ -547,7 +549,7 @@ async fn datafusion_keyset_scan_keeps_null_keys_under_pushed_filters() -> R {
 }
 
 // ---------------------------------------------------------------------------------------
-// C8 / M6 / N6 — strict inputs
+// Strict inputs
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -560,7 +562,7 @@ async fn strict_inputs_are_typed_errors() -> R {
     let ex = pg.extractor().await;
     let table = pg.table("t");
 
-    // C8: unknown projection column, named.
+    // Unknown projection column, named.
     let err = ex
         .extract_full_table(&table, Some(vec!["id", "nmae"]))
         .await
@@ -570,7 +572,7 @@ async fn strict_inputs_are_typed_errors() -> R {
         "{err}"
     );
 
-    // N6: batch_size 0 on every extractor path.
+    // `batch_size` 0 on every extractor path.
     let zero = ex
         .extract_full_table_for_each_batch(&table, None, 0, 1024, &mut |_| Ok(()))
         .await;
@@ -593,15 +595,15 @@ async fn strict_inputs_are_typed_errors() -> R {
         "{zero:?}"
     );
 
-    // M6: missing table, extractor path and provider path.
+    // Missing table, extractor path and provider path.
     let missing = ex.extract_full_table(&pg.table("nope"), None).await;
     assert!(
         matches!(missing, Err(ExtractorError::TableNotFound(_))),
         "{missing:?}"
     );
     let cfg = pg.job("nope", "pg-decode-missing");
-    let ctx = DistributedContext::standalone(&cfg, 1).await?;
-    let registered = ctx.register_source(&cfg).await;
+    let ctx = SessionContext::new();
+    let registered = register_table(&ctx, &cfg).await;
     pg.cleanup().await;
     let err = registered.expect_err("provider must not register a missing table");
     assert!(err.to_string().contains("not found"), "{err}");
@@ -609,7 +611,7 @@ async fn strict_inputs_are_typed_errors() -> R {
 }
 
 // ---------------------------------------------------------------------------------------
-// R5 — dropping a DataFusion scan stream stops the source query
+// Dropping a DataFusion scan stream stops the source query
 // ---------------------------------------------------------------------------------------
 
 /// Backends of `application_name` that are still running something or holding a
@@ -639,10 +641,9 @@ async fn dropping_a_scan_stream_stops_the_source() -> R {
         let mut cfg = pg.job("t", &app);
         cfg.execution.batch_size = 1000;
         cfg.execution.use_copy = use_copy;
-        let ctx = DistributedContext::standalone(&cfg, 1).await?;
-        ctx.register_source(&cfg).await?;
+        let ctx = SessionContext::new();
+        register_table(&ctx, &cfg).await?;
         let mut stream = ctx
-            .session
             .sql("SELECT id, pad FROM t")
             .await?
             .execute_stream()

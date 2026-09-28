@@ -109,6 +109,7 @@ impl SourcePoolRegistry {
     }
 
     fn entry(&self, descriptor: &PostgresConnectionDescriptor) -> Result<Entry, ExtractorError> {
+        let size = descriptor.budgeted_max_connections();
         let key = format!("{}|rt={}", descriptor.registry_key(), runtime_key());
         let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         pools.retain(|_, entry| !entry.pool.is_closed());
@@ -130,7 +131,7 @@ impl SourcePoolRegistry {
         let statement_timeout = format!("{}ms", descriptor.statement_timeout_ms);
 
         let pool = PgPoolOptions::new()
-            .max_connections(descriptor.budgeted_max_connections())
+            .max_connections(size.max(1))
             .acquire_timeout(descriptor.acquire_timeout())
             .idle_timeout(IDLE_TIMEOUT)
             .after_connect(move |conn, _meta| {
@@ -155,7 +156,7 @@ impl SourcePoolRegistry {
             })
             .connect_lazy_with(connect_options);
 
-        let budget = usize::try_from(descriptor.budgeted_max_connections()).unwrap_or(1);
+        let budget = usize::try_from(size).unwrap_or(1);
         let entry = Entry {
             pool,
             scans: Arc::new(Semaphore::new(budget.max(1))),
@@ -321,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_pool_key_includes_session_settings_and_credentials_source() {
-        // S3: a second job must not inherit the first job's session settings.
+        // A second job must not inherit the first job's session settings.
         let base = descriptor(1);
         let mut timeout = base.clone();
         timeout.statement_timeout_ms = 5;
@@ -337,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_slots_match_the_budget_and_are_shared() {
-        // S1: one limiter per source, sized to the per-process connection budget.
+        // One limiter per source, sized to the per-process connection budget.
         let mut d = descriptor(4); // pool_max 8 / 4 workers = 2
         d.password_env = "PATH".into(); // lazy pool; any set variable works
         let a = registry().scan_slots(&d).unwrap();
@@ -353,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_acquire_timeout_never_undercuts_statement_timeout() {
-        // S1: a scan waiting for a connection held by a sibling scan must not hit a 30 s
+        // A scan waiting for a connection held by a sibling scan must not hit a 30 s
         // cliff while the holder is still within its statement timeout.
         let mut d = descriptor(1);
         d.statement_timeout_ms = 300_000;
@@ -368,7 +369,7 @@ mod tests {
     async fn test_close_all_empties_the_registry() {
         let reg = SourcePoolRegistry::new();
         // Lazy pool, never connects: an always-present variable is a valid password source,
-        // so the test does not mutate the environment (T-6).
+        // so the test does not mutate the environment.
         let mut d = descriptor(1);
         d.password_env = "PATH".into();
         let pool = reg.pool(&d).unwrap(); // lazy: no connection is opened
@@ -380,7 +381,7 @@ mod tests {
 
     #[test]
     fn test_deferred_get_fails_cleanly_without_password_env() {
-        // `UNUSED_TEST_ENV` is never set anywhere (no env mutation needed, T-6).
+        // `UNUSED_TEST_ENV` is never set anywhere (no env mutation needed).
         let pool = SourcePool::deferred(descriptor(1));
         assert!(pool.get().is_err());
         // A second get must not panic and must keep failing (lazy init already cached the error).

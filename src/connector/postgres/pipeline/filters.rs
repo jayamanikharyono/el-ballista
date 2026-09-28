@@ -126,8 +126,8 @@ impl Pipeline {
     /// extraction schema: an RFC3339 (or `%Y-%m-%d`) string on a timestamp column
     /// becomes a real timestamp literal that pushes to the source — so
     /// orchestrator-supplied time ranges push instead of degrading to Arrow-side
-    /// filtering after a full scan. Date strings become date literals that
-    /// evaluate correctly in Arrow (date-literal pushdown is deferred).
+    /// filtering after a full scan. A `%Y-%m-%d` string on a date column becomes
+    /// a date literal, which pushes the same way.
     pub(crate) fn filter_exprs_with_schema(&self, schema: &Schema) -> Result<Vec<Expr>, AppError> {
         self.filter_groups()?
             .iter()
@@ -176,14 +176,17 @@ impl Pipeline {
         // a warmed production provider would.
         provider.warm_explain(&exprs).await;
         let verdicts = provider.supports_filters_pushdown(&refs)?;
+        // Reasons for the whole set at once: a range filter is judged together with the
+        // other ranges on its column, exactly as `supports_filters_pushdown` just did.
+        let reasons = provider.explain_decisions(&refs);
 
         Ok(groups
             .iter()
             .zip(exprs)
             .zip(verdicts)
-            .map(|((group, expr), pushdown)| {
+            .zip(reasons)
+            .map(|(((group, expr), pushdown), reason)| {
                 let pushed_to_source = pushdown != TableProviderFilterPushDown::Unsupported;
-                let reason = provider.explain_decision(&expr);
                 FilterDecision {
                     filter: describe_group(group),
                     expr,
@@ -220,7 +223,7 @@ fn or_group(exprs: Vec<Expr>) -> Result<Expr, AppError> {
 
 /// Canonical display for one AND-conjunct: a singleton renders as its spec,
 /// an OR-group as `(a OR b)`.
-fn describe_group(group: &[FilterSpec]) -> String {
+pub(super) fn describe_group(group: &[FilterSpec]) -> String {
     match group {
         [] => "(empty OR-group)".to_string(),
         [single] => single.describe(),
@@ -359,8 +362,8 @@ impl FilterSpec {
     /// column's Arrow type says more: an RFC3339 (or `%Y-%m-%d`) string on a
     /// timestamp column becomes a real timestamp literal that pushes to the
     /// source; a `%Y-%m-%d` string on a date column becomes a date literal that
-    /// evaluates correctly in Arrow (date-literal pushdown is deferred — only
-    /// timestamp literals translate today). Anything else falls back to
+    /// pushes too (as a `date` comparison, so a plain index on the column can
+    /// serve it). Anything else falls back to
     /// [`FilterSpec::to_expr`].
     pub(crate) fn to_expr_with_type(&self, dtype: Option<&DataType>) -> Result<Expr, AppError> {
         let column = self.column.trim();
@@ -503,7 +506,7 @@ mod tests {
     fn from_config_file_loads_extract_job() {
         let pipeline =
             Pipeline::from_config_file("examples/configs/full_extract.example.json").unwrap();
-        assert_eq!(pipeline.config().job_id, "orders_full");
+        assert_eq!(pipeline.config().job_id, "payment_full");
     }
 
     #[test]
@@ -514,22 +517,25 @@ mod tests {
         // synthetically instead of coupling to this fixture.
         let config = JobConfig::from_file("examples/configs/extract.example.json").unwrap();
         let pipeline = Pipeline::from_config(config).unwrap();
-        assert_eq!(pipeline.config().job_id, "orders_extract");
+        assert_eq!(pipeline.config().job_id, "payment_extract");
         // Flat specs: 4 predicates across 4 AND-conjuncts.
         let specs = pipeline.filter_specs().unwrap();
         assert_eq!(specs.len(), 4);
-        assert_eq!(specs[0].describe(), "status = 'PAID'");
-        assert_eq!(specs[1].describe(), "amount > 100");
-        assert_eq!(specs[2].describe(), "updated_at >= '2026-01-01T00:00:00Z'");
-        assert_eq!(specs[3].describe(), "user_id >= 500");
+        assert_eq!(
+            specs[0].describe(),
+            "payment_date >= '2007-04-06T00:00:00Z'"
+        );
+        assert_eq!(specs[1].describe(), "payment_date < '2007-04-13T00:00:00Z'");
+        assert_eq!(specs[2].describe(), "customer_id >= 300");
+        assert_eq!(specs[3].describe(), "amount > 5");
         // Grouped: 4 singleton conjuncts, each lowering to its own expression.
         let groups = pipeline.filter_groups().unwrap();
         assert_eq!(groups.len(), 4);
         assert!(groups.iter().all(|g| g.len() == 1));
         let exprs = pipeline.filter_exprs().unwrap();
         assert_eq!(exprs.len(), 4);
-        assert_eq!(exprs[0], col("status").eq(lit("PAID")));
-        assert_eq!(exprs[1], col("amount").gt(lit(100i64)));
+        assert_eq!(exprs[2], col("customer_id").gt_eq(lit(300i64)));
+        assert_eq!(exprs[3], col("amount").gt(lit(5i64)));
     }
 
     #[test]

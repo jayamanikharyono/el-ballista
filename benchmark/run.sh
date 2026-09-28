@@ -2,33 +2,49 @@
 # Full-load benchmark: Rust extraction layer vs PySpark, same Postgres, same query.
 #
 # Modes (`--mode standalone|distributed|both`, default both):
-# - standalone:  Rust scans through in-process Ballista (one container, no cluster).
+# - standalone:  Rust scans through plain DataFusion (one container, no Ballista at all).
 # - distributed: Rust scans through a real scheduler + worker deployment
-#                (bench-scheduler + bench-worker-N containers, remote client).
+#                (bench-scheduler + bench-worker-N containers, remote client). The engine
+#                cores are split: the first core runs the scheduler + client, every
+#                worker gets its own core(s) from the rest (default 3 workers on 0-3).
+#                A fresh cluster is started for every attempt, like every other engine
+#                container, so per-container figures cover exactly one run.
 # Spark runs local[*] unless --spark-cores caps it (its own cluster modes are out of
 # scope here).
 #
 # Workload (identical everywhere): scenarios `full` (SELECT * -> Parquet) and `selective`
 # (indexed ~3% slice + narrow projection -> Parquet).
 # Rust side fans out over RUST_PARTITIONS keyset ranges; Spark over SPARK_PARTITIONS
-# JDBC partitions on order_id. Both default to ceil(table_rows / 64000) unless
-# --batch-size overrides the reference. Everything runs sequentially (never parallel)
-# so nothing contends for CPU.
+# JDBC partitions on order_id. Both default to the engine core count (4 on the 0-3 pin),
+# which is Spark's own default parallelism for local[*]; everything else (fetch size,
+# batch size, shuffle settings) is each tool's default. --batch-size no longer changes
+# the partition count. Both engines write ONE Parquet file, and both are timed end to
+# end: from the entry point of the program to the last byte written. Everything runs
+# sequentially (never parallel) so nothing contends for CPU.
 #
 # Usage:
 #   benchmark/run.sh [--clean] [--skip-scale] [--repeat N] [--workers N] [--spark-partitions N]
 #                    [--spark-cores N] [--rust-partitions N] [--batch-size N] [--pull] [--no-build]
 #                    [--mode standalone|distributed|both] [--parallel-strategy keyset|ctid]
-#                    [--no-use-copy]
+#                    [--no-use-copy] [--max-retries N] [--attempt-timeout SECS]
 #                    [--cpus N] [--cpuset-cpus RANGE] [--memory SIZE]
 #                    [--scheduler-memory SIZE] [--client-memory SIZE] [--worker-memory SIZE]
+#
+# Hangs and failed attempts: every attempt runs under a watchdog. It kills the attempt when
+# a container it depends on stops (e.g. an OOM-killed worker), or when it has produced no
+# result after --attempt-timeout seconds (default 1800; 0 = no limit). A killed or failed
+# attempt is discarded and run again from scratch (fresh cluster for distributed), up to
+# --max-retries times per case (default 2); after that the case is marked FAILED and the
+# run moves on. The library's own distributed job retry is switched off in the benchmark
+# config (distributed.max_retries 0): a re-run inside the client would finish on a smaller
+# cluster, and that time is not comparable.
 #
 # CPU + memory budget (every container the script starts):
 #   CPU defaults to a hard pin on cores 0-3 (--cpuset-cpus 0-3). Equality is enforced
 #   ONLY at this container boundary: inside, every runtime runs unrestricted (Spark
 #   local[*], DataFusion defaults, Ballista visible-CPU slots) and takes all the CPUs
 #   the container offers. A host with fewer cores than the pins name (default layout:
-#   6 — engines 0-3 + bench-pg 4-5) fails fast before any container starts, instead of
+#   8 — engines 0-3 + bench-pg 4-7) fails fast before any container starts, instead of
 #   silently benchmarking the wrong budget. --cpuset-cpus RANGE pins a different set
 #   ("" lifts the pin); --cpus N replaces the pin with a softer CFS quota.
 #   Never cap a runtime from the inside (--spark-cores, BENCH_CONCURRENT_TASKS) for
@@ -38,10 +54,10 @@
 #   standalone Rust client each get it in full; the distributed deployment (scheduler +
 #   client + workers) SHARES it — scheduler/client take --scheduler-memory/--client-memory
 #   (512m each) and each worker gets --worker-memory (default: the remainder split evenly).
-#   Postgres is NOT on this budget: bench-pg is hardcoded to --cpuset-cpus=4-5 --memory=2g
+#   Postgres is NOT on this budget: bench-pg is hardcoded to --cpuset-cpus=4-7 --memory=2g
 #   (PG_CPUSET/PG_MEM) so the shared fixture never changes shape between runs. The script
 #   checks the Docker host's core count against every pin (engines and bench-pg) before
-#   starting anything, so the default layout needs a host with >= 6 cores.
+#   starting anything, so the default layout needs a host with >= 8 cores.
 #   Pass an empty value to lift any default (e.g. --memory "" = unconstrained).
 #   Also settable via CPUSET_CPUS / CPUS / MEMORY / SCHEDULER_MEMORY / CLIENT_MEMORY /
 #   WORKER_MEMORY env.
@@ -59,8 +75,11 @@
 #            SPARK_DRIVER_MEM (default: solved from the container budget via Spark's
 #            own overhead formula, max(384m, 10% of heap); explicit value always wins;
 #            on tiny hosts the computed heap can OOM mid-write — set it explicitly),
-#            BENCH_CONCURRENT_TASKS (default empty: each worker uses all its visible
-#            CPUs as task slots — the pinned budget, never capped for headline runs).
+#            BENCH_CONCURRENT_TASKS (default: each worker's source-connection share,
+#            POOL_MAX / WORKERS, so every budgeted connection can be busy — the same rule
+#            standalone follows; scans are bounded by connections, not cores).
+#            POOL_MAX (default 12: divisible by 3 and 4, so standalone and a 3- or
+#            4-worker cluster open the same number of source connections).
 #            PARALLEL_STRATEGY (default keyset): keyset or ctid - partitioning strategy.
 #
 # Outputs: benchmark/results/*.json (best runs, peaks + per-container breakdown baked in),
@@ -84,35 +103,43 @@ PGDATA="bench-pgdata"
 PG_PORT="${PG_PORT:-5433}"
 PG_PASSWORD="${BENCH_PG_PASSWORD:-postgres}"
 # Postgres test budget — HARDCODED, not a flag: every benchmark run faces the same
-# source database (cores 4-5, 2g RAM). A hard pin, not a quota: like the engines, PG
+# source database (cores 4-7, 2g RAM). A hard pin, not a quota: like the engines, PG
 # gets named cores or the run fails fast (host core check below) on a smaller host
 # instead of silently benchmarking a different fixture. Cores sit clear of the engine
 # pin (0-3) so the fixture never contends with the engines. A shared fixture must never
 # change shape between runs; override by editing here, never per invocation, so results
 # stay comparable. PG_CPUSET and PG_MEM are what verify_pin checks bench-pg against.
-PG_CPUSET="4-5"
+PG_CPUSET="4-7"
 PG_MEM="2g"
 PG_CPU_FLAGS="--cpuset-cpus=$PG_CPUSET"
 PG_MEM_FLAGS="--memory=$PG_MEM"
-WORKERS=4
-# Batch size is the input knob (empty = auto, each tool's own default); partition
-# counts DERIVE from a reference batch size (64000 unless --batch-size overrides it)
-# as ceil(table_rows / ref) so each partition holds roughly one batch worth of rows.
-# Both engines use the same derived count — neither side wins on granularity.
-# Explicit --rust-partitions / --spark-partitions flags override the derivation
-# per engine.
+WORKERS=3
+# Source connection budget written into the Rust job config. 12 divides by 3 and 4, so
+# standalone (12) and the distributed deployment (WORKERS x 12/WORKERS) open the same
+# number of connections to the source.
+POOL_MAX="${POOL_MAX:-12}"
+# Partition counts default to the engine core count (see ENGINE_CORES below) on BOTH
+# engines — Spark's own default parallelism for local[*] — so neither side is tuned and
+# neither wins on granularity. Explicit --rust-partitions / --spark-partitions flags
+# override per engine (diagnostics; keep them equal for headline numbers).
 SPARK_PARTITIONS=""
 RUST_PARTITIONS=""
 # BATCH_SIZE empty = auto: batch_size is omitted from the Rust config (code default
-# 8192 applies) and BENCH_FETCHSIZE is left unset for Spark (JDBC default applies).
+# 8192 applies) and Spark's JDBC fetchsize is set to the same 8192 (SPARK_AUTO_FETCHSIZE).
+# Spark's own default (fetchsize 0) makes the Postgres driver hold each partition's whole
+# result in the heap: 12.5M rows per task at 50M rows / 4 partitions, which runs out of
+# memory at every budget. Streaming in the same chunk size as Rust is the equal setting.
 # Set via --batch-size to force the same rows-per-batch on both engines.
 BATCH_SIZE=""
+SPARK_AUTO_FETCHSIZE=8192
 # Rust source scan path: COPY (SELECT ...) TO STDOUT (FORMAT BINARY) when 1
 # (default), cursor FETCH when 0 (--no-use-copy). COPY skips per-row SQL
 # parse/bind/portal overhead; pushed-filter selective scans always use cursors
 # (COPY accepts no bind parameters) — logged loudly per partition either way.
 USE_COPY=1
 REPEAT=1
+MAX_RETRIES=2
+ATTEMPT_TIMEOUT=1800
 SCALE=1
 CLEAN=0
 PULL=0
@@ -150,6 +177,8 @@ while [ $# -gt 0 ]; do
     --clean) CLEAN=1; shift ;;
     --skip-scale) SCALE=0; shift ;;
     --repeat) REPEAT="$2"; shift 2 ;;
+    --max-retries) MAX_RETRIES="$2"; shift 2 ;;
+    --attempt-timeout) ATTEMPT_TIMEOUT="$2"; shift 2 ;;
     --workers) WORKERS="$2"; shift 2 ;;
     --spark-partitions) SPARK_PARTITIONS="$2"; shift 2 ;;
     --spark-cores) SPARK_CORES="$2"; shift 2 ;;
@@ -171,6 +200,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+for _v in MAX_RETRIES ATTEMPT_TIMEOUT; do
+  [ "${!_v}" -ge 0 ] 2>/dev/null || { echo "--$(echo "$_v" | tr 'A-Z_' 'a-z-') must be a whole number >= 0 (got '${!_v}')" >&2; exit 2; }
+done
+
 case "$MODE" in
   standalone|distributed|both) ;;
   *) echo "--mode must be standalone, distributed, or both" >&2; exit 2 ;;
@@ -188,6 +221,51 @@ if [ "$CPUS_GIVEN" = 1 ] && [ "$CPUSET_GIVEN" = 0 ]; then CPUSET_CPUS=""; fi
 CPU_FLAGS=""
 [ -n "$CPUSET_CPUS" ] && CPU_FLAGS="$CPU_FLAGS --cpuset-cpus=$CPUSET_CPUS"
 [ -n "$CPUS" ] && CPU_FLAGS="$CPU_FLAGS --cpus=$CPUS"
+
+# Distributed core layout. On a cpuset pin the engine cores are SPLIT, not shared: the
+# first core runs the control plane (scheduler + the client that writes the Parquet
+# file), and the remaining cores are dealt to the workers (each gets its own). The
+# deployment's total stays exactly the engine pin, so it is still the same budget as
+# standalone and Spark. Too few cores for WORKERS + 1, or a --cpus quota instead of a
+# pin, falls back to every container sharing the whole budget (with a warning).
+expand_cpuset() { # 0-3 -> "0 1 2 3", 0,2-3 -> "0 2 3"
+  local spec=$1 part lo hi out=""
+  for part in ${spec//,/ }; do
+    case "$part" in
+      *-*) lo=${part%-*}; hi=${part#*-}; out="$out $(seq -s ' ' "$lo" "$hi")" ;;
+      *) out="$out $part" ;;
+    esac
+  done
+  echo $out
+}
+DIST_CONTROL_CPUSET="$CPUSET_CPUS"
+DIST_WORKER_CPUSETS=()
+DIST_LAYOUT="shared"
+if [ -n "$CPUSET_CPUS" ] && [ -z "$CPUS" ]; then
+  read -r -a _cores <<< "$(expand_cpuset "$CPUSET_CPUS")"
+  if [ "${#_cores[@]}" -ge $(( WORKERS + 1 )) ]; then
+    DIST_CONTROL_CPUSET="${_cores[0]}"
+    _rest=$(( ${#_cores[@]} - 1 )); _per=$(( _rest / WORKERS )); _extra=$(( _rest % WORKERS ))
+    _idx=1
+    for _w in $(seq 1 "$WORKERS"); do
+      _n=$_per; [ "$_w" -le "$_extra" ] && _n=$(( _n + 1 ))
+      _set=$(IFS=,; echo "${_cores[*]:$_idx:$_n}")
+      DIST_WORKER_CPUSETS+=("$_set"); _idx=$(( _idx + _n ))
+    done
+    DIST_LAYOUT="split"
+  fi
+fi
+if [ "$DIST_LAYOUT" = "shared" ]; then
+  for _w in $(seq 1 "$WORKERS"); do DIST_WORKER_CPUSETS+=("$CPUSET_CPUS"); done
+  if [ "$MODE" != "standalone" ] && [ -n "$CPUSET_CPUS$CPUS" ]; then
+    echo "WARN: distributed containers share the whole engine budget (need a cpuset pin with >= $(( WORKERS + 1 )) cores to give each worker its own)" >&2
+  fi
+fi
+dist_flags() { # $1=cpuset -> docker CPU flags for one distributed container
+  if [ "$DIST_LAYOUT" = "split" ]; then echo "--cpuset-cpus=$1"; else echo "$CPU_FLAGS"; fi
+}
+# Worker task slots default to the worker's source-connection share.
+BENCH_CONCURRENT_TASKS="${BENCH_CONCURRENT_TASKS:-$(( POOL_MAX / WORKERS ))}"
 
 # Peak correction: a cpuset pin is kernel-enforced, so no true peak can ever exceed
 # pin_cpus x 100%. Measured per-tick sums still overshoot it (misaligned per-container
@@ -325,7 +403,7 @@ if [ "$CLEAN" = "1" ]; then
 fi
 
 # Fail fast on a host too small for the pins: every cpuset (engine default 0-3, bench-pg
-# 4-5) must name cores the Docker host actually has. Checked here, before any container
+# 4-7) must name cores the Docker host actually has. Checked here, before any container
 # starts, instead of surfacing as a `docker run` error (or a silently reused, differently
 # pinned container) mid-run.
 cpuset_max() { # highest core index in a cpuset spec: 0-3 -> 3, 0,2 -> 2, 4-5 -> 5
@@ -349,19 +427,19 @@ for spec in "$CPUSET_CPUS" "$PG_CPUSET"; do
 done
 
 # --- distributed cluster (scheduler + workers) -------------------------------
-# Started once per run when MODE includes distributed; torn down afterwards (and by
-# the EXIT trap). Workers advertise --hostname-matching names so the scheduler can
+# Started fresh for every distributed attempt by run_rust and torn down right after it
+# (and by the EXIT trap). Workers advertise --hostname-matching names so the scheduler can
 # dial them back; all processes resolve the source password independently.
 
 start_cluster() {
   echo "== start scheduler + $WORKERS worker(s)"
   # shellcheck disable=SC2086
-  $CLI run -d $CPU_FLAGS $MEM_SCHED --name bench-scheduler --hostname bench-scheduler --network "$NET" \
+  $CLI run -d $(dist_flags "$DIST_CONTROL_CPUSET") $MEM_SCHED --name bench-scheduler --hostname bench-scheduler --network "$NET" \
     -e BENCH_ROLE=scheduler -e BENCH_SCHEDULER_URL="$SCHEDULER_URL" \
     -e BENCH_PG_PASSWORD="$PG_PASSWORD" \
     -p "127.0.0.1:${SCHED_API_PORT}:50050" \
     "$IMG_RUST" >/dev/null
-  verify_pin bench-scheduler
+  verify_pin bench-scheduler "$DIST_CONTROL_CPUSET"
 
   echo -n "waiting for scheduler REST API"
   for _ in $(seq 1 60); do
@@ -375,12 +453,12 @@ start_cluster() {
   local i
   for i in $(seq 1 "$WORKERS"); do
     # shellcheck disable=SC2086
-    $CLI run -d $CPU_FLAGS $MEM_WORKER --name "bench-worker-$i" --hostname "bench-worker-$i" --network "$NET" \
+    $CLI run -d $(dist_flags "${DIST_WORKER_CPUSETS[$(( i - 1 ))]}") $MEM_WORKER --name "bench-worker-$i" --hostname "bench-worker-$i" --network "$NET" \
       -e BENCH_ROLE=worker -e BENCH_SCHEDULER_URL="$SCHEDULER_URL" \
       -e BENCH_PG_PASSWORD="$PG_PASSWORD" \
-      -e BENCH_CONCURRENT_TASKS="${BENCH_CONCURRENT_TASKS:-}" \
+      -e BENCH_CONCURRENT_TASKS="$BENCH_CONCURRENT_TASKS" \
       "$IMG_RUST" >/dev/null
-    verify_pin "bench-worker-$i"
+    verify_pin "bench-worker-$i" "${DIST_WORKER_CPUSETS[$(( i - 1 ))]}"
   done
 
   echo -n "waiting for $WORKERS executor(s) to register"
@@ -658,6 +736,10 @@ EOF
 }
 
 mkdir -p "$RESULTS" "$OUTPUT"
+# A container left over from an interrupted earlier run would make the first `docker run`
+# of its name fail (name conflict) and the watchdog would then read the OLD container's
+# state: remove them all up front, not only on exit.
+cleanup_containers
 trap cleanup_containers EXIT
 # Drop previous result files: a skipped mode (--mode standalone) must not report
 # another invocation's distributed numbers as its own.
@@ -741,24 +823,64 @@ sample_stats() { # $1=container $2=csv
   sample_cluster "${2%_cluster.csv}" "$1" --single "$1" --pg "$PG"
 }
 
-run_rust() { # $1=tag $2=scenario $3=filter $4=columns $5=mode $6=stats prefix
-  local tag=$1 scenario=$2 filter=$3 columns=$4 mode=$5 sprefix=$6
-  local name=bench-rust sched_url="" mem=$MEM_RUST
+# How a stopped container ended: "exit 137, OOMKilled=true".
+container_death() { # $1=container
+  $CLI inspect -f 'exit {{.State.ExitCode}}, OOMKilled={{.State.OOMKilled}}' "$1" 2>/dev/null \
+    || echo "container gone"
+}
+
+# `docker wait`, but never forever. Kills container $1 when one of the containers it depends
+# on (rest of the args, e.g. the cluster of a distributed client) stops, or when
+# ATTEMPT_TIMEOUT (> 0) seconds pass. Prints the exit code; a kill also writes why to $2.
+watch_wait() { # $1=container $2=reason file, rest...=containers that must stay up
+  local name=$1 reason_file=$2 start=$SECONDS c
+  shift 2
+  rm -f "$reason_file"
+  while [ "$($CLI inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]; do
+    for c in "$@"; do
+      if [ "$($CLI inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" != "true" ]; then
+        echo "$c stopped mid-run ($(container_death "$c"))" > "$reason_file"
+        break 2
+      fi
+    done
+    if [ "$ATTEMPT_TIMEOUT" -gt 0 ] && [ $(( SECONDS - start )) -ge "$ATTEMPT_TIMEOUT" ]; then
+      echo "no result after ${ATTEMPT_TIMEOUT}s (--attempt-timeout)" > "$reason_file"
+      break
+    fi
+    sleep 2
+  done
+  if [ -f "$reason_file" ]; then
+    echo "!! killing $name: $(cat "$reason_file")" >&2
+    $CLI kill "$name" >/dev/null 2>&1 || true
+  fi
+  $CLI wait "$name" 2>/dev/null || echo 1
+}
+
+run_rust() { # $1=tag $2=scenario $3,$4=(unused: Rust reads the scenario from its config) $5=mode $6=stats prefix
+  local tag=$1 scenario=$2 mode=$5 sprefix=$6
+  local name=bench-rust sched_url="" mem=$MEM_RUST cpu_flags=$CPU_FLAGS pin=$CPUSET_CPUS
   if [ "$mode" = "distributed" ]; then
     name=bench-rust-dist
     sched_url="$SCHEDULER_URL"
     mem=$MEM_CLIENT
+    cpu_flags=$(dist_flags "$DIST_CONTROL_CPUSET"); pin=$DIST_CONTROL_CPUSET
+    # A fresh cluster per attempt (like every other engine container): per-container
+    # figures, memory.peak included, then cover exactly this run. Cluster start-up is
+    # infrastructure, outside the client's timed section. Subshell: helpers `exit`.
+    stop_cluster
+    ( start_cluster ) >&2 || { stop_cluster; echo "cluster did not start" >&2; return 1; }
   fi
+  $CLI rm -f "$name" >/dev/null 2>&1 || true  # never attach to a stale container
   # shellcheck disable=SC2086
-  $CLI run -d $CPU_FLAGS $mem --name "$name" --network "$NET" \
+  $CLI run -d $cpu_flags $mem --name "$name" --network "$NET" \
     -e BENCH_PG_PASSWORD="$PG_PASSWORD" -e BENCH_WORKERS="$WORKERS" \
     -e BENCH_OUTPUT=/output/orders_rust_${mode}_${scenario}.parquet \
-    -e BENCH_FILTER="$filter" -e BENCH_COLUMNS="$columns" -e BENCH_SCENARIO="$scenario" \
+    -e BENCH_SCENARIO="$scenario" \
     -e BENCH_SCHEDULER_URL="$sched_url" \
     -v "$OUTPUT:/output" \
-    -v "$BENCH_DIR/bench-config.json:/etc/bench/config.json:ro" \
+    -v "$BENCH_DIR/bench-config-${scenario}.json:/etc/bench/config.json:ro" \
     "$IMG_RUST" >/dev/null
-  verify_pin "$name"
+  verify_pin "$name" "$pin"
   # Mount sanity: a stale bind shows up as ENOENT minutes later otherwise.
   if $CLI ps --format '{{.Names}}' | grep -qx "$name" \
     && ! $CLI exec "$name" sh -c 'touch /output/.writetest && rm /output/.writetest' >/dev/null 2>&1; then
@@ -772,11 +894,13 @@ run_rust() { # $1=tag $2=scenario $3=filter $4=columns $5=mode $6=stats prefix
   else
     sample_stats "$name" "${sprefix}_cluster.csv" &
   fi
-  local code; code=$($CLI wait "$name")
+  local code watch=()
+  [ "$mode" = "distributed" ] && watch=(bench-scheduler $(seq -f "bench-worker-%g" 1 "$WORKERS"))
+  code=$(watch_wait "$name" "${sprefix}.reason" ${watch[@]+"${watch[@]}"})
   wait
   if [ "$mode" = "distributed" ]; then
-    # Exact cgroup high-water marks of the long-lived cluster containers (the client
-    # reports its own in its JSON). Lifetime peaks: they span every scenario served.
+    # Exact cgroup high-water marks of the cluster containers (the client reports its
+    # own in its JSON). The cluster was started for this attempt, so these cover it.
     local c peaks="{"
     for c in bench-scheduler $(seq -f "bench-worker-%g" 1 "$WORKERS"); do
       local v; v=$($CLI exec "$c" cat /sys/fs/cgroup/memory.peak 2>/dev/null | tr -dc 0-9)
@@ -791,8 +915,12 @@ run_rust() { # $1=tag $2=scenario $3=filter $4=columns $5=mode $6=stats prefix
     echo "--- host output dir ---" >&2
     ls -la "$OUTPUT" >&2 || true
   fi
+  if [ "$code" != "0" ] && [ ! -f "${sprefix}.reason" ]; then
+    echo "$name exited ($(container_death "$name"))" > "${sprefix}.reason"
+  fi
   $CLI rm -f "$name" >/dev/null
-  [ "$code" = "0" ] || { echo "rust container failed (exit $code)" >&2; return 1; }
+  [ "$mode" = "distributed" ] && stop_cluster
+  [ "$code" = "0" ] || { echo "rust container failed: $(cat "${sprefix}.reason")" >&2; return 1; }
   [ -n "$json" ] || { echo "rust container produced no JSON summary" >&2; return 1; }
   echo "$json"
 }
@@ -801,13 +929,14 @@ run_spark() { # $1=tag $2=scenario $3=filter $4=columns $5=stats prefix
   local tag=$1 scenario=$2 filter=$3 columns=$4 sprefix=$5
   local master="local[*]"
   [ -n "$SPARK_CORES" ] && master="local[$SPARK_CORES]"
+  $CLI rm -f bench-spark >/dev/null 2>&1 || true  # never attach to a stale container
   # shellcheck disable=SC2086
   $CLI run -d $CPU_FLAGS $MEM_SPARK --name bench-spark --network "$NET" --shm-size=1g \
     -e BENCH_PG_HOST="$PG" -e BENCH_PG_PORT=5432 -e BENCH_PG_DB=app \
     -e BENCH_PG_USER=postgres -e BENCH_PG_PASSWORD="$PG_PASSWORD" \
     -e BENCH_PARTITIONS="$SPARK_PARTITIONS" -e SPARK_DRIVER_MEM="$SPARK_DRIVER_MEM" \
     -e BENCH_SPARK_MASTER="$master" \
-    -e BENCH_FETCHSIZE="$BATCH_SIZE" \
+    -e BENCH_FETCHSIZE="${BATCH_SIZE:-$SPARK_AUTO_FETCHSIZE}" \
     -e BENCH_OUTPUT=/output/orders_spark_${scenario}.parquet \
     -e BENCH_FILTER="$filter" -e BENCH_COLUMNS="$columns" -e BENCH_SCENARIO="$scenario" \
     -v "$OUTPUT:/output" "$IMG_SPARK" >/dev/null
@@ -818,7 +947,7 @@ run_spark() { # $1=tag $2=scenario $3=filter $4=columns $5=stats prefix
     echo "WARN: /output not writable inside bench-spark (stale bind mount?)" >&2
   fi
   sample_stats bench-spark "${sprefix}_cluster.csv" &
-  local code; code=$($CLI wait bench-spark)
+  local code; code=$(watch_wait bench-spark "${sprefix}.reason")
   wait
   local json; json=$($CLI logs bench-spark 2>/dev/null | grep '^{' | tail -1)
   if [ "$code" != "0" ]; then
@@ -827,8 +956,11 @@ run_spark() { # $1=tag $2=scenario $3=filter $4=columns $5=stats prefix
     echo "--- host output dir ---" >&2
     ls -la "$OUTPUT" >&2 || true
   fi
+  if [ "$code" != "0" ] && [ ! -f "${sprefix}.reason" ]; then
+    echo "bench-spark exited ($(container_death bench-spark))" > "${sprefix}.reason"
+  fi
   $CLI rm -f bench-spark >/dev/null
-  [ "$code" = "0" ] || { echo "spark container failed (exit $code)" >&2; return 1; }
+  [ "$code" = "0" ] || { echo "spark container failed: $(cat "${sprefix}.reason")" >&2; return 1; }
   [ -n "$json" ] || { echo "spark container produced no JSON summary" >&2; return 1; }
   echo "$json"
 }
@@ -923,8 +1055,8 @@ for path in sorted(glob.glob(prefix + "_c_*.csv")):
 
 # Exact cgroup memory high-water marks (memory.peak, includes page cache — the figure a
 # --memory limit / OOM kill applies to), immune to the 100 ms sampling gaps. The engine
-# container reports its own; long-lived cluster containers are read by run.sh (lifetime
-# peaks: they span every scenario the cluster served).
+# container reports its own; the cluster containers are read by run.sh right after the
+# client finishes (the cluster is started fresh for every attempt, so they cover it).
 exact = {}
 if doc.get("mem_peak_bytes"):
     exact["engine"] = doc["mem_peak_bytes"]
@@ -954,29 +1086,32 @@ EOF
 }
 
 # A case (engine x scenario) that fails is recorded and the run moves on, so the other
-# cases' numbers still reach the summary. The first failed attempt ends that case — its
-# remaining attempts are skipped (retrying a deterministic failure such as an OOM only
-# burns time). If an earlier attempt of the case succeeded, its best result is kept and
-# the case is marked partial; otherwise the case is FAILED and leaves only
+# cases' numbers still reach the summary. A failed or killed attempt (see watch_wait) is
+# discarded and run again from scratch, up to MAX_RETRIES times per case; every retry is
+# listed in the summary. Once the retries are used up the case stops: if an earlier
+# attempt succeeded, its best result is kept and the case is marked partial; otherwise the
+# case is FAILED and leaves only
 # $RESULTS/<tag>_<scenario>.failed (the reason) and no output file, so the correctness
 # check never compares a half-written Parquet. The script exits non-zero at the end if
 # any case failed.
 FAILED_CASES=()
+RETRIED=()
 fail_case() { # $1=tag $2=scenario $3=reason
   echo "$3" > "$RESULTS/${1}_${2}.failed"
   FAILED_CASES+=("$1/$2")
-  echo "!! $1/$2 FAILED: $3 — skipping its remaining attempts, continuing with the next case" >&2
+  echo "!! $1/$2 FAILED: $3 — continuing with the next case" >&2
 }
 
 best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
   # tag namespaces files, e.g. rust_standalone / rust_distributed / spark.
   # Each attempt writes to its own stats prefix; only the winner is promoted.
   local tag=$1 engine=$2 mode=$3 scenario=$4 filter=$5 columns=$6
-  local ms best_ms="" best_i=0 i json sprefix rc failure=""
+  local ms best_ms="" best_i=0 i=1 json sprefix rc failure="" retries=0 retrying=0 why
   rm -f "$RESULTS/${tag}_${scenario}.failed" "$RESULTS/${tag}_${scenario}.partial" \
     "$RESULTS/${tag}_${scenario}.json" "$RESULTS/${tag}_${scenario}_mempeak.json"
-  for i in $(seq 1 "$REPEAT"); do
-    echo "-- $tag/$scenario attempt $i/$REPEAT"
+  while [ "$i" -le "$REPEAT" ]; do
+    echo "-- $tag/$scenario attempt $i/$REPEAT$([ "$retrying" = 1 ] && echo " (retry $retries/$MAX_RETRIES)")"
+    retrying=0
     # Clear BEFORE the attempt, not after: Spark refuses to write over an existing
     # path, and deleting after would remove the final attempt's output that the
     # correctness check compares. Scoped to this engine's own file (tag): a broad
@@ -995,19 +1130,35 @@ best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
       ms=$(echo "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["elapsed_ms"])' 2>/dev/null) || ms=""
     fi
     if [ "$rc" != "0" ] || [ -z "$ms" ]; then
-      failure="attempt $i/$REPEAT failed ($([ "$rc" != "0" ] && echo "exit $rc" || echo "unparseable JSON summary"))"
+      if [ "$rc" != "0" ]; then
+        why=$(cat "${sprefix}.reason" 2>/dev/null || echo "exit $rc")
+      else
+        why="unparseable JSON summary"
+      fi
+      failure="attempt $i/$REPEAT failed ($why)"
       # The failed attempt's partial output must not reach the correctness check.
       rm -rf "$OUTPUT"/orders_${tag}_${scenario}.parquet
+      if [ "$retries" -lt "$MAX_RETRIES" ]; then
+        retries=$(( retries + 1 ))
+        RETRIED+=("$tag/$scenario: $failure")
+        echo "!! $tag/$scenario: $failure — discarded, retrying from scratch ($retries/$MAX_RETRIES)" >&2
+        retrying=1
+        continue
+      fi
+      [ "$MAX_RETRIES" -gt 0 ] && failure="$failure; gave up after $MAX_RETRIES retr$([ "$MAX_RETRIES" = 1 ] && echo y || echo ies)"
       break
     fi
+    failure=""  # a successful re-run replaces the discarded attempt
     echo "$json" > "$RESULTS/.${tag}_${scenario}_try${i}.json"
     if [ -z "$best_ms" ] || [ "$ms" -lt "$best_ms" ]; then
       best_ms=$ms
       best_i=$i
     fi
+    i=$(( i + 1 ))
   done
   if [ -z "$best_ms" ]; then
-    rm -f "$RESULTS"/."${tag}_${scenario}"_try*.json "$RESULTS"/."${tag}_${scenario}"_try*.csv
+    rm -f "$RESULTS"/."${tag}_${scenario}"_try*.json "$RESULTS"/."${tag}_${scenario}"_try*.csv \
+      "$RESULTS"/."${tag}_${scenario}"_try*.reason
     fail_case "$tag" "$scenario" "$failure"
     return 0
   fi
@@ -1021,7 +1172,8 @@ best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
     mv "$f" "$RESULTS/${tag}_${scenario}_c_${name}.csv"
   done
   shopt -u nullglob
-  rm -f "$RESULTS"/."${tag}_${scenario}"_try*.json "$RESULTS"/."${tag}_${scenario}"_try*.csv
+  rm -f "$RESULTS"/."${tag}_${scenario}"_try*.json "$RESULTS"/."${tag}_${scenario}"_try*.csv \
+    "$RESULTS"/."${tag}_${scenario}"_try*.reason
   finalize_json "$RESULTS/${tag}_${scenario}.json" "$RESULTS/${tag}_${scenario}"
   if [ -n "$failure" ]; then
     # Keep the successful attempts' best, but say the case did not complete all attempts.
@@ -1034,58 +1186,67 @@ best_of() { # $1=tag $2=engine $3=mode $4=scenario $5=filter $6=columns
 }
 
 # Scenarios: full load (everything) + selective (indexed ~3% slice + narrow projection).
-# Same filter/projection strings go to both engines verbatim.
+# Defined ONCE, structurally. Rust gets them as job config (structured `filters` + `columns`
+# in bench-config-<scenario>.json, extracted through the connector API — no SQL). Spark's
+# JDBC read needs a SQL predicate, so SELECTIVE_FILTER is rendered from the same definition
+# (as are the expected-count query and the summary text).
+SELECTIVE_FILTER_COLUMN=status; SELECTIVE_FILTER_OP="="; SELECTIVE_FILTER_VALUE=REFUNDED
+SELECTIVE_COLUMNS="order_id,amount,status"
 FULL_FILTER=""; FULL_COLUMNS=""
-SELECTIVE_FILTER="status = 'REFUNDED'"; SELECTIVE_COLUMNS="order_id,amount,status"
+SELECTIVE_FILTER="$SELECTIVE_FILTER_COLUMN $SELECTIVE_FILTER_OP '$SELECTIVE_FILTER_VALUE'"
 
 EXPECTED_FULL=$($CLI exec "$PG" psql -U postgres -d app -tAc 'select count(*) from public.orders')
 EXPECTED_SELECTIVE=$($CLI exec "$PG" psql -U postgres -d app -tAc "select count(*) from public.orders where $SELECTIVE_FILTER")
 
 echo "expected rows: full=$EXPECTED_FULL selective=$EXPECTED_SELECTIVE"
-# Batch mode: empty BATCH_SIZE = auto (each tool's own default); set = manual override
-# applied to both engines. Partition counts always derive from a reference batch size
-# (64000 unless overridden) so an auto run and a manual run differ ONLY in per-batch
-# streaming, never in fan-out.
+# Batch mode: empty BATCH_SIZE = auto (Rust's default 8192 rows per batch, Spark's fetchsize
+# set to match); set = manual override applied to both engines. The batch size never changes
+# the partition count, so an auto run and a manual run differ only in per-batch streaming.
 if [ -n "$BATCH_SIZE" ]; then
   [ "$BATCH_SIZE" -ge 1 ] 2>/dev/null || { echo "BATCH_SIZE must be >= 1 (got '$BATCH_SIZE')" >&2; exit 1; }
   echo "batch size: manual $BATCH_SIZE rows/batch on both engines"
 else
-  echo "batch size: auto (rust default 8192/batch, spark JDBC default = driver default)"
+  echo "batch size: auto (rust default 8192 rows/batch; spark JDBC fetchsize $SPARK_AUTO_FETCHSIZE to match — its own default buffers whole partitions)"
 fi
-REF_BATCH=${BATCH_SIZE:-64000}
-if [ -z "$RUST_PARTITIONS" ]; then
-  RUST_PARTITIONS=$(( (EXPECTED_FULL + REF_BATCH - 1) / REF_BATCH ))
-  [ "$RUST_PARTITIONS" -ge 1 ] || RUST_PARTITIONS=1
+# Engine cores = the pinned budget (cpuset size), else the --cpus quota rounded up, else
+# the Docker host's CPUs. Default partition count on both engines = engine cores, which is
+# Spark's default parallelism for local[*].
+if [ -n "$CPUSET_CPUS" ]; then ENGINE_CORES=$(cpuset_count "$CPUSET_CPUS")
+elif [ -n "$CPUS" ]; then ENGINE_CORES=$(python3 -c 'import math,sys; print(max(1, math.ceil(float(sys.argv[1]))))' "$CPUS")
+else ENGINE_CORES=$HOST_NCPU; fi
+[ -n "$RUST_PARTITIONS" ] || RUST_PARTITIONS=$ENGINE_CORES
+[ -n "$SPARK_PARTITIONS" ] || SPARK_PARTITIONS=$ENGINE_CORES
+echo "partitions: rust=$RUST_PARTITIONS spark=$SPARK_PARTITIONS (engine cores = $ENGINE_CORES; override with --rust-partitions / --spark-partitions)"
+if [ "$MODE" != "standalone" ] && [ $(( RUST_PARTITIONS % WORKERS )) -ne 0 ]; then
+  echo "note: $RUST_PARTITIONS partitions over $WORKERS workers do not divide evenly (round-robin placement; some workers scan more)" >&2
 fi
-if [ -z "$SPARK_PARTITIONS" ]; then
-  SPARK_PARTITIONS=$(( (EXPECTED_FULL + REF_BATCH - 1) / REF_BATCH ))
-  [ "$SPARK_PARTITIONS" -ge 1 ] || SPARK_PARTITIONS=1
-fi
-echo "partitions: rust=$RUST_PARTITIONS spark=$SPARK_PARTITIONS (ceil($EXPECTED_FULL / $REF_BATCH); override with --rust-partitions / --spark-partitions)"
 # Equal-spec card (the comparability contract — see the rule in benchmark/README.md):
 # equality is enforced ONLY at the container boundary (pin + memory). Inside, every
 # runtime runs unrestricted — Spark local[*], DataFusion defaults, Ballista visible-CPU
 # slots — and sizes itself from the pinned budget. Never cap runtimes from the inside
 # (--spark-cores, BENCH_CONCURRENT_TASKS) for headline numbers; those knobs are for
 # diagnostics only.
-echo "compute: spark=local[${SPARK_CORES:-*}] rust-standalone=defaults rust-distributed=$WORKERS workers x ${BENCH_CONCURRENT_TASKS:-all-visible} slot(s)"
+echo "compute: spark=local[${SPARK_CORES:-*}] rust-standalone=defaults rust-distributed=$WORKERS workers x $BENCH_CONCURRENT_TASKS slot(s), cores control=[$DIST_CONTROL_CPUSET] workers=[${DIST_WORKER_CPUSETS[*]}] ($DIST_LAYOUT); pool_max=$POOL_MAX"
 
 # Omit batch_size in auto mode so the Rust code default (8192) applies.
 BATCH_JSON=""; [ -n "$BATCH_SIZE" ] && BATCH_JSON="\"batch_size\": $BATCH_SIZE,"
 COPY_JSON="\"use_copy\": true"; [ "$USE_COPY" = "0" ] && COPY_JSON="\"use_copy\": false"
 echo "source scan: rust $([ "$USE_COPY" = "0" ] && echo "cursor FETCH" || echo "COPY BINARY") (selective scans always cursor: COPY takes no bind params)"
-# Generate bench-config.json with the specified parallel strategy
-cat > "$BENCH_DIR/bench-config.json" <<EOF
+# Generate the Rust job config of one scenario: $1=scenario $2=filters JSON $3=columns JSON.
+write_rust_config() {
+cat > "$BENCH_DIR/bench-config-$1.json" <<EOF
 {
-  "job_id": "orders_bench",
+  "job_id": "orders_bench_$1",
   "table": "orders",
+  "filters": $2,
+  "columns": $3,
   "source": {
     "host": "bench-pg",
     "port": 5432,
     "user": "postgres",
     "password_env": "BENCH_PG_PASSWORD",
     "database": "app",
-    "pool_max": 8,
+    "pool_max": $POOL_MAX,
     "statement_timeout_ms": 300000,
     "application_name": "rel-bench-rust",
     "schema": "public"
@@ -1106,23 +1267,28 @@ cat > "$BENCH_DIR/bench-config.json" <<EOF
   "execution": { ${BATCH_JSON} ${COPY_JSON} },
   "distributed": {
     "scheduler_url": "",
-    "workers": $WORKERS
+    "workers": $WORKERS,
+    "max_retries": 0
   }
 }
 EOF
+}
+write_rust_config full '[]' 'null'
+write_rust_config selective \
+  "$(python3 -c 'import json,sys; print(json.dumps([{"column": sys.argv[1], "op": sys.argv[2], "value": sys.argv[3]}]))' \
+      "$SELECTIVE_FILTER_COLUMN" "$SELECTIVE_FILTER_OP" "$SELECTIVE_FILTER_VALUE")" \
+  "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split(",")))' "$SELECTIVE_COLUMNS")"
+# Fail now, not after minutes of scanning, if a generated config is not valid JSON.
+for s in full selective; do
+  python3 -m json.tool "$BENCH_DIR/bench-config-$s.json" >/dev/null \
+    || { echo "generated bench-config-$s.json is not valid JSON" >&2; exit 2; }
+done
 
 run_mode() { # $1=mode(standalone|distributed)
   local mode=$1 tag
   if [ "$mode" = "distributed" ]; then
+    # run_rust starts a fresh cluster per attempt (and a failed start fails that case).
     tag=rust_distributed
-    # A cluster that never comes up fails both distributed cases, not the whole run.
-    # Subshell: helpers like verify_pin `exit` on mismatch.
-    if ! ( start_cluster ); then
-      stop_cluster
-      fail_case "$tag" full "cluster did not start"
-      fail_case "$tag" selective "cluster did not start"
-      return 0
-    fi
   else
     tag=rust_standalone
   fi
@@ -1130,9 +1296,6 @@ run_mode() { # $1=mode(standalone|distributed)
   best_of "$tag" rust "$mode" full "$FULL_FILTER" "$FULL_COLUMNS"
   echo "== rust/$mode scenario: selective ($REPEAT attempt(s))"
   best_of "$tag" rust "$mode" selective "$SELECTIVE_FILTER" "$SELECTIVE_COLUMNS"
-  if [ "$mode" = "distributed" ]; then
-    stop_cluster
-  fi
 }
 
 case "$MODE" in
@@ -1210,7 +1373,7 @@ summary_table() { # $1=results dir -> totals-only table on stdout: one row per t
   python3 - "$1" <<'EOF'
 import glob, json, os, sys
 results = sys.argv[1]
-header = ["engine", "scenario", "elapsed_ms", "cpu_seconds", "peak_rss_mib",
+header = ["engine", "scenario", "elapsed_ms", "cpu_seconds", "peak_mem_mib",
           "mem_peak_exact_mib"]
 def v(d, k):
     x = d.get(k)
@@ -1230,7 +1393,7 @@ for pat in ("rust_*_full.json", "spark_full.json",
         partial = path[:-len(".json")] + ".partial"
         rows.append([d["engine"], d["scenario"],
                      str(d["elapsed_ms"]) + (" (partial)" if os.path.exists(partial) else ""),
-                     v(d, "cpu_seconds"), v(d, "peak_rss_mib"), v(d, "mem_peak_exact_mib")])
+                     v(d, "cpu_seconds"), v(d, "peak_mem_mib"), v(d, "mem_peak_exact_mib")])
 widths = [len(h) for h in header]
 for r in rows:
     widths = [max(w, len(c)) for w, c in zip(widths, r)]
@@ -1246,14 +1409,14 @@ EOF
 {
   echo "# Benchmark: initial loads, public.orders"
   echo
-  echo "Full: SELECT * over all columns -> Snappy Parquet. Selective: WHERE $SELECTIVE_FILTER + projection ($SELECTIVE_COLUMNS). Rust standalone: in-process Ballista, $RUST_PARTITIONS keyset partitions. Rust distributed: scheduler + $WORKERS workers over the network (CPU/RSS summed across the cluster; per-container peaks below). Spark 3.5.4 local ($([ -n "$SPARK_CORES" ] && echo "$SPARK_CORES cores" || echo "all cores")): $SPARK_PARTITIONS JDBC partitions on order_id. Batch: $([ -n "$BATCH_SIZE" ] && echo "$BATCH_SIZE rows/batch both engines" || echo "tool defaults (rust 8192, spark driver default)"). Rust source scan: $([ "$USE_COPY" = "0" ] && echo "cursor FETCH" || echo "COPY BINARY (full loads; selective falls back to cursor — see logs)"). Sequential runs, best of $REPEAT."
-  echo "Spec: containers [$CPU_FLAGS ${MEM_SPARK:-unconstrained}] pg=[$PG_CPU_FLAGS $PG_MEM_FLAGS] mem sched/workers/client [$MEM_SCHED/${MEM_WORKER:-none}/${MEM_CLIENT:-none}] compute spark=local[${SPARK_CORES:-*}] rust-distributed=$WORKERS x ${BENCH_CONCURRENT_TASKS:-all-visible} slots."
+  echo "Full: every column, every row -> one Snappy Parquet file. Selective: filter $SELECTIVE_FILTER + projection ($SELECTIVE_COLUMNS) -> one file. Timed end to end on both engines: program entry point to last byte written (Spark: SparkSession start included, no read-back). Rust standalone: plain DataFusion (no Ballista), $RUST_PARTITIONS keyset partitions, pool_max $POOL_MAX. Rust distributed: scheduler + client on core(s) [$DIST_CONTROL_CPUSET], $WORKERS workers on [${DIST_WORKER_CPUSETS[*]}] ($DIST_LAYOUT), $BENCH_CONCURRENT_TASKS slot(s) each, fresh cluster per attempt. Spark 3.5.4 local ($([ -n "$SPARK_CORES" ] && echo "$SPARK_CORES cores" || echo "all cores")): $SPARK_PARTITIONS JDBC partitions on order_id, repartition(1) before the write, all other settings Spark defaults. Batch: $([ -n "$BATCH_SIZE" ] && echo "$BATCH_SIZE rows/batch both engines" || echo "auto (rust default 8192 rows/batch, spark JDBC fetchsize $SPARK_AUTO_FETCHSIZE to match)"). Rust source scan: $([ "$USE_COPY" = "0" ] && echo "cursor FETCH" || echo "COPY BINARY (falls back to cursor when a filter is pushed — see logs)"). Sequential runs, best of $REPEAT. A failed or hung attempt is killed, discarded and re-run from scratch (up to $MAX_RETRIES per case; attempt timeout $([ "$ATTEMPT_TIMEOUT" -gt 0 ] && echo "${ATTEMPT_TIMEOUT}s" || echo "off")); the client-side distributed job retry is off (max_retries 0)."
+  echo "Spec: containers [$CPU_FLAGS ${MEM_SPARK:-unconstrained}] pg=[$PG_CPU_FLAGS $PG_MEM_FLAGS] mem sched/workers/client [$MEM_SCHED/${MEM_WORKER:-none}/${MEM_CLIENT:-none}] compute spark=local[${SPARK_CORES:-*}] rust-distributed=$WORKERS x $BENCH_CONCURRENT_TASKS slots."
   echo
   report_table "$RESULTS"
   echo
   echo "## Summary (engine totals per test variant: elapsed time, CPU work, memory)"
   echo
-  echo "Stats cover each engine's timed section. \`cpu_seconds\`: exact CPU time (cumulative counters). \`peak_rss_mib\`: peak process memory (anonymous pages, 100 ms samples, summed across containers per sample). \`peak_mem_mib\` (detail table): peak working set (usage − inactive page cache, as \`docker stats\`). \`mem_peak_exact_mib\`: exact cgroup high-water mark incl. page cache — what a \`--memory\` limit applies to; for distributed runs a sum of per-container lifetime peaks (upper bound)."
+  echo "Stats cover each engine's timed section (program entry point to last byte written). Memory is measured at the **container** level, the whole engine deployment: \`peak_mem_mib\`: peak container working set (usage − inactive page cache, as \`docker stats\`; 100 ms samples, summed across the deployment's containers per sample). \`mem_peak_exact_mib\`: exact container high-water mark (cgroup \`memory.peak\`), everything the containers were charged incl. page cache — what a \`--memory\` limit applies to; for distributed a sum of per-container peaks of this run's fresh cluster (upper bound). \`cpu_seconds\`: exact CPU time of the deployment (cumulative counters). Process memory (\`peak_rss_mib\`) is in the detail table."
   echo
   summary_table "$RESULTS"
   echo
@@ -1276,6 +1439,13 @@ echo "Correctness gate: **$GATE**" | tee -a "$RESULTS/summary.md"
 if [ "${#FAILED_CASES[@]}" -gt 0 ]; then
   echo "Failed cases (no result, excluded from the gate and the file check): ${FAILED_CASES[*]}" \
     | tee -a "$RESULTS/summary.md"
+fi
+if [ "${#RETRIED[@]}" -gt 0 ]; then
+  {
+    echo
+    echo "Discarded and re-run attempts (not in any number above):"
+    for r in "${RETRIED[@]}"; do echo "- $r"; done
+  } | tee -a "$RESULTS/summary.md"
 fi
 
 [ "$GATE" = "PASS" ] || exit 1

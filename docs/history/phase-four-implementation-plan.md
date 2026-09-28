@@ -1,6 +1,6 @@
 # Phase 4 Implementation Plan — Distributed Execution
 
-> **Historical plan.** File paths and module names below predate the Postgres connector modularization: code now lives under `src/connector/postgres/` (e.g. `connector::postgres::{pipeline, engine, distributed}`), `src/pushdown/` is connector-agnostic, the `SourceAwarePushdownRule` optimizer rule and the `sink` config were removed, and `run()` is a diagnostic (`run_with` is the checkpointed API). See [architecture](../architecture.md) for the current layout.
+> Archived planning document (September 2026). Not a description of the current code — see [../roadmap.md](../roadmap.md) and [../architecture.md](../architecture.md).
 
 **Status**: ✓ IMPLEMENTED (compile-clean, all unit tests pass; runtime validation against a real
 cluster pending — see [Verification](#verification))

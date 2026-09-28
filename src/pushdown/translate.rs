@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
@@ -37,7 +37,9 @@ pub enum ColumnKind {
     Integer,
     /// Timestamp (with or without zone; sessions run in UTC): `Exact` against timestamp literals.
     Timestamp,
-    /// Calendar date: no date literal is translated, so only `IS [NOT] NULL` pushes.
+    /// Calendar date: `Exact` against date literals (and against another date column). A
+    /// comparison that DataFusion had to wrap in a cast (a date column against a timestamp,
+    /// say) is not a plain column comparison, so it stays in Arrow.
     Date,
     /// Binary floating point. `=` is `Inexact` (the source treats `-0 = 0`, a superset of
     /// Arrow's total-order equality); every other comparison is not pushable.
@@ -229,7 +231,8 @@ fn translate_comparison(
             let (la, lb) = match (ka, kb) {
                 (ColumnKind::Integer, ColumnKind::Integer)
                 | (ColumnKind::Boolean, ColumnKind::Boolean)
-                | (ColumnKind::Timestamp, ColumnKind::Timestamp) => (column(a), column(b)),
+                | (ColumnKind::Timestamp, ColumnKind::Timestamp)
+                | (ColumnKind::Date, ColumnKind::Date) => (column(a), column(b)),
                 (ColumnKind::Text { .. }, ColumnKind::Text { .. }) => {
                     (binary_collated(column(a)), binary_collated(column(b)))
                 }
@@ -275,7 +278,8 @@ fn column_vs_literal(
     match (kind, literal) {
         (ColumnKind::Boolean, Literal::Bool(_))
         | (ColumnKind::Integer, Literal::Int(_))
-        | (ColumnKind::Timestamp, Literal::Timestamp(_)) => Some((Fidelity::Exact, column(name))),
+        | (ColumnKind::Timestamp, Literal::Timestamp(_))
+        | (ColumnKind::Date, Literal::Date(_)) => Some((Fidelity::Exact, column(name))),
         // The source says `-0 = 0` (and NaN = NaN, like Arrow): a superset for `=`. For every
         // other operator it can return fewer rows (`x < 0.0` drops -0.0), so keep in Arrow.
         (ColumnKind::Float, Literal::Float(_)) if op == CmpOp::Eq => {
@@ -303,6 +307,7 @@ fn inferred_kind(literal: &Literal) -> ColumnKind {
             bytewise_collation: false,
         },
         Literal::Timestamp(_) => ColumnKind::Timestamp,
+        Literal::Date(_) => ColumnKind::Date,
     }
 }
 
@@ -324,10 +329,23 @@ fn translate_literal(value: &ScalarValue) -> Option<Literal> {
         ScalarValue::TimestampMicrosecond(Some(v), ..) => {
             DateTime::<Utc>::from_timestamp_micros(*v).map(Literal::Timestamp)
         }
-        // NULL literals and every other ScalarValue variant (Decimal128, Binary, Date32, lists,
+        ScalarValue::Date32(Some(days)) => date_literal(*days),
+        // NULL literals and every other ScalarValue variant (Decimal128, Binary, Date64, lists,
         // structs, ...) aren't translated — comparisons against them stay in Arrow.
         _ => None,
     }
+}
+
+/// A `Date32` value (days since 1970-01-01) as a date literal, limited to years 1..=9999.
+/// Every such date exists in Postgres (whose `date` spans 4713 BC to 5874897 AD) and renders
+/// as a plain `YYYY-MM-DD`; anything outside that range stays in Arrow rather than risk a
+/// source-side range error or a mis-rendered BC date.
+fn date_literal(days: i32) -> Option<Literal> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    let date = epoch.checked_add_signed(chrono::Duration::days(i64::from(days)))?;
+    (1..=9999)
+        .contains(&chrono::Datelike::year(&date))
+        .then_some(Literal::Date(date))
 }
 
 #[cfg(test)]
@@ -376,6 +394,8 @@ mod tests {
         // Type mismatch between column kind and literal: never guessed.
         assert_eq!(t(col("id").eq(lit("1"))), None);
         assert_eq!(t(col("d").eq(lit(1i64))), None);
+        // A timestamp literal against a date column is not a date comparison.
+        assert_eq!(t(col("d").gt(lit(ts_literal()))), None);
         assert_eq!(t(col("blob").eq(lit("x"))), None);
         // Unknown columns never push.
         assert_eq!(t(col("nope").eq(lit(1i64))), None);
@@ -383,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_text_comparisons_are_binary_collated_and_exact() {
-        // B1: every text operator compares byte-wise, like Arrow.
+        // Every text operator compares byte-wise, like Arrow.
         for (expr, op) in [
             (col("name").eq(lit("a")), "="),
             (col("name").not_eq(lit("a")), "<>"),
@@ -471,9 +491,96 @@ mod tests {
         assert_eq!(t(col("nope").is_null()), None);
     }
 
+    fn ts_literal() -> ScalarValue {
+        ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), None)
+    }
+
+    fn date32(y: i32, m: u32, d: u32) -> ScalarValue {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let days = (NaiveDate::from_ymd_opt(y, m, d).unwrap() - epoch).num_days();
+        ScalarValue::Date32(Some(i32::try_from(days).unwrap()))
+    }
+
+    #[test]
+    fn test_date_comparisons_are_exact() {
+        // Every operator, either operand order, as a plain column comparison (index-usable).
+        assert_eq!(
+            t(col("d").gt_eq(lit(date32(2026, 9, 27)))),
+            exact(r#"("d" >= $1)"#)
+        );
+        assert_eq!(
+            t(col("d").lt(lit(date32(2026, 9, 28)))),
+            exact(r#"("d" < $1)"#)
+        );
+        assert_eq!(
+            t(col("d").eq(lit(date32(2026, 1, 1)))),
+            exact(r#"("d" = $1)"#)
+        );
+        assert_eq!(
+            t(col("d").not_eq(lit(date32(2026, 1, 1)))),
+            exact(r#"("d" <> $1)"#)
+        );
+        assert_eq!(
+            t(lit(date32(2026, 1, 1)).lt_eq(col("d"))),
+            exact(r#"($1 <= "d")"#)
+        );
+        // A daily window, NOT over it, and date-to-date column comparison.
+        assert_eq!(
+            t(col("d")
+                .gt_eq(lit(date32(2026, 9, 27)))
+                .and(col("d").lt(lit(date32(2026, 9, 28))))),
+            exact(r#"(("d" >= $1) AND ("d" < $2))"#)
+        );
+        assert_eq!(
+            t(Expr::Not(Box::new(col("d").eq(lit(date32(2026, 1, 1)))))),
+            exact(r#"(NOT ("d" = $1))"#)
+        );
+        let kinds = ColumnKinds::from([
+            ("d".to_string(), ColumnKind::Date),
+            ("d2".to_string(), ColumnKind::Date),
+        ]);
+        let (f, p) = translate_with(&col("d").lt(col("d2")), &kinds).unwrap();
+        assert_eq!(
+            (f, render(&p).0),
+            (Fidelity::Exact, r#"("d" < "d2")"#.into())
+        );
+        // The bound literal is the calendar date itself.
+        let (_, p) = translate_with(&col("d").eq(lit(date32(2026, 9, 27))), &kinds).unwrap();
+        let expected = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
+        assert_eq!(
+            render(&p).1,
+            vec![crate::pushdown::SqlParam::Date(expected)]
+        );
+        // Date literal against a non-date column, a cast column, NULL, out-of-range years:
+        // all stay in Arrow.
+        assert_eq!(t(col("ts").gt(lit(date32(2026, 1, 1)))), None);
+        assert_eq!(t(col("id").gt(lit(date32(2026, 1, 1)))), None);
+        assert_eq!(
+            t(Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(col("d")),
+                datafusion::arrow::datatypes::DataType::Utf8,
+            ))
+            .eq(lit("2026-01-01"))),
+            None
+        );
+        assert_eq!(t(col("d").eq(lit(ScalarValue::Date32(None)))), None);
+        assert_eq!(
+            t(col("d").eq(lit(ScalarValue::Date32(Some(i32::MAX))))),
+            None
+        );
+        assert_eq!(
+            t(col("d").eq(lit(ScalarValue::Date32(Some(-800_000))))),
+            None
+        );
+        assert!(matches!(
+            date_literal(0),
+            Some(Literal::Date(d)) if d == NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+        ));
+    }
+
     #[test]
     fn test_label_and_text_cast_columns() {
-        // C4: enum comparisons anywhere in the tree become label comparisons.
+        // Enum comparisons anywhere in the tree become label comparisons.
         assert_eq!(
             t(col("m").eq(lit("sad")).or(col("m").eq(lit("happy")))),
             exact(
@@ -486,7 +593,7 @@ mod tests {
         );
         // Enum against a non-text literal has no source form.
         assert_eq!(t(col("m").eq(lit(1i64))), None);
-        // C5: uuid/json-like columns push only = / <> through their text form.
+        // uuid/json-like columns push only = / <> through their text form.
         assert_eq!(
             t(col("u").eq(lit("123e4567-e89b-12d3-a456-426614174000"))),
             exact(r#"((CAST("u" AS text) COLLATE "C") = $1)"#)

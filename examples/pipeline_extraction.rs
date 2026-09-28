@@ -58,9 +58,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Diagnostic count only (no checkpoint, nothing delivered) — distributed over Ballista.
-    // `.distributed()` defaults to the standard scheduler URL; `.in_process()` here keeps the
-    // example self-contained (spins up a local cluster).
-    let counted = connector.extract().distributed().in_process().run().await?;
+    // Needs a running cluster (`rel scheduler` + `rel worker`) at the configured scheduler
+    // URL, else the standard local endpoint; skipped with a note when none is reachable.
+    let counted = match connector.extract().distributed().run().await {
+        Ok(counted) => counted,
+        Err(e) => {
+            println!(
+                "distributed run() skipped: no Ballista cluster reachable ({})",
+                e.underlying()
+            );
+            return Ok(());
+        }
+    };
     println!(
         "distributed run() [diagnostic]: {} row(s), workers {:?}",
         counted.rows_extracted, counted.workers

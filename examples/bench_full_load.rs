@@ -1,23 +1,36 @@
-//! Benchmark: initial loads through standalone Ballista.
+//! Benchmark: initial loads through plain DataFusion (standalone) or a Ballista cluster.
 //!
 //! Fair-comparison counterpart to `benchmark/spark/load.py`. Scans the configured table,
 //! writes one Snappy Parquet file, prints a JSON summary for `benchmark/run.sh`.
 //!
 //!   cargo run --release --example bench_full_load -- \
-//!       <config.json> <workers> <output.parquet> [filter_sql] [columns_csv] [scenario]
+//!       <config.json> <workers> <output.parquet> [scenario_label]
 //!
-//! Deployment comes from `BENCH_SCHEDULER_URL`: empty/unset runs standalone (scheduler +
-//! in-process executor, no cluster needed); set to `http://host:port` to fan out over a
-//! `rel scheduler` + `rel worker` deployment instead. Same code path either way —
-//! standalone only removes the network.
+//! **What** is extracted comes only from the job config file — the table, the structured
+//! `filters` and the `columns` projection (`benchmark/run.sh` writes one config per scenario).
+//! **How** it is extracted is only the connector API (`PostgresConnector::extract()`). The
+//! harness takes no filter/projection arguments, builds no SQL and never touches the
+//! provider directly; `scenario_label` is just a name for the summary. Deployment comes from
+//! `BENCH_SCHEDULER_URL`:
+//! - empty/unset: `.standalone().stream()` — plain DataFusion in one process, no Ballista.
+//!   The process uses the whole `pool_max`; at most `execution.concurrent_partitions`
+//!   (default `pool_max`) partitions scan at once, so buffered batches stay bounded by that
+//!   concurrency, not by the partition count.
+//! - `http://host:port`: `.distributed().scheduler(url).workers(n).stream()` on a
+//!   `rel scheduler` + `rel worker` deployment; every worker process budgets
+//!   `pool_max / workers` connections.
 //!
-//! - No filter/columns: full load (`SELECT *`), the entire row.
-//! - With filter/columns: selective load, e.g. `status = 'REFUNDED'`,
-//!   `order_id,amount,status` — same predicate and projection must be given to both
-//!   engines or the comparison is meaningless.
+//! - Config without `filters`/`columns`: full load (every column, every row).
+//! - Config with them: selective load, e.g.
+//!   `"filters": [{"column": "status", "op": "=", "value": "REFUNDED"}]`,
+//!   `"columns": ["order_id", "amount", "status"]`. Give both engines the same predicate and
+//!   projection or the comparison is meaningless.
 //!
-//! Timed sections (printed in the summary):
-//! - `scan_ms`: scan + transport + planning (everything that is not Parquet encode)
+//! Timed section: end to end, from this program's entry point (before the config is read)
+//! to the last byte of the Parquet file written — the same span the Spark side times.
+//! Printed split in two:
+//! - `scan_ms`: config load, schema discovery, split planning, scan and transport
+//!   (everything that is not Parquet encode)
 //! - `write_ms`: cumulative Parquet encode time across batches
 //!
 //! Batches stream straight into the writer (`execute_stream`), so memory stays O(batch)
@@ -33,17 +46,21 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Timed section = end to end, the same span as the Spark side: from this entry point
+    // (before the config is read) to the last Parquet byte written.
+    let t_scan = Instant::now();
+    let t_start_epoch_ms = epoch_ms();
     // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
     rust_ballista_extraction_layer::logging::init_from_env_and_args();
 
     let config_path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "examples/configs/extract.example.json".to_string());
+        .unwrap_or_else(|| "benchmark/rust/bench-config.json".to_string());
     let workers: usize = std::env::args()
         .nth(2)
         .map(|s| s.parse().unwrap())
@@ -51,10 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_path = std::env::args()
         .nth(3)
         .unwrap_or_else(|| "output/bench_full_load.parquet".to_string());
-    let filter_sql = std::env::args().nth(4).filter(|s| !s.is_empty());
-    let columns_csv = std::env::args().nth(5).filter(|s| !s.is_empty());
     let scenario = std::env::args()
-        .nth(6)
+        .nth(4)
         .unwrap_or_else(|| "full".to_string());
 
     let config = JobConfig::from_file(&config_path)?;
@@ -81,33 +96,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let projection = columns_csv.as_deref().unwrap_or("*");
-    let mut sql = format!("SELECT {projection} FROM {table}");
-    if let Some(filter) = filter_sql.as_deref() {
-        sql.push_str(" WHERE ");
-        sql.push_str(filter);
-    }
+    // Recorded as-is in the summary: the config is the whole definition of the scenario.
+    let filters = serde_json::to_value(&config.filters)?;
+    let projection = config
+        .columns
+        .as_ref()
+        .map_or_else(|| "*".to_string(), |c| c.join(","));
+    let use_copy = config.execution.use_copy;
+    let connector = PostgresConnector::from_config(config)?;
 
-    // Standalone: scheduler + in-process executor, no external cluster needed. The scan
-    // still fans out over `workers` keyset partitions with budgeted pools — the same code
-    // path as the remote deployment, minus the network.
+    // Standalone: `.standalone()` — plain DataFusion in this process, whole pool_max.
+    // Remote: `.distributed()` on the `rel scheduler` + `rel worker` cluster.
     let scheduler_url = std::env::var("BENCH_SCHEDULER_URL")
         .ok()
         .filter(|s| !s.is_empty());
-    let deployment = if scheduler_url.is_some() {
-        "remote"
+    let engine = if scheduler_url.is_some() {
+        "rust-ballista-remote"
     } else {
-        "standalone"
+        "rust-datafusion-standalone"
     };
 
-    let ctx = match scheduler_url.as_deref() {
-        Some(url) => DistributedContext::remote(&config, url, workers).await?,
-        None => DistributedContext::standalone(&config, workers).await?,
+    let mut stream = match scheduler_url.as_deref() {
+        Some(url) => {
+            connector
+                .extract()
+                .distributed()
+                .scheduler(url)
+                .workers(workers)
+                .stream()
+                .await?
+        }
+        None => connector.extract().standalone().stream().await?,
     };
-    ctx.register_source(&config).await?;
-
-    let df = ctx.session.sql(&sql).await?;
-    let schema: SchemaRef = df.schema().inner().clone();
+    let schema: SchemaRef = stream.schema();
 
     // Stream batches straight into the Parquet writer: memory stays O(batch) no matter
     // how many rows the table holds. Collecting everything first (the naive alternative)
@@ -117,9 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let mut writer = ArrowWriter::try_new(output_file, schema, Some(props))?;
 
-    let t_scan = Instant::now();
-    let t_start_epoch_ms = epoch_ms();
-    let mut stream = df.execute_stream().await?;
     let mut rows = 0usize;
     let mut n_batches = 0usize;
     let mut write_ns: u128 = 0;
@@ -146,12 +164,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
         serde_json::json!({
-            "engine": format!("rust-ballista-{deployment}"),
+            "engine": engine,
             "scenario": scenario,
             "table": table,
-            "filter": filter_sql,
+            "filters": filters,
             "projection": projection,
-            "use_copy": config.execution.use_copy,
+            "use_copy": use_copy,
             "workers": workers,
             "rows": rows,
             "batches": n_batches,

@@ -16,7 +16,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{TEST_PASSWORD_ENV, TestDb};
+use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
 use rust_ballista_extraction_layer::config::{
@@ -26,6 +26,7 @@ use rust_ballista_extraction_layer::config::{
 use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
 use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
 use rust_ballista_extraction_layer::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
+use rust_ballista_extraction_layer::connector::postgres::register_table;
 use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
 use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
 
@@ -70,17 +71,17 @@ fn job_for(db: &TestDb, table: &str, policy: &str) -> JobConfig {
         distributed: DistributedConfig {
             scheduler_url: String::new(),
             workers: 2,
+            ..DistributedConfig::default()
         },
     }
 }
 
-/// `SELECT id FROM <table> WHERE <filter>` through the distributed (Ballista standalone) path.
+/// `SELECT id FROM <table> WHERE <filter>` through plain DataFusion (`register_table`).
 async fn ids_where(db: &TestDb, table: &str, policy: &str, filter: &str) -> R<Vec<i64>> {
     let config = job_for(db, table, policy);
-    let ctx = DistributedContext::standalone(&config, 2).await?;
-    ctx.register_source(&config).await?;
+    let ctx = SessionContext::new();
+    register_table(&ctx, &config).await?;
     let df = ctx
-        .session
         .sql(&format!("SELECT id FROM {table} WHERE {filter}"))
         .await?;
     let batches = df.collect().await?;
@@ -92,10 +93,16 @@ async fn ids_where(db: &TestDb, table: &str, policy: &str, filter: &str) -> R<Ve
     Ok(ids)
 }
 
-/// A distributed (Ballista standalone) context with `table` registered under `policy`.
-async fn distributed_ctx(db: &TestDb, table: &str, policy: &str) -> R<DistributedContext> {
+/// A context on `cluster` (two workers) with `table` registered under `policy`: pushed
+/// filters travel through the plan codecs to the worker processes.
+async fn distributed_ctx(
+    cluster: &TestCluster,
+    db: &TestDb,
+    table: &str,
+    policy: &str,
+) -> R<DistributedContext> {
     let config = job_for(db, table, policy);
-    let ctx = DistributedContext::standalone(&config, 2).await?;
+    let ctx = DistributedContext::remote(&config, &cluster.url, 2).await?;
     ctx.register_source(&config).await?;
     Ok(ctx)
 }
@@ -170,8 +177,8 @@ async fn pushdown_matches_no_pushdown() -> R {
     Ok(())
 }
 
-/// Review findings B1 (collation / NOT / float), B5 (IS NULL precedence), C4 (enum under OR),
-/// C5 (uuid/jsonb text comparisons): one differential row per hazard.
+/// One differential row per hazard: collation-sensitive text, `NOT`, float `-0.0`/`NaN`,
+/// `IS NULL` precedence, enums under `OR`, uuid/jsonb text comparisons, and dates.
 #[tokio::test]
 async fn pushdown_differential_table() -> R {
     let db = live!();
@@ -191,17 +198,18 @@ async fn pushdown_differential_table() -> R {
                 feeling {s}.mood,
                 uid uuid,
                 meta jsonb,
-                note text
+                note text,
+                d date
             )"#
         ),
         format!(r#"CREATE INDEX pd_name_idx ON {s}.pd (name)"#),
         format!(
             r#"INSERT INTO {s}.pd VALUES
-            (1, 'B', 'FOO', '-0',  true,  'sad',      '123e4567-e89b-12d3-a456-426614174000', '"x"', 'a'),
-            (2, 'a', 'bar', 1.0,   false, 'ok',       '123e4567-e89b-12d3-a456-426614174001', '1',   NULL),
-            (3, 'c', 'foo', -1.0,  NULL,  'ecstatic', '123e4567-e89b-12d3-a456-426614174002', NULL,  'b'),
-            (4, NULL, NULL, NULL,  NULL,  NULL,       NULL,                                   'true', E'c\\d'),
-            (5, 'Ä', 'Foo', 'NaN', true,  'sad',      NULL,                                   '"y"', '')"#
+            (1, 'B', 'FOO', '-0',  true,  'sad',      '123e4567-e89b-12d3-a456-426614174000', '"x"', 'a',     '2024-02-29'),
+            (2, 'a', 'bar', 1.0,   false, 'ok',       '123e4567-e89b-12d3-a456-426614174001', '1',   NULL,    '1970-01-01'),
+            (3, 'c', 'foo', -1.0,  NULL,  'ecstatic', '123e4567-e89b-12d3-a456-426614174002', NULL,  'b',     '2024-01-01'),
+            (4, NULL, NULL, NULL,  NULL,  NULL,       NULL,                                   'true', E'c\\d', NULL),
+            (5, 'Ä', 'Foo', 'NaN', true,  'sad',      NULL,                                   '"y"', '',      '9999-12-31')"#
         ),
         format!("ANALYZE {s}.pd"),
     ];
@@ -214,27 +222,27 @@ async fn pushdown_differential_table() -> R {
 
     // (filter, pushed under `always`?)
     let cases: &[(&str, bool)] = &[
-        // B1: text range under an ICU collation ('B' < 'a' bytewise, not under ICU).
+        // Text range under an ICU collation ('B' < 'a' bytewise, not under ICU).
         ("name < 'a'", true),
         ("name >= 'B'", true),
         ("name <> 'a'", true),
-        // B1: NOT / equality under a nondeterministic (case-insensitive) collation.
+        // NOT / equality under a nondeterministic (case-insensitive) collation.
         ("NOT (ci_name = 'foo')", true),
         ("ci_name = 'foo'", true),
-        // B1: -0.0 and NaN under float comparisons.
+        // -0.0 and NaN under float comparisons.
         ("x < 0.0", false),
         ("x <> 0.0", false),
         ("x = 0.0", true),
         ("NOT (x = 0.0)", false),
-        // B5: `(NOT flag) IS NULL` must keep its grouping.
+        // `(NOT flag) IS NULL` must keep its grouping.
         ("(NOT flag) IS NULL", true),
         ("NOT (flag IS NULL)", true),
         ("(NOT flag) IS NOT NULL", true),
-        // C4: enum comparisons under OR / NOT / ranges.
+        // Enum comparisons under OR / NOT / ranges.
         ("feeling = 'sad' OR feeling = 'ecstatic'", true),
         ("NOT (feeling = 'ok')", true),
         ("feeling < 'p'", true),
-        // C5: uuid / jsonb compared through their text form (=, <> only).
+        // uuid / jsonb compared through their text form (=, <> only).
         ("uid = '123e4567-e89b-12d3-a456-426614174001'", true),
         ("uid <> '123e4567-e89b-12d3-a456-426614174001'", true),
         ("uid < '123e4567-e89b-12d3-a456-426614174001'", false),
@@ -245,12 +253,23 @@ async fn pushdown_differential_table() -> R {
         ("uid IS NULL", true),
         // Backslash literal (bound parameter).
         (r"note = 'c\d'", true),
+        // Dates: every operator, NOT, a two-sided window, leap day, epoch, year 9999 and NULL.
+        ("d >= '2024-01-01'", true),
+        ("d < '2024-01-01'", true),
+        ("d = '2024-02-29'", true),
+        ("d <> '2024-02-29'", true),
+        ("d <= '9999-12-31'", true),
+        ("NOT (d = '1970-01-01')", true),
+        ("d >= '2024-01-01' AND d < '2024-03-01'", true),
+        ("d IS NULL", true),
+        // A cast on the column is DataFusion's job, never pushed.
+        ("CAST(d AS VARCHAR) = '2024-02-29'", false),
     ];
 
-    // One context per policy for the whole table (each standalone context starts its own
-    // in-process scheduler + executor).
-    let never = distributed_ctx(&db, "pd", "never").await?;
-    let always = distributed_ctx(&db, "pd", "always").await?;
+    // One cluster, one context per policy for the whole table.
+    let cluster = TestCluster::start(2, 2).await;
+    let never = distributed_ctx(&cluster, &db, "pd", "never").await?;
+    let always = distributed_ctx(&cluster, &db, "pd", "always").await?;
     let local = local_always_ctx(&db, "pd").await?;
 
     let mut failures = Vec::new();
@@ -274,7 +293,7 @@ async fn pushdown_differential_table() -> R {
     Ok(())
 }
 
-/// N1: provider statistics refresh lazily once older than `statistics_ttl_secs`. Oracle:
+/// Provider statistics refresh lazily once older than `statistics_ttl_secs`. Oracle:
 /// the provider's own decision before vs after `ANALYZE` + one scan (TTL 0).
 #[tokio::test]
 async fn cost_statistics_refresh_after_ttl() -> R {
@@ -325,5 +344,157 @@ async fn cost_statistics_refresh_after_ttl() -> R {
         "stale statistics were not refreshed: {}",
         provider.explain_decision(&filter)
     );
+    Ok(())
+}
+
+/// Incremental-load windows on unindexed temporal columns (timestamptz, timestamp, date):
+/// judged alone, one side of a one-day window keeps half the table and stays in Arrow; judged
+/// with its sibling (as DataFusion hands them over), the pair is a 0.5% window estimated from
+/// the column's histogram / most-common values and both sides push. Oracles: the provider's
+/// own decisions, the physical plan's pushed-filter count, and a `never` differential.
+#[tokio::test]
+async fn range_windows_push_on_histogram_estimates() -> R {
+    use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+    use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
+
+    let db = live!();
+    let s = db.schema.clone();
+    for sql in [
+        format!(
+            "CREATE TABLE {s}.ev (id bigint PRIMARY KEY, ts timestamptz NOT NULL, \
+             naive timestamp NOT NULL, d date NOT NULL)"
+        ),
+        // 40k rows over 200 days (200 rows a day), no index on the temporal columns.
+        format!(
+            "INSERT INTO {s}.ev SELECT g, \
+               timestamptz '2026-01-01 00:00:00+00' + (g % 200) * interval '1 day' \
+                 + (g % 1440) * interval '1 minute', \
+               timestamp '2026-01-01 00:00:00' + (g % 200) * interval '1 day' \
+                 + (g % 1440) * interval '1 minute', \
+               date '2026-01-01' + (g % 200) \
+             FROM generate_series(1, 40000) g"
+        ),
+        format!("ANALYZE {s}.ev"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&db.pool)
+            .await
+            .map_err(|e| format!("setup failed: {sql}: {e}"))?;
+    }
+
+    let config = job_for(&db, "ev", "cost_based");
+    let provider = Arc::new(
+        PostgresTableProvider::new(
+            PostgresConnectionDescriptor::from_config(&config.source, 1),
+            &config.resolved_table(),
+            PushdownPolicy::CostBased,
+            Vec::new(),
+            Vec::new(),
+            CostParams::default(),
+            config.pushdown.statistics_ttl_secs,
+            config.execution.batch_size,
+        )
+        .await?,
+    );
+
+    // Day 100 of 200: 2026-04-11 .. 2026-04-12.
+    let day =
+        |d: i64| chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(d);
+    let micros = |d: i64| {
+        day(d)
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros()
+    };
+    let days_since_epoch =
+        |d: i64| (day(d) - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
+    let windows: Vec<(&str, Expr, Expr)> = vec![
+        (
+            "ts",
+            col("ts").gt_eq(lit(ScalarValue::TimestampMicrosecond(
+                Some(micros(100)),
+                Some("UTC".into()),
+            ))),
+            col("ts").lt(lit(ScalarValue::TimestampMicrosecond(
+                Some(micros(101)),
+                Some("UTC".into()),
+            ))),
+        ),
+        (
+            "naive",
+            col("naive").gt_eq(lit(ScalarValue::TimestampMicrosecond(
+                Some(micros(100)),
+                None,
+            ))),
+            col("naive").lt(lit(ScalarValue::TimestampMicrosecond(
+                Some(micros(101)),
+                None,
+            ))),
+        ),
+        (
+            "d",
+            col("d").gt_eq(lit(ScalarValue::Date32(Some(days_since_epoch(100))))),
+            col("d").lt(lit(ScalarValue::Date32(Some(days_since_epoch(101))))),
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (name, lo, hi) in &windows {
+        let alone = provider.explain_decision(lo);
+        let verdicts = provider.supports_filters_pushdown(&[lo, hi])?;
+        let reasons = provider.explain_decisions(&[lo, hi]);
+        println!("{name}: alone={alone}\n  together={reasons:?}");
+        if !alone.starts_with("KEEP") {
+            failures.push(format!("{name}: lower bound alone should keep: {alone}"));
+        }
+        if verdicts
+            != [
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Exact,
+            ]
+        {
+            failures.push(format!(
+                "{name}: window should push exactly: {verdicts:?} {reasons:?}"
+            ));
+        }
+        if !reasons
+            .iter()
+            .all(|r| r.contains("window of 2 range filters"))
+        {
+            failures.push(format!(
+                "{name}: reasons should name the window: {reasons:?}"
+            ));
+        }
+    }
+
+    // End to end through SQL: both sides reach the scan, and the rows match `never`.
+    let ctx = SessionContext::new();
+    ctx.register_table("ev", provider.clone())?;
+    for filter in [
+        "ts >= TIMESTAMP '2026-04-11 00:00:00' AND ts < TIMESTAMP '2026-04-12 00:00:00'",
+        "naive >= TIMESTAMP '2026-04-11 00:00:00' AND naive < TIMESTAMP '2026-04-12 00:00:00'",
+        "d >= '2026-04-11' AND d < '2026-04-12'",
+    ] {
+        let pushed = pushed_filter_count(&ctx, "ev", filter).await?;
+        let got = ids_in(&ctx, "ev", filter).await?;
+        let kept = ids_where(&db, "ev", "never", filter).await?;
+        println!("{filter}: pushed_filters={pushed} rows={}", got.len());
+        if pushed != 2 {
+            failures.push(format!(
+                "`{filter}`: expected 2 pushed filters, got {pushed}"
+            ));
+        }
+        if got != kept || got.len() != 200 {
+            failures.push(format!(
+                "`{filter}`: {} rows pushed vs {} kept (want 200 each)",
+                got.len(),
+                kept.len()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
     Ok(())
 }

@@ -9,6 +9,13 @@
 //! (schema-coerced, pushed to the source when possible) and column projection; this example
 //! streams the cluster's result straight into one local Parquet file (memory stays O(batch)).
 //! Materializing output is the caller's job — this project is not a sink.
+//!
+//! Needs a running cluster: `rel scheduler` plus `[workers]` `rel worker` processes, at the
+//! config's `distributed.scheduler_url` (default `http://localhost:50050`), e.g.
+//!
+//!   rel scheduler &
+//!   rel worker --scheduler-url http://localhost:50050 &
+//!   rel worker --scheduler-url http://localhost:50050 --port 50061 --grpc-port 50062 &
 
 use std::fs::{self, File};
 
@@ -37,12 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Table: {}", connector.config().resolved_table());
     println!("  Filters: {:?}", connector.config().filters);
 
-    // In-process scheduler + executors: the same plan-shipping path as a remote cluster,
-    // minus the network.
+    // The configured scheduler (else the standard local endpoint); the registered executors
+    // are checked against the connection budget before the scan starts.
     let mut stream = connector
         .extract()
         .distributed()
-        .in_process()
         .workers(workers)
         .stream()
         .await?;

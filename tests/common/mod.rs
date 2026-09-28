@@ -14,8 +14,10 @@
 //! ```
 //!
 //! Design: schema isolation (not database isolation) inside the one server — each `TestDb`
-//! gets `test_<pid>_<n>`, builds the hostile fixture inside it, and drops the schema on
-//! `Drop`. Tests can run in parallel.
+//! gets `test_<pid>_<n>`, loads the hostile fixture (`tests/data/hostile.sql`) inside it, and
+//! drops the schema on `Drop` (fresh connection, bounded timeout, failures logged) or via
+//! `TestDb::cleanup().await`.
+//! Tests can run in parallel.
 //!
 //! Single implementation: [`postgres.rs`] holds the harness; this module re-exports it so
 //! every suite shares one fixture, one provisioning rule, and one cleanup path.
@@ -28,3 +30,10 @@ mod postgres;
 // harness API, and an itemized `pub use` would trip `unused_imports` in the binaries
 // that don't need every name.
 pub use postgres::*;
+
+// Real-cluster harness (`rel scheduler` + `rel worker` child processes). Only the
+// distributed suites start one, so the re-export is unused in the others.
+#[path = "cluster.rs"]
+mod cluster;
+#[allow(unused_imports)]
+pub use cluster::*;

@@ -1,10 +1,11 @@
 //! Parallel scan strategies.
 //! extractor/postgres/parallel.rs
 //! Splits a table scan across multiple connections using keyset or ctid partitioning.
-//! `export_snapshot`/`use_snapshot` exist for future cross-connection consistency work but are
-//! NOT wired into any scan path: pooled connections cannot hold `SET TRANSACTION SNAPSHOT`
-//! across checkouts, so snapshot-consistent parallel reads stay deferred. Keyset bounds come
-//! from a single MIN/MAX read; ctid ranges from relpages.
+//! Keyset bounds come from a single MIN/MAX read; ctid ranges from relpages.
+//!
+//! Isolation: each partition is scanned by its own statement/cursor and so reads its own
+//! snapshot; partitions are **not** mutually consistent (snapshot-consistent parallel reads
+//! via exported snapshots are not implemented).
 
 use sqlx::PgPool;
 
@@ -16,30 +17,7 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Parallel scan strategy: how to partition the table across connections.
-/// Serialized into distributed plans; `None` preserves single-scan behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ParallelStrategy {
-    /// No parallelism; scan with a single connection.
-    #[default]
-    None,
-    /// Partition by primary key ranges using keyset predicates.
-    Keyset,
-    /// Partition by physical tuple ID ranges. No partition column needed; concurrent
-    /// VACUUM can move tuples between pages, so prefer keyset for hot tables. Exported
-    /// snapshots for cross-connection consistency remain deferred (see module docs).
-    Ctid,
-}
-
-impl ParallelStrategy {
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "keyset" => ParallelStrategy::Keyset,
-            "ctid" => ParallelStrategy::Ctid,
-            _ => ParallelStrategy::None,
-        }
-    }
-}
+pub use crate::types::ParallelStrategy;
 
 /// Configuration for parallel scans.
 #[derive(Debug, Clone)]
@@ -58,6 +36,11 @@ impl Default for ParallelScanConfig {
 }
 
 /// Represents a single partition of a parallel scan.
+///
+/// `predicate` is the authoritative filter (rendered SQL; `None` = the whole table). For
+/// keyset partitions `lo`/`hi` are informational: `lo` is the inclusive lower key bound,
+/// `hi` the exclusive upper bound, and `hi == None` on the open-ended last partition. The
+/// first keyset partition also holds every row whose key is NULL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanPartition {
     pub partition_id: usize,
@@ -68,6 +51,21 @@ pub struct ScanPartition {
 
 /// Computes partition bounds for a keyset-based scan.
 /// Uses min/max from the partition column or histogram bounds from pg_stats.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
+/// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+/// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
+/// use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
+///
+/// let parts = compute_keyset_partitions(ex.pool(), "public", "orders", "id", 4).await?;
+/// for p in &parts {
+///     println!("#{}: {:?}", p.partition_id, p.predicate);
+/// }
+/// # Ok(()) }
+/// ```
 pub async fn compute_keyset_partitions(
     pool: &PgPool,
     schema_name: &str,
@@ -79,23 +77,26 @@ pub async fn compute_keyset_partitions(
         return Ok(single_partition());
     }
 
+    // MIN/MAX on the raw column (then cast), so a btree index on an int2/int4/int8 key
+    // answers each with one index probe. `MIN(col::bigint)` would force a sequential scan
+    // on anything but an int8 column.
     let query = format!(
-        "SELECT MIN({}::bigint), MAX({}::bigint) FROM {}.{}",
-        quote_ident(partition_column),
-        quote_ident(partition_column),
+        "SELECT MIN({col})::bigint, MAX({col})::bigint FROM {}.{}",
         quote_ident(schema_name),
-        quote_ident(table_name)
+        quote_ident(table_name),
+        col = quote_ident(partition_column),
     );
 
     let (min_val, max_val): (Option<i64>, Option<i64>) =
         sqlx::query_as(sqlx::AssertSqlSafe(query.as_str()))
             .fetch_one(pool)
             .await
-            .map_err(|e| {
-                ExtractorError::Statistics(format!(
-                    "cannot compute partition bounds for {}.{}: {}",
-                    schema_name, table_name, e
-                ))
+            .map_err(|e| ExtractorError::SourceQuery {
+                context: format!(
+                    "cannot compute partition bounds for {}.{}",
+                    schema_name, table_name
+                ),
+                source: e,
             })?;
 
     let partitions = keyset_partitions_from_bounds(
@@ -119,55 +120,129 @@ pub async fn compute_keyset_partitions(
 /// Pure partitioning math for keyset scans, given already-known column bounds: no
 /// database access, so this is unit-testable without a live Postgres — the DB round trip
 /// in `compute_keyset_partitions` above is only responsible for producing `min_val`/`max_val`.
+///
+/// Coverage guarantees (every row matches exactly one predicate):
+/// - partition 0: `("col" >= min AND "col" < b1) OR "col" IS NULL` — NULL keys match no
+///   range comparison, so they are placed explicitly and exactly once;
+/// - middle partitions: `"col" >= bᵢ AND "col" < bᵢ₊₁`;
+/// - last partition: `"col" >= bₙ₋₁`, open-ended, so `max` itself (even `i64::MAX`) and keys
+///   inserted above it during the scan are included.
+///
+/// Bound arithmetic runs in `i128`, so any span within `i64::MIN..=i64::MAX` is exact.
+/// When the span has fewer keys than `num_partitions`, fewer (never empty) partitions are
+/// produced.
 fn keyset_partitions_from_bounds(
     partition_column: &str,
     min_val: i64,
     max_val: i64,
     num_partitions: usize,
 ) -> Vec<ScanPartition> {
-    debug_assert!(
-        num_partitions > 1,
-        "callers must special-case <=1 partitions before this"
-    );
-
-    if min_val >= max_val {
-        log::warn!(
-            "keyset partitioning: min >= max ({} >= {}), falling back to single partition",
-            min_val,
-            max_val
-        );
+    if num_partitions <= 1 || min_val >= max_val {
+        if min_val > max_val {
+            log::warn!(
+                "keyset partitioning: min > max ({min_val} > {max_val}), falling back to single partition"
+            );
+        }
         return single_partition();
     }
 
-    let range = max_val - min_val;
-    let partition_size = (range / num_partitions as i64).max(1);
+    let col = quote_ident(partition_column);
+    let (min, max) = (i128::from(min_val), i128::from(max_val));
+    // Number of distinct keys in [min, max]; at most 2^64, exact in i128.
+    let span = max - min + 1;
+    let n = i128::try_from(num_partitions)
+        .unwrap_or(i128::MAX)
+        .min(span);
+    let size = (span + n - 1) / n; // ceil: every boundary below is <= max.
 
-    let mut partitions = Vec::new();
-    for i in 0..num_partitions {
-        let lo = min_val + (i as i64 * partition_size);
-        let hi = if i == num_partitions - 1 {
-            max_val + 1 // Include the max value in the last partition
-        } else {
-            lo + partition_size
-        };
+    // Interior boundaries b1..b(k-1), all in (min, max] and therefore valid i64 values.
+    let boundaries: Vec<i64> = (1..n)
+        .map(|i| min + i * size)
+        .take_while(|b| *b <= max)
+        .filter_map(|b| i64::try_from(b).ok())
+        .collect();
 
-        let predicate = format!(
-            "{} >= {} AND {} < {}",
-            quote_ident(partition_column),
-            lo,
-            quote_ident(partition_column),
-            hi
-        );
-
+    let mut partitions = Vec::with_capacity(boundaries.len() + 1);
+    let mut lo = min_val;
+    for (i, &hi) in boundaries.iter().enumerate() {
         partitions.push(ScanPartition {
             partition_id: i,
             lo: Some(lo),
             hi: Some(hi),
-            predicate: Some(predicate),
+            predicate: Some(keyset_predicate(&col, i, lo, Some(hi))),
         });
+        lo = hi;
     }
-
+    // For min < max there is always at least one boundary, so this tail is never partition
+    // 0 in practice; `keyset_predicate` stays total either way (partition 0 holds NULLs).
+    let tail_id = partitions.len();
+    partitions.push(ScanPartition {
+        partition_id: tail_id,
+        lo: Some(lo),
+        hi: None,
+        predicate: Some(keyset_predicate(&col, tail_id, lo, None)),
+    });
     partitions
+}
+
+/// The one rendering of a keyset partition predicate (`col` already quoted).
+///
+/// Both ends of the key space are open so the partitions cover every row even after the
+/// table changed since the bounds were computed (a resumed run reuses stored bounds):
+/// partition 0 has no lower bound (`col < hi`, plus NULL keys), and `hi == None` is the
+/// open-ended tail. `lo` of partition 0 is therefore informational only.
+fn keyset_predicate(col: &str, partition_id: usize, lo: i64, hi: Option<i64>) -> String {
+    match (partition_id == 0, hi) {
+        (true, Some(hi)) => format!("{col} < {hi} OR {col} IS NULL"),
+        (false, Some(hi)) => format!("{col} >= {lo} AND {col} < {hi}"),
+        (true, None) => "TRUE".to_string(),
+        (false, None) => format!("{col} >= {lo}"),
+    }
+}
+
+/// Re-create one keyset partition from stored bounds — exactly the partition
+/// [`compute_keyset_partitions`] produced when it computed them — so a resumed job scans the
+/// same key ranges it planned, instead of recomputing bounds from a table that has since
+/// changed. `lo == hi == None` is the whole-table partition (valid only as partition 0).
+///
+/// Only integer bounds are accepted and the predicate is re-rendered from them (never read
+/// back as SQL), so a stored checkpoint cannot inject SQL.
+///
+/// # Examples
+///
+/// ```
+/// use rust_ballista_extraction_layer::connector::postgres::parallel::keyset_partition;
+///
+/// let p = keyset_partition("id", 1, Some(10), None).unwrap();
+/// assert_eq!(p.predicate.as_deref(), Some(r#""id" >= 10"#));
+/// assert!(keyset_partition("id", 1, None, Some(5)).is_err());
+/// ```
+pub fn keyset_partition(
+    partition_column: &str,
+    partition_id: usize,
+    lo: Option<i64>,
+    hi: Option<i64>,
+) -> Result<ScanPartition, ExtractorError> {
+    let predicate = match (lo, hi) {
+        (None, None) if partition_id == 0 => None,
+        (Some(lo), hi) if hi.is_none_or(|hi| hi > lo) => Some(keyset_predicate(
+            &quote_ident(partition_column),
+            partition_id,
+            lo,
+            hi,
+        )),
+        _ => {
+            return Err(ExtractorError::InvalidConfig(format!(
+                "invalid stored keyset bounds for partition {partition_id}: lo={lo:?} hi={hi:?}"
+            )));
+        }
+    };
+    Ok(ScanPartition {
+        partition_id,
+        lo,
+        hi,
+        predicate,
+    })
 }
 
 /// The universal "don't partition" fallback: one partition covering everything.
@@ -182,7 +257,7 @@ fn single_partition() -> Vec<ScanPartition> {
 
 /// Computes partition bounds for a ctid-based scan.
 /// Divides the table's physical pages into equal ranges.
-pub async fn compute_ctid_partitions(
+pub(crate) async fn compute_ctid_partitions(
     pool: &PgPool,
     schema_name: &str,
     table_name: &str,
@@ -200,11 +275,9 @@ pub async fn compute_ctid_partitions(
         .bind(schema_name)
         .fetch_optional(pool)
         .await
-        .map_err(|e| {
-            ExtractorError::Statistics(format!(
-                "cannot fetch relpages for {}.{}: {}",
-                schema_name, table_name, e
-            ))
+        .map_err(|e| ExtractorError::SourceQuery {
+            context: format!("cannot fetch relpages for {}.{}", schema_name, table_name),
+            source: e,
         })?
         .flatten()
         .unwrap_or(1);
@@ -281,36 +354,14 @@ fn ctid_partitions_from_relpages(relpages: i32, num_partitions: usize) -> Vec<Sc
     partitions
 }
 
-/// Establish an exported snapshot for consistent cross-connection reads.
-pub async fn export_snapshot(pool: &PgPool) -> Result<String, ExtractorError> {
-    let snapshot_id: String = sqlx::query_scalar("SELECT pg_export_snapshot()")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| ExtractorError::Statistics(format!("cannot export snapshot: {e}")))?;
+/// Test-only access to the pure keyset math for other modules' unit tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::ScanPartition;
 
-    Ok(snapshot_id)
-}
-
-/// Set a connection to use an exported snapshot.
-pub async fn use_snapshot(pool: &PgPool, snapshot_id: &str) -> Result<(), ExtractorError> {
-    // Validate snapshot_id format to prevent injection (snapshots are hex-only).
-    if !snapshot_id
-        .chars()
-        .all(|c| c.is_ascii_hexdigit() || c == '-')
-    {
-        return Err(ExtractorError::Statistics(
-            "invalid snapshot_id format".to_string(),
-        ));
+    pub(crate) fn keyset(column: &str, min: i64, max: i64, n: usize) -> Vec<ScanPartition> {
+        super::keyset_partitions_from_bounds(column, min, max, n)
     }
-
-    sqlx::query(sqlx::AssertSqlSafe(
-        format!("SET TRANSACTION SNAPSHOT '{}';", snapshot_id).as_str(),
-    ))
-    .execute(pool)
-    .await
-    .map_err(|e| ExtractorError::Statistics(format!("cannot set snapshot: {e}")))?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -319,10 +370,63 @@ mod tests {
 
     #[test]
     fn test_parallel_strategy_parse() {
-        assert_eq!(ParallelStrategy::parse("keyset"), ParallelStrategy::Keyset);
-        assert_eq!(ParallelStrategy::parse("ctid"), ParallelStrategy::Ctid);
-        assert_eq!(ParallelStrategy::parse("none"), ParallelStrategy::None);
-        assert_eq!(ParallelStrategy::parse("unknown"), ParallelStrategy::None);
+        assert_eq!(
+            ParallelStrategy::parse("keyset").unwrap(),
+            ParallelStrategy::Keyset
+        );
+        assert_eq!(
+            ParallelStrategy::parse("Keyset").unwrap(),
+            ParallelStrategy::Keyset
+        );
+        assert_eq!(
+            ParallelStrategy::parse(" CTID ").unwrap(),
+            ParallelStrategy::Ctid
+        );
+        assert_eq!(
+            ParallelStrategy::parse("none").unwrap(),
+            ParallelStrategy::None
+        );
+        assert_eq!(
+            ParallelStrategy::parse("NONE").unwrap(),
+            ParallelStrategy::None
+        );
+        assert_eq!(ParallelStrategy::parse("").unwrap(), ParallelStrategy::None);
+        let err = ParallelStrategy::parse("keyst").unwrap_err();
+        assert!(err.to_string().contains("keyst"), "{err}");
+    }
+
+    #[test]
+    fn test_strategy_serde_uses_lowercase_names() {
+        assert_eq!(
+            serde_json::to_string(&ParallelStrategy::Keyset).unwrap(),
+            "\"keyset\""
+        );
+        let s: ParallelStrategy = serde_json::from_str("\"ctid\"").unwrap();
+        assert_eq!(s, ParallelStrategy::Ctid);
+        assert!(serde_json::from_str::<ParallelStrategy>("\"Keyset\"").is_err());
+    }
+
+    #[test]
+    fn test_keyset_partition_rebuilds_exactly_what_was_computed() {
+        // A resumed job re-creates its stored splits from lo/hi alone; the predicate
+        // must be byte-identical to the one the original plan scanned.
+        for (min, max, n) in [
+            (1, 10, 3),
+            (0, 1000, 4),
+            (i64::MIN, i64::MAX, 4),
+            (1, i64::MAX, 2),
+            (0, 2, 4),
+            (5, 5, 4),
+        ] {
+            for p in keyset_partitions_from_bounds("id", min, max, n) {
+                let rebuilt = keyset_partition("id", p.partition_id, p.lo, p.hi).unwrap();
+                assert_eq!(rebuilt.predicate, p.predicate, "{min}..{max}/{n}");
+                assert_eq!((rebuilt.lo, rebuilt.hi), (p.lo, p.hi));
+            }
+        }
+        // Inverted or half-missing bounds are rejected, never scanned.
+        assert!(keyset_partition("id", 1, Some(5), Some(5)).is_err());
+        assert!(keyset_partition("id", 1, None, None).is_err());
     }
 
     #[test]
@@ -334,62 +438,155 @@ mod tests {
 
     // --- keyset_partitions_from_bounds: real math, no DB needed ---
 
-    #[test]
-    fn test_keyset_partitions_even_split_covers_full_range_contiguously() {
-        // 1000-wide range (0..1000), 4 partitions -> each 250 wide, contiguous, and the
-        // last partition's hi is max_val + 1 (inclusive of the max value itself).
-        let partitions = keyset_partitions_from_bounds("id", 0, 1000, 4);
-        assert_eq!(partitions.len(), 4);
-        assert_eq!(partitions[0].lo, Some(0));
-        assert_eq!(partitions[0].hi, Some(250));
-        assert_eq!(partitions[1].lo, Some(250));
-        assert_eq!(partitions[1].hi, Some(500));
-        assert_eq!(partitions[2].lo, Some(500));
-        assert_eq!(partitions[2].hi, Some(750));
-        assert_eq!(partitions[3].lo, Some(750));
-        assert_eq!(
-            partitions[3].hi,
-            Some(1001),
-            "last partition must include max_val"
-        );
+    /// Evaluate a generated predicate the way Postgres would, for a key (None = NULL).
+    /// Only understands the shapes this module emits.
+    fn matches(p: &ScanPartition, key: Option<i64>) -> bool {
+        let lo_ok = |k: i64| p.lo.is_none_or(|lo| k >= lo);
+        let hi_ok = |k: i64| p.hi.is_none_or(|hi| k < hi);
+        let nulls = p
+            .predicate
+            .as_deref()
+            .is_some_and(|s| s.contains("IS NULL"));
+        match key {
+            None => p.predicate.is_none() || nulls,
+            Some(k) => p.predicate.is_none() || (lo_ok(k) && hi_ok(k)),
+        }
+    }
+
+    /// Every key (and NULL) must fall in exactly one partition.
+    fn assert_exact_cover(partitions: &[ScanPartition], keys: &[Option<i64>]) {
+        for &k in keys {
+            let hits = partitions.iter().filter(|p| matches(p, k)).count();
+            assert_eq!(
+                hits, 1,
+                "key {k:?} matched {hits} partitions: {partitions:?}"
+            );
+        }
+        for w in partitions.windows(2) {
+            assert_eq!(w[0].hi, w[1].lo, "partitions must be contiguous");
+        }
         for (i, p) in partitions.iter().enumerate() {
             assert_eq!(p.partition_id, i);
-            assert!(p.predicate.as_ref().unwrap().contains("\"id\""));
-        }
-        // No gaps or overlaps between consecutive partitions.
-        for w in partitions.windows(2) {
-            assert_eq!(
-                w[0].hi, w[1].lo,
-                "partitions must be contiguous with no gap/overlap"
-            );
         }
     }
 
     #[test]
-    fn test_keyset_partitions_range_smaller_than_partition_count_still_min_size_one() {
-        // Range of 2 (0..2) split into 4 partitions: partition_size = (2/4).max(1) = 1, so
-        // partition_size * num_partitions (4) overshoots the actual range (2). The last
-        // partition or two legitimately end up empty ([3, 3)) — that's harmless (an empty
-        // scan), not a bug. What must never happen is an *inverted* range (hi < lo), which
-        // would silently turn into a nonsense predicate.
-        let partitions = keyset_partitions_from_bounds("id", 0, 2, 4);
+    fn test_keyset_partitions_even_split_covers_full_range_contiguously() {
+        // 0..=1000 is 1001 keys -> ceil(1001/4) = 251 per partition.
+        let partitions = keyset_partitions_from_bounds("id", 0, 1000, 4);
         assert_eq!(partitions.len(), 4);
+        let bounds: Vec<_> = partitions.iter().map(|p| (p.lo, p.hi)).collect();
+        assert_eq!(
+            bounds,
+            vec![
+                (Some(0), Some(251)),
+                (Some(251), Some(502)),
+                (Some(502), Some(753)),
+                (Some(753), None),
+            ]
+        );
+        assert_exact_cover(
+            &partitions,
+            &[
+                None,
+                Some(0),
+                Some(250),
+                Some(251),
+                Some(999),
+                Some(1000),
+                Some(5000),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_keyset_first_partition_has_no_lower_bound() {
+        // NEW-3: a resumed run reuses stored bounds, so a key inserted below the planned MIN
+        // must still fall into partition 0.
+        let p = keyset_partition("id", 0, Some(100), Some(200)).unwrap();
+        assert_eq!(
+            p.predicate.as_deref(),
+            Some(r#""id" < 200 OR "id" IS NULL"#)
+        );
+        let whole = keyset_partitions_from_bounds("id", 7, 7, 4);
+        assert!(whole.iter().all(|p| p.predicate.as_deref() != Some("")));
+    }
+
+    #[test]
+    fn test_keyset_predicates_include_nulls_once_and_open_tail() {
+        // Exact generated SQL.
+        let partitions = keyset_partitions_from_bounds("k", 1, 10, 3);
+        let preds: Vec<_> = partitions
+            .iter()
+            .map(|p| p.predicate.clone().unwrap())
+            .collect();
+        assert_eq!(
+            preds,
+            vec![
+                r#""k" < 5 OR "k" IS NULL"#.to_string(),
+                r#""k" >= 5 AND "k" < 9"#.to_string(),
+                r#""k" >= 9"#.to_string(),
+            ]
+        );
+        assert_eq!(
+            preds.iter().filter(|p| p.contains("IS NULL")).count(),
+            1,
+            "NULL keys must belong to exactly one partition"
+        );
+    }
+
+    #[test]
+    fn test_keyset_partitions_i64_max_key_is_included() {
+        // `max = i64::MAX` used to compute `max + 1` (overflow) and drop the max row.
+        let partitions = keyset_partitions_from_bounds("id", 1, i64::MAX, 2);
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[1].hi, None);
+        assert_exact_cover(
+            &partitions,
+            &[None, Some(1), Some(2), Some(i64::MAX - 1), Some(i64::MAX)],
+        );
+    }
+
+    #[test]
+    fn test_keyset_partitions_full_i64_span_does_not_overflow() {
+        // `max - min` overflowed i64 for spans wider than i64::MAX (random/hashed keys).
+        let partitions = keyset_partitions_from_bounds("id", i64::MIN, i64::MAX, 4);
+        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions[0].lo, Some(i64::MIN));
+        assert_eq!(partitions[1].hi, Some(0));
+        assert_exact_cover(
+            &partitions,
+            &[
+                None,
+                Some(i64::MIN),
+                Some(-1),
+                Some(0),
+                Some(1),
+                Some(i64::MAX),
+            ],
+        );
+        let partitions = keyset_partitions_from_bounds("id", i64::MIN, i64::MIN + 1, 8);
+        assert_eq!(partitions.len(), 2);
+        assert_exact_cover(&partitions, &[None, Some(i64::MIN), Some(i64::MIN + 1)]);
+    }
+
+    #[test]
+    fn test_keyset_partitions_fewer_keys_than_partitions_never_empty() {
+        // 0..=2 is 3 keys: at most 3 partitions, none inverted or empty.
+        let partitions = keyset_partitions_from_bounds("id", 0, 2, 4);
+        assert_eq!(partitions.len(), 3);
         for p in &partitions {
-            let (lo, hi) = (p.lo.unwrap(), p.hi.unwrap());
-            assert!(
-                hi >= lo,
-                "partition range must never invert, got [{lo}, {hi})"
-            );
+            if let (Some(lo), Some(hi)) = (p.lo, p.hi) {
+                assert!(hi > lo, "partition range must never be empty/inverted");
+            }
         }
-        // Pin the actual (harmless) overshoot shape so a change here is a deliberate one.
-        assert_eq!((partitions[3].lo, partitions[3].hi), (Some(3), Some(3)));
+        assert_exact_cover(&partitions, &[None, Some(0), Some(1), Some(2), Some(3)]);
     }
 
     #[test]
     fn test_keyset_partitions_min_equals_max_falls_back_to_single_partition() {
-        // A degenerate (or entirely-NULL) column collapses min == max: partitioning would
-        // divide by a zero-width range, so this must fall back to one unbounded partition
-        // rather than emit a bogus/empty predicate.
+        // A degenerate (or entirely-NULL) column collapses min == max: one unbounded
+        // partition (predicate None = whole table, NULLs included).
         let partitions = keyset_partitions_from_bounds("id", 42, 42, 4);
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].lo, None);
@@ -399,8 +596,6 @@ mod tests {
 
     #[test]
     fn test_keyset_partitions_min_greater_than_max_falls_back_to_single_partition() {
-        // Should never happen from a real MIN/MAX query, but a caller could pass swapped
-        // bounds by mistake: must degrade safely, not underflow/panic on `max - min`.
         let partitions = keyset_partitions_from_bounds("id", 100, 50, 4);
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].lo, None);

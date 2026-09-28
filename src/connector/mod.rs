@@ -6,9 +6,8 @@
 //! 1. **What SQL?** — [`pushdown::Predicate::render_to`] renders pushed filters into a
 //!    [`pushdown::SqlSink`]: identifiers and placeholders from a
 //!    [`pushdown::dialect::SqlDialect`], literals bound at render position by the backend's
-//!    own sink ([`pushdown::PgParamSink`]). The observable `(sql, params)` form
-//!    ([`pushdown::Predicate::render_sql`]) is what a MySQL connector would walk into its
-//!    own driver.
+//!    own sink (Postgres: `connector::postgres::param_sink::PgParamSink`). Fidelity is decided
+//!    at translation from the [`pushdown::ColumnKind`] each connector assigns its columns.
 //! 2. **What filter?** — caller-provided predicates or ranges. The orchestrator decides
 //!    WHAT range to extract; the extraction layer decides HOW to extract it efficiently
 //!    (full / filtered scan, partitioning, DataFusion/Ballista execution).
@@ -18,8 +17,8 @@
 //!    budgeted source pool in the executing process, without ever serializing a password.
 //!
 //! The planning SPI itself is DataFusion's: connectors implement `TableProvider` /
-//! `ExecutionPlan`, and the [`pushdown::optimizer_rule::SourceAwarePushdownRule`] plus
-//! `supports_filters_pushdown` work through those traits, not through backend types.
+//! `ExecutionPlan`, and `supports_filters_pushdown` plus DataFusion's own `PushDownFilter`
+//! rule work through those traits, not through backend types.
 //!
 //! Deliberately backend-concrete (not SPI): `sqlx` pools and `QueryBuilder` binding.
 //! `PgPool` and `MySqlPool` are distinct types with distinct encode impls; a generic pool
@@ -30,11 +29,9 @@
 //! [`pushdown::Predicate::render_to`]: crate::pushdown::Predicate::render_to
 //! [`pushdown::SqlSink`]: crate::pushdown::SqlSink
 //! [`pushdown::dialect::SqlDialect`]: crate::pushdown::dialect::SqlDialect
-//! [`pushdown::PgParamSink`]: crate::pushdown::PgParamSink
-//! [`pushdown::Predicate::render_sql`]: crate::pushdown::Predicate::render_sql
+//! [`pushdown::ColumnKind`]: crate::pushdown::ColumnKind
 //! [`pushdown::stats::TableStatsSource`]: crate::pushdown::stats::TableStatsSource
-//! [`pushdown::optimizer_rule::SourceAwarePushdownRule`]: crate::pushdown::optimizer_rule::SourceAwarePushdownRule
-//! [`distributed::pool_registry`]: crate::distributed::pool_registry
+//! [`distributed::pool_registry`]: crate::connector::postgres::distributed::pool_registry
 
 pub mod errors;
 pub mod mysql;

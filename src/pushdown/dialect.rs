@@ -1,15 +1,15 @@
-//! SQL dialect trait and fidelity rules.
+//! SQL dialect trait for rendering the pushdown IR.
 //! pushdown/dialect.rs
-//! Abstracts dialect-specific rendering, placeholder generation, identifier quoting, and fidelity
-//! judgment over column metadata. Connector-agnostic: each backend implements [`SqlDialect`] under
-//! its own connector (`PostgresDialect`, `MysqlDialect`).
+//! Abstracts dialect-specific rendering: identifier quoting, placeholder generation, cast
+//! target names, and the name of the dialect's bytewise collation. Connector-agnostic: each
+//! backend implements [`SqlDialect`] under its own connector (`PostgresDialect`,
+//! `MysqlDialect`). Fidelity is *not* a dialect question here: it is decided once, during
+//! translation, from the engine-neutral [`ColumnKind`](crate::pushdown::ColumnKind) each
+//! connector assigns to its columns.
 
-use crate::pushdown::Fidelity;
-use crate::types::ColumnMetadata;
+use crate::pushdown::{CastType, Collation};
 
-/// A SQL dialect's rendering conventions and fidelity rules.
-/// Implemented per connector (PostgresDialect, MysqlDialect, etc.) to handle
-/// dialect-specific SQL generation, collation semantics, and type coercion hazards.
+/// A SQL dialect's rendering conventions for the pushdown IR.
 pub trait SqlDialect: Send + Sync {
     /// Render an identifier (table/column name) with dialect-specific quoting.
     fn quote_ident(&self, name: &str) -> String;
@@ -17,25 +17,11 @@ pub trait SqlDialect: Send + Sync {
     /// Generate a placeholder string for the Nth parameter (1-indexed in most dialects).
     fn placeholder(&self, param_index: usize) -> String;
 
-    /// Judge the fidelity of a comparison between a literal value and a column type,
-    /// consulting the column's metadata (collation, precision, unsigned, etc.) to apply
-    /// dialect-specific rules beyond what the literal type alone can determine.
-    fn column_literal_fidelity(
-        &self,
-        column: &ColumnMetadata,
-        literal_is_text: bool,
-        literal_is_float: bool,
-    ) -> Fidelity;
+    /// SQL type name for a `CAST(... AS <name>)` target.
+    fn cast_type_name(&self, to: CastType) -> &'static str;
 
-    /// Judge the fidelity of a column-to-column comparison, considering both columns'
-    /// metadata (collation, type, precision).
-    fn column_column_fidelity(
-        &self,
-        left_column: &ColumnMetadata,
-        right_column: &ColumnMetadata,
-    ) -> Fidelity;
+    /// SQL text that follows `COLLATE` for `collation` (already quoted if the dialect needs
+    /// it). [`Collation::Binary`] must compare strings byte-by-byte on UTF-8, which is the
+    /// ordering Arrow/Rust use — translation relies on this to mark text comparisons `Exact`.
+    fn collation_name(&self, collation: Collation) -> &'static str;
 }
-
-// PostgreSQL's dialect lives with its connector; re-exported here so existing
-// `pushdown::dialect::PostgresDialect` paths keep resolving during the connector migration.
-pub use crate::connector::postgres::dialect::PostgresDialect;

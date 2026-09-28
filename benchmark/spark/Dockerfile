@@ -20,11 +20,17 @@ RUN python3 -c "import urllib.request, os; \
       f'https://repo1.maven.org/maven2/org/postgresql/postgresql/{v}/postgresql-{v}.jar', \
       f\"{os.environ.get('SPARK_HOME', '/opt/spark')}/jars/postgresql-{v}.jar\")"
 
-COPY load.py /opt/bench/load.py
+# The base image builds and runs as the non-root `spark` user, and a plain COPY keeps the
+# host file's mode and gives it to root — a 0600 checkout (umask 077, some sync tools)
+# then fails at runtime with "can't open file '/opt/bench/load.py': Permission denied".
+# Own it as spark with 0755: some BuildKit versions also apply --chmod to the parent
+# directories COPY creates, and a 0644 /opt/bench could not be traversed.
+COPY --chown=spark:spark --chmod=0755 load.py /opt/bench/load.py
+# Fail the build (not the benchmark, minutes later) if the runtime user cannot read it.
+RUN python3 -c "import os; open('/opt/bench/load.py').read(); print('load.py readable as uid', os.getuid())"
 
 # Same contract as the Rust image: config via environment, parquet to /output.
-# (Runs as root, like the image default for custom entrypoints; output files may
-# end up root-owned — chown them if your umask complains.)
+# (Runs as the base image's `spark` user; /output must be writable by it — run.sh checks.)
 ENV BENCH_PG_HOST=bench-pg \
     BENCH_PG_PORT=5432 \
     BENCH_PG_DB=app \

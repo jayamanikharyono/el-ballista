@@ -1,5 +1,7 @@
 # Phase 4 Implementation Plan — Distributed Execution
 
+> Archived planning document (September 2026). Not a description of the current code — see [../roadmap.md](../roadmap.md) and [../architecture.md](../architecture.md).
+
 **Status**: ✓ IMPLEMENTED (compile-clean, all unit tests pass; runtime validation against a real
 cluster pending — see [Verification](#verification))
 

@@ -15,7 +15,7 @@ pub struct PgParamSink<'q> {
 }
 
 impl<'q> PgParamSink<'q> {
-    pub fn new(query: &'q mut QueryBuilder<Postgres>) -> Self {
+    pub(crate) fn new(query: &'q mut QueryBuilder<Postgres>) -> Self {
         Self { query }
     }
 }
@@ -32,6 +32,9 @@ impl SqlSink for PgParamSink<'_> {
             SqlParam::Float(v) => self.query.push_bind(v),
             SqlParam::Text(v) => self.query.push_bind(v),
             SqlParam::Timestamp(v) => self.query.push_bind(v),
+            // Bound as a Postgres `date`: compares with a `date` column exactly and can use a
+            // plain index on it.
+            SqlParam::Date(v) => self.query.push_bind(v),
         };
     }
 }

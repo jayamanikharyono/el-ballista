@@ -34,8 +34,9 @@ async fn numeric_columns_decode_exact() -> Result<(), Box<dyn std::error::Error>
     )
     .await?;
 
-    let batch = ex.extract_full_table(&db.table(), None).await?;
-    assert_eq!(batch.num_rows(), 8);
+    // No ORDER BY in extraction: sort by id before asserting per-row positions.
+    let batch = common::sorted_by(&ex.extract_full_table(&db.table(), None).await?, "id");
+    assert_eq!(batch.num_rows(), common::HOSTILE_ROWS);
 
     // amount numeric(12,2): exact unscaled values, NULLs preserved.
     assert_eq!(
@@ -48,6 +49,12 @@ async fn numeric_columns_decode_exact() -> Result<(), Box<dyn std::error::Error>
             None,
             Some(100),
             Some(4242),
+            None,
+            // ids 9..13: the updated_at tie rows.
+            None,
+            Some(-1),
+            None,
+            None,
             None,
         ]
     );

@@ -38,12 +38,14 @@ Gate 2 maps directly onto DataFusion's `TableProviderFilterPushDown` enum:
 
 - **`Exact`** — the source guarantees it omits *only* rows failing the predicate. DataFusion adds
   no `FilterExec`.
-- **`Inexact`** — the source reduces rows but may return some that fail the predicate. DataFusion
-  keeps a `FilterExec` above the scan to re-check. Correct, just less efficient.
+- **`Inexact`** — the source reduces rows but may return some that fail the predicate: its
+  result is a **superset** of the correct rows. DataFusion keeps a `FilterExec` above the scan to
+  re-check. The re-check can remove rows but never add them back, so a pushed form that could
+  return *fewer* rows than Arrow is not `Inexact` — it is not pushed at all.
 - **`Unsupported`** — not pushed; DataFusion filters everything itself.
 
-`Inexact` is the safety valve, and we reach for it whenever we are not *certain* the semantics
-match. One consequence to keep in mind: when any pushed filter is `Inexact`, DataFusion cannot push
+`Inexact` is only a safety valve for "maybe too many rows". When the source might return too
+*few*, the predicate stays in Arrow. One consequence to keep in mind: when any pushed filter is `Inexact`, DataFusion cannot push
 the `LIMIT` down, because an inexact filter does not guarantee that every non-matching row was
 removed, so a source-side `LIMIT n` could leave fewer than `n` valid rows.
 
@@ -51,30 +53,29 @@ removed, so a source-side `LIMIT n` could leave fewer than `n` valid rows.
 
 ## 2. Expression translation
 
-`pushdown::translate` walks the DataFusion `Expr` tree and attempts to render it into a dialect-specific
+`pushdown::translate_with` walks the DataFusion `Expr` tree and renders it into an engine-agnostic
 `Predicate` IR with bound parameters. Translation is **allowlist-based**: an expression node we do
 not explicitly recognize is not pushed. A denylist would mean every new DataFusion release could
 silently start pushing something we have never validated.
 
+Fidelity is decided *during translation*, from the `ColumnKind` the connector assigns each column
+from its catalog (Postgres: `connector::postgres::dialect::column_kind`). The IR is rendered
+through a per-connector dialect:
+
 ```rust
-/// Per-connector dialect: quoting, placeholders, and fidelity rules
-/// (`src/pushdown/dialect.rs`; implemented per backend)
+/// Per-connector rendering (`src/pushdown/dialect.rs`; implemented per backend)
 pub trait SqlDialect: Send + Sync {
     fn quote_ident(&self, name: &str) -> String;
-    fn placeholder(&self, param_index: usize) -> String;   // "$1" for Postgres
-    fn column_literal_fidelity(
-        &self,
-        column: &ColumnMetadata,
-        literal_is_text: bool,
-        literal_is_float: bool,
-    ) -> Fidelity; // Exact | Inexact
-    fn column_column_fidelity(
-        &self,
-        left_column: &ColumnMetadata,
-        right_column: &ColumnMetadata,
-    ) -> Fidelity;
+    fn placeholder(&self, param_index: usize) -> String;           // "$1" for Postgres
+    fn cast_type_name(&self, to: CastType) -> &'static str;         // CastType::Text -> "text"
+    fn collation_name(&self, collation: Collation) -> &'static str; // Binary -> "\"C\""
 }
 ```
+
+Every composite node renders inside its own parentheses (`("flag" IS NULL)`, `(NOT ...)`,
+`CAST(... AS text)`, `(... COLLATE "C")`), so the SQL never depends on the source's operator
+precedence (Postgres binds `IS NULL` tighter than `NOT`). Operators, cast targets and collations
+are closed enums in the serialized plan, never SQL text.
 
 Parameters are always bound, never interpolated. This is not only about injection — bound
 parameters let Postgres reuse prepared plans and keep literal formatting (timestamps, decimals,
@@ -84,16 +85,43 @@ byte strings) out of our hands.
 
 | Category | Pushed | Notes |
 | --- | --- | --- |
-| Column reference | yes | Quoted per dialect |
+| Column reference | yes | Quoted per dialect; must be a known column of the table |
 | Literals: int (8/16/32/64-bit, unsigned ≤32-bit), float, bool, utf8 | yes | Bound as typed parameters |
 | Literals: timestamp-microsecond | yes | Bound as typed parameter |
-| Literals: date, decimal, binary, NULL, anything else | **no** | `translate_literal` returns `None` → kept in Arrow |
-| Comparison: `= != < <= > >=` | yes | Fidelity depends on column type — see §3 |
-| `AND` / `OR` / `NOT` | yes | Fidelity is the *minimum* of the children's |
-| `IS NULL` / `IS NOT NULL` | yes | Exact in both dialects |
-| `IN (list)`, `BETWEEN`, `LIKE`, `CAST`, arithmetic `+ - * /` | **no** | `translate` returns `None` (deliberate for arithmetic — see §3.4); kept in Arrow. The `Predicate::Cast` variant exists but is only ever produced by internal enum-label normalization, never from user predicates |
+| Literals: date (`Date32`, years 1–9999) | yes | Bound as a Postgres `date` |
+| Literals: decimal, binary, NULL, anything else | **no** | kept in Arrow |
+| Comparison `= <> < <= > >=` against a literal | per column kind | See the table below and §3 |
+| Column-to-column comparison | same-kind integer / boolean / timestamp / date / text only | Text sides both `COLLATE "C"` |
+| `AND` / `OR` | yes | Fidelity is the *minimum* of the children's |
+| `NOT`, `IS [NOT] NULL` over a predicate | only over an `Exact` child | The negation of a superset is a subset |
+| `IS NULL` / `IS NOT NULL` on a column | yes, any known column | `Exact` |
+| `IN (list)`, `BETWEEN`, `LIKE`, `CAST`, arithmetic `+ - * /` | **no** | Kept in Arrow (deliberate for arithmetic — see §3.4) |
 | Regex, JSON path, string functions | **no** | Kept in Arrow; usually much faster there anyway |
 | UDFs | **no** | By definition not expressible in the source |
+
+| Column kind (Postgres types) | Pushed comparisons | Fidelity |
+| --- | --- | --- |
+| Integer (`smallint`/`integer`/`bigint`), Boolean, Timestamp (`timestamp[tz]`) | all six | `Exact` |
+| Text (`text`, `varchar`) | all six, as `("col" COLLATE "C") op $n` | `Exact` |
+| Label (true enums from `pg_enum`) | all six, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
+| TextCast (`uuid`, `json`, `jsonb`, other `USER-DEFINED` incl. `citext`) | `=` and `<>` only, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
+| Date (`date`) | all six, as a plain `"col" op $n` against a bound `date` (a plain index on the column serves it) | `Exact` |
+| Float (`real`, `double precision`) | `=` only | `Inexact` |
+| `character(n)`, numeric, bytea, arrays, other | none (only `IS [NOT] NULL`) | — |
+
+Only plain column comparisons push. When DataFusion has to wrap the column in a cast to make a
+comparison type-check — a `date` column against a timestamp literal, `CAST(d AS VARCHAR) = '…'`
+— the filter is not a column comparison any more and stays in Arrow. Casts and aliases in the
+projection are always DataFusion's: only the column list is pushed.
+
+`COLLATE "C"` orders the **server-encoded** bytes, which equals Arrow's UTF-8 byte order only
+when `server_encoding = UTF8`. The provider reads `SHOW server_encoding` once; on any other
+encoding (or if the lookup fails) Text and Label columns are treated as TextCast — `=` / `<>`
+only, since byte equality does not depend on the encoding.
+
+The rules above are also checked by a seeded property-based differential test
+(`tests/pg_pushdown_prop.rs`: random nested predicates over ICU / case-insensitive / plain text,
+`-0.0`/`NaN`/NULL floats, integer extremes, booleans and an enum, `always` vs `never`).
 
 Aggregate and join pushdown are deliberately **out of scope for Phase 1**. They are the highest-risk
 translations (grouping semantics, NULL handling in `COUNT`, join-side null padding, and a very real
@@ -119,28 +147,28 @@ SELECT * FROM orders WHERE status = 'PAID';   -- also matches 'paid', 'Paid', 'P
 Arrow's string comparison is byte-exact. Push that predicate as `Exact` and DataFusion drops its
 own filter — you have just silently loosened the query and included rows the user did not ask for.
 
-**Rule:** for any string comparison, the connector inspects the column's collation.
+The same hazard hits ordering: under ICU `en-US`, `'B' < 'a'` is false, while Arrow compares bytes
+and says true. Pushing `name < 'a'` even as `Inexact` would drop `'B'` — and a re-check cannot
+restore it.
 
-| Situation | Fidelity |
-| --- | --- |
-| Postgres, collation is `C` or `POSIX` | `Exact` |
-| Postgres, any other deterministic collation, `=` only | `Exact` (equality under deterministic collations is byte equality) |
-| Postgres, non-`C` collation, ordering comparison (`< >`) | `Inexact` |
-| Postgres, `citext` column or non-deterministic collation | `Inexact` |
-| Unknown / unresolvable collation | `Inexact` |
+**Rule:** every text comparison is rendered with an explicit binary collation —
+`("name" COLLATE "C") < $1` on Postgres. `"C"` compares the UTF-8 bytes, which is exactly Rust/
+Arrow `str` ordering, so the comparison is `Exact` under every column collation (including
+nondeterministic ICU collations and `citext`, whose value is compared through its text form).
 
-`Inexact` here is not a performance loss worth worrying about: the database still does the work of
-reducing the rows, DataFusion just re-checks the survivors, which is a vectorized pass over a small
-batch.
+The cost: an explicit `COLLATE "C"` can only use an index built with the `C` collation. The
+cost model therefore assumes an index serves a text comparison only when the column's own
+collation is `C`/`POSIX` (from `information_schema.columns.collation_name`); otherwise it falls back
+to selectivity and cost estimates.
 
-**Enum columns.** Postgres has no `enum = text` operator, so a text literal against a true enum
-column (detected via `pg_enum`, cached per provider) is rewritten to a label comparison
-(`"status"::text = 'PAID'`) and forced `Inexact` — label equality *is* enum equality, so the
-cast only narrows. A non-text literal against an enum has no pushable form and stays in Arrow
-(an integer literal alone would look `Exact` and then fail at execution with `42883`).
-`citext` is deliberately excluded from this rewrite: its native case-insensitive operator is
-correct as pushed, and recasting to text would narrow case-sensitively, dropping rows Arrow
-would keep.
+**Enum, uuid, json, `citext`.** Postgres has no `enum = text` (or `uuid = text`) operator, so a
+text literal is compared against the value's text form: `(CAST("status" AS text) COLLATE "C") =
+$1`. That text is what the extractor emits into Arrow, so the comparison is `Exact`. Enum labels
+push all six operators (label order, byte-wise — which is what Arrow compares, not the enum's
+declaration order). For `uuid`/`json`/`jsonb`/other user-defined types only `=` and `<>` push;
+ordering comparisons stay in Arrow. A non-text literal against any of these has no pushable form
+and stays in Arrow. (`jsonb` equality is `Exact` because extraction selects `jsonb` as `::text` too, so Arrow
+holds exactly the text the source compared — keep the two in sync.)
 
 ### 3.2 NULL semantics
 
@@ -159,9 +187,10 @@ translation unless the equivalence holds under three-valued logic. Specifically,
   our declared precision would be evaluated at full precision in the database and at truncated
   precision in Arrow. **Rule:** comparisons on `NUMERIC` columns whose declared precision exceeds
   38 digits are `Unsupported`, not `Inexact`, because the scan itself is already in trouble.
-- Float comparison against `NaN` differs: Postgres orders `NaN` as greater than all other values;
-  IEEE-754 (and Arrow kernels) treat comparisons with `NaN` as false. **Rule:** any comparison on a
-  float column is `Inexact`.
+- Floats: Arrow compares with IEEE total order (`-0.0 < +0.0`, `NaN = NaN`); Postgres treats
+  `-0 = 0` and orders `NaN` above everything. So `x < 0.0` or `x <> 0.0` pushed to Postgres would
+  drop `-0.0` rows. **Rule:** float `=` is `Inexact` (the source returns a superset); every other
+  float comparison — and `NOT` over float `=` — stays in Arrow.
 
 ### 3.4 Arithmetic and overflow
 
@@ -196,19 +225,51 @@ The model estimates two quantities and compares them against a policy budget.
 
 ### 4.1 Inputs
 
-Statistics come from the source, cheaply, and are cached with a TTL (default 15 minutes):
+Statistics come from the source, cheaply, and are cached per provider with a TTL (default 15
+minutes). They are refreshed lazily: the first `scan` after the TTL expires re-reads them
+(best-effort; a failed refresh keeps the previous snapshot). A refresh only affects later plans —
+filters already accepted at planning are never re-decided. Providers decoded from a serialized
+plan (Ballista scheduler/executors) carry no statistics and never refresh.
 
 | Input | Postgres |
 | --- | --- |
 | Row count estimate | `pg_class.reltuples` |
-| Column selectivity | `pg_stats` — `n_distinct`, `most_common_vals`/`most_common_freqs`, `histogram_bounds` |
+| Column selectivity | `pg_stats` — `n_distinct` (negative values are fractions of `reltuples` and are converted), `null_frac` |
+| Range selectivity (integer, date, timestamp columns) | `pg_stats` — `histogram_bounds`, `most_common_vals` / `most_common_freqs`, converted in SQL to numbers (dates as days, timestamps as epoch seconds). Best-effort: without them range estimates use the defaults below |
 | Index availability | `pg_index` + `pg_class` |
 | Plan cost / access method | `EXPLAIN (FORMAT JSON)` — plans without executing |
 | Table size | `pg_total_relation_size()` |
 
 `EXPLAIN` is the highest-fidelity signal and the one we lean on for the decisive cases: it tells us
 whether the candidate predicate produces an index scan or a sequential scan, and at what estimated
-cost. It is one cheap round trip and the result is cached per (table, predicate shape).
+cost. It is one cheap round trip and the result is cached per (table, predicate shape). A plan
+without `Total Cost` is treated as *unknown* (the statistics estimate is used), never as free.
+
+### Range selectivity and windows
+
+A range comparison (`<`, `<=`, `>`, `>=`) on an integer, date or timestamp column is estimated
+from the column's distribution, the way Postgres does it: the most-common values inside the
+range, plus the histogram's share of the remaining (non-NULL, non-most-common) rows, linear
+inside a bucket. A column with most-common values but no histogram — typical for a date column
+with a few hundred distinct days — is estimated from the most-common values alone.
+
+Filters arrive at the provider as a set (DataFusion splits `AND` into separate filters). A range
+filter is estimated **together with the other range filters on the same column**, as one window:
+for `updated_at >= '2026-09-27'` and `updated_at < '2026-09-28'`, each side is judged by the
+one-day window's selectivity, not by its own open-ended half. Both sides therefore get the same
+decision. `rel plan` names the basis: `low selectivity (0.50% from histogram, window of 2 range
+filters)`.
+
+A window's cost is the table-size heuristic over the window's selectivity, even when an
+`EXPLAIN` of one side is cached: that `EXPLAIN` prices an open-ended half-range, not the window.
+It also keeps `rel plan` (which warms `EXPLAIN`) in agreement with a first run (which has not).
+
+Fallback: without the column's distribution (never analyzed, a type the distribution query does
+not cover, the query failed, or a provider rebuilt from a serialized plan), a range filter keeps
+the plain per-predicate estimate (0.33 per comparison) and gets no window discount — the model
+keeps rather than pushes on a guess.
+
+Equality still uses `1 / n_distinct`, and `OR` / `NOT` trees keep the per-predicate estimate.
 
 ### 4.2 The decision
 
@@ -236,6 +297,11 @@ cost. It is one cheap round trip and the result is cached per (table, predicate 
                          source_cost < budget
 ```
 
+"Index available" means: EXPLAIN chose an index path, or a catalog index is **plain** (not
+partial, no expression keys), **btree** (hash for `=` only), and has the compared column as its
+**leading** key. `<>`, `NOT`, `IS NOT NULL` and column-to-column comparisons never count; `OR`
+counts only when every branch does; `AND` when either side does.
+
 Two guardrails override the arithmetic:
 
 - **Source CPU budget.** A source can declare `max_source_cost`. On a production primary this is
@@ -253,10 +319,12 @@ Two guardrails override the arithmetic:
 | `always` | Push everything expressible and safe | Dedicated replica, no production impact |
 | `never` | Keep everything in Arrow | Emergency: source is under pressure |
 | `cost_based` | The model above (default) | Normal operation |
-| `strict` | Push a filter only if every referenced column is indexed, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp); never push `LIMIT`; `push` hints ignored, `deny` still applies | Source under pressure |
+| `strict` | Push a filter only if every referenced column leads a plain index, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp/date); keeps everything without statistics; never pushes `LIMIT`; `push` hints ignored, `deny` still applies. Pushed fidelity is the translated one | Source under pressure |
 | `hinted` | Per-column and per-predicate overrides in the job spec | When you know something the stats do not |
 
-Configured per source, overridable per job (JSON job spec):
+Policy names are case-insensitive; an unknown name is a configuration error (it never falls
+back to a default, so a mistyped emergency `never` cannot fail open). `deny` matches column names
+case-insensitively. Configured per source, overridable per job (JSON job spec):
 
 ```json
 {
@@ -271,9 +339,16 @@ Configured per source, overridable per job (JSON job spec):
 }
 ```
 
+**Where decisions are made.** `supports_filters_pushdown` is the only place the policy runs.
+`scan` pushes every filter DataFusion hands it (DataFusion only passes filters that were accepted),
+translating it again — deterministically, from column kinds that travel inside serialized plans —
+and fails loudly if one cannot be translated rather than dropping it. So a Ballista scheduler,
+which rebuilds the provider without statistics, pushes exactly what the planning client decided,
+under every policy. There is no separate optimizer rule: DataFusion's own `PushDownFilter` drives
+`supports_filters_pushdown`.
+
 Filtered extraction has no always-pushed predicate: every caller-provided filter goes through
-the same fidelity + policy decision. (The watermark special case from the deferred
-[ incremental extraction](deferred/incremental-extraction.md) design no longer applies.)
+the same fidelity + policy decision.
 
 ---
 
@@ -297,11 +372,11 @@ fine for sampling but must never be relied on for deterministic extraction.
 Pushdown bugs return *plausible* wrong answers, so testing needs to be differential rather than
 example-based.
 
-1. **Differential correctness tests (implemented, `tests/pg_pushdown.rs`).** For each dialect, run every allowlisted predicate against a
-   seeded table with the full hostile-value set (NULLs, empty strings, mixed case, accents, `NaN`,
-   `±infinity`, zero dates, max/min integers, high-precision decimals) both with pushdown enabled
-   and with `policy = "never"`. The two result sets must be identical. This test catches every
-   hazard in §3 and is the single highest-value test in the project.
+1. **Differential correctness tests (implemented, `tests/pg_pushdown.rs`).** Postgres only so far:
+   a table of hazards (ICU-collated text ranges, `NOT` under a nondeterministic collation, `-0.0`
+   and `NaN` floats, `(NOT flag) IS NULL`, enum `OR`, `uuid`/`jsonb` equality, `IS NULL`, backslash
+   text) run with `policy = "always"` and `"never"`; the result sets must be identical, and each
+   case also asserts whether it was actually pushed, so the differential cannot pass vacuously.
 2. **Property tests (planned).** Generate random predicate trees with `proptest`, then assert the same
    equality. Random trees find the `NOT`/`OR`/NULL interactions that hand-written tests miss.
 3. **Plan snapshot tests.** Assert the *decisions*, not just the results, so a stats or cost-model

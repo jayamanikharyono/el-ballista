@@ -1,5 +1,7 @@
 # Phase 3 Implementation Plan — True Streaming Execution
 
+> Archived planning document (September 2026). Not a description of the current code — see [../roadmap.md](../roadmap.md) and [../architecture.md](../architecture.md).
+
 **Status**: ✓ COMPLETE (as of September 10, 2026)
 
 This document outlines the evolution from Phase 2 (cost-based pushdown with materialized results) to Phase 3 (true incremental streaming with bounded memory).

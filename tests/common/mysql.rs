@@ -16,10 +16,12 @@
 //! ```
 //!
 //! Design: database isolation inside the one server — each `MySqlTestDb` gets `test_<pid>_<n>`,
-//! builds the hostile fixture inside it, and drops it on `Drop`. Tests can run in parallel.
+//! builds the hostile fixture inside it, and drops it on `Drop` (fresh admin connection on a private
+//! runtime, 10 s timeout, failures logged) or via the explicit `MySqlTestDb::cleanup().await`.
+//! Tests can run in parallel.
 
-use sqlx::MySqlPool;
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
+use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlPoolOptions};
+use sqlx::{Connection, MySqlPool};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -38,6 +40,11 @@ pub struct MySqlTestDb {
     pub port: u16,
     pub user: String,
     pub password: String,
+    /// Admin (server `test` database) options, so teardown can open a fresh connection that is
+    /// independent of the test runtime.
+    admin_options: MySqlConnectOptions,
+    /// Set by [`MySqlTestDb::cleanup`]; makes `Drop` a no-op.
+    cleaned: bool,
 }
 
 impl MySqlTestDb {
@@ -64,7 +71,7 @@ impl MySqlTestDb {
         let admin_pool = MySqlPoolOptions::new()
             .max_connections(4)
             .acquire_timeout(Duration::from_secs(30))
-            .connect_with(admin_options)
+            .connect_with(admin_options.clone())
             .await
             .unwrap_or_else(|e| {
                 panic!(
@@ -90,15 +97,9 @@ impl MySqlTestDb {
         .await
         .unwrap_or_else(|e| panic!("MySqlTestDb: cannot create database {db_name}: {e}"));
 
-        // Reconnect to the per-test database for fixture setup. Password may be empty, so build
-        // the URL accordingly.
-        let test_url = if password.is_empty() {
-            format!("mysql://{user}@{host}:{port}/{db_name}")
-        } else {
-            format!("mysql://{user}:{password}@{host}:{port}/{db_name}")
-        };
-        let test_options = MySqlConnectOptions::from_str(&test_url)
-            .unwrap_or_else(|e| panic!("MySqlTestDb: invalid per-test URL {test_url:?}: {e}"));
+        // Reconnect to the per-test database for fixture setup (same server/credentials, other
+        // database — no URL re-assembly, so special characters in the password are safe).
+        let test_options = admin_options.clone().database(&db_name);
         let test_pool = MySqlPoolOptions::new()
             .max_connections(4)
             .acquire_timeout(Duration::from_secs(30))
@@ -115,6 +116,8 @@ impl MySqlTestDb {
             port,
             user,
             password,
+            admin_options,
+            cleaned: false,
         };
         db.setup()
             .await
@@ -186,28 +189,81 @@ impl MySqlTestDb {
     }
 }
 
+impl MySqlTestDb {
+    /// Drop the per-test database on the test's own runtime and close the pool. Prefer this over
+    /// relying on `Drop` when a test wants the teardown awaited. `Drop` is a no-op afterwards.
+    pub async fn cleanup(mut self) {
+        self.cleaned = true;
+        let sql = format!("DROP DATABASE IF EXISTS `{}`", self.database);
+        let res = tokio::time::timeout(
+            TEARDOWN_TIMEOUT,
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).execute(&self.pool),
+        )
+        .await;
+        match res {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!(
+                "MySqlTestDb::cleanup: DROP DATABASE {} failed: {e}",
+                self.database
+            ),
+            Err(_) => eprintln!(
+                "MySqlTestDb::cleanup: DROP DATABASE {} timed out after {TEARDOWN_TIMEOUT:?}",
+                self.database
+            ),
+        }
+        self.pool.close().await;
+    }
+}
+
+/// Upper bound on teardown: a stuck `DROP DATABASE` must not hang the suite.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `DROP DATABASE` over a FRESH admin connection on a private current-thread runtime. The test's
+/// pool is bound to the test runtime, which is blocked in `join()` while `Drop` runs, so it can
+/// never drive that pool's I/O (the old deadlock / 30 s acquire timeout).
+fn drop_database_blocking(options: MySqlConnectOptions, db_name: String) {
+    let joined = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("MySqlTestDb::drop: cannot build teardown runtime for {db_name}: {e}");
+                return;
+            }
+        };
+        rt.block_on(async {
+            let work = async {
+                let mut conn = MySqlConnection::connect_with(&options).await?;
+                let sql = format!("DROP DATABASE IF EXISTS `{db_name}`");
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                    .execute(&mut conn)
+                    .await?;
+                conn.close().await
+            };
+            match tokio::time::timeout(TEARDOWN_TIMEOUT, work).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("MySqlTestDb::drop: DROP DATABASE {db_name} failed: {e}"),
+                Err(_) => eprintln!(
+                    "MySqlTestDb::drop: DROP DATABASE {db_name} timed out after {TEARDOWN_TIMEOUT:?}"
+                ),
+            }
+        });
+    })
+    .join();
+    if joined.is_err() {
+        eprintln!("MySqlTestDb::drop: teardown thread panicked");
+    }
+}
+
 impl Drop for MySqlTestDb {
     fn drop(&mut self) {
-        let pool = self.pool.clone();
-        let db_name = self.database.clone();
-        // Best-effort cleanup — needs its own runtime because Drop has no async context.
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            if let Ok(rt) = rt {
-                rt.block_on(async {
-                    // MySQL allows dropping the currently-selected database; best-effort either
-                    // way (the test database is ephemeral, torn down with the compose stack).
-                    let _ = sqlx::query(sqlx::AssertSqlSafe(
-                        format!("DROP DATABASE IF EXISTS `{db_name}`").as_str(),
-                    ))
-                    .execute(&pool)
-                    .await;
-                });
-            }
-        })
-        .join();
+        // A failed drop must never fail (or hang) a test, but it is logged, not swallowed.
+        if self.cleaned {
+            return;
+        }
+        drop_database_blocking(self.admin_options.clone(), self.database.clone());
     }
 }
 
@@ -230,4 +286,16 @@ fn parse_url(url: &str) -> Option<(String, u16, String, String, String)> {
         password.to_string(),
         database.to_string(),
     ))
+}
+
+/// `batch` reordered by its ``col`` column ascending. Extraction carries no `ORDER BY`, so row
+/// order is unspecified; tests that assert on row positions must sort first.
+pub fn sorted_by(
+    batch: &arrow::record_batch::RecordBatch,
+    col: &str,
+) -> arrow::record_batch::RecordBatch {
+    let idx = batch.schema().index_of(col).expect("sort column exists");
+    let indices =
+        arrow::compute::sort_to_indices(batch.column(idx), None, None).expect("sort_to_indices");
+    arrow::compute::take_record_batch(batch, &indices).expect("take_record_batch")
 }

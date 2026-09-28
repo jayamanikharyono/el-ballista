@@ -1,24 +1,37 @@
 # Connector Abstraction Plan
 
-Status: **in progress.** Step 1 done: `pushdown` is now a shared crate-root module
-(`src/pushdown/`, no longer under `connector::postgres`); `SqlDialect`/`Fidelity`/`Predicate`/cost
-model live there; `PostgresDialect` moved to `connector/postgres/dialect.rs` and `MysqlDialect` is
-under `connector/mysql/` (both `impl crate::pushdown::dialect::SqlDialect`). A `SourceConnector`
-trait sketch is in `connector/mod.rs`. Remaining steps below are not done yet.
-
 ## Goal
 
 Support multiple source connectors (PostgreSQL today, MySQL next) where the *generic* machinery —
 SQL predicate rendering, cost-based pushdown, the DataFrame engine, and Ballista distributed
 execution — is shared, and only genuinely backend-specific pieces live under each connector.
 
+Abstractions are added only when a second connector needs them, so the plan below lands in
+steps, each driven by the MySQL connector growing a capability.
+
 ## Current state
 
-After the modularization, all Postgres code lives under `src/connector/postgres/`, with
-`distributed`, `engine`, and `pipeline` physically there and re-exported at the
-crate root as transitional shims (see AGENTS.md — Postgres connector modularization). The MySQL
-prototype (`src/connector/mysql/`) is a walking skeleton: `MysqlDialect`, a type mapper, a
-`information_schema` reader, and a full-table extractor (materializes `Utf8` via `CAST`).
+- **Shared:** `src/pushdown/` is a connector-agnostic crate-root module (`ir`, `translate`,
+  `policy`, `cost_model`, `dialect`, and the backend-neutral `stats` / `explain` types). Both
+  `PostgresDialect` and `MysqlDialect` implement `crate::pushdown::dialect::SqlDialect`.
+- **Postgres:** everything Postgres-specific lives under `src/connector/postgres/`, including
+  `dialect`, `param_sink`, `inline_sql`, the `stats` collector, the `explain` executor,
+  `distributed`, `engine`, `pipeline` and the `PostgresConnector` builder API (`api.rs`). There
+  are no crate-root re-exports: callers use
+  `rust_ballista_extraction_layer::connector::postgres::*`. The push/keep decision is made in
+  `PostgresTableProvider::supports_filters_pushdown`; there is no custom optimizer rule.
+- **MySQL:** the prototype (`src/connector/mysql/`) is a walking skeleton: `MysqlDialect`, a
+  type mapper, an `information_schema` reader, and a full-table extractor that selects raw
+  columns (no `CAST`) and decodes them into typed Arrow arrays — lossless unsigned integers
+  (`bigint unsigned` → `UInt64`), `tinyint(1)` → `Boolean`, `YEAR` → `Int16`, `TIME` →
+  `Duration(µs)`, `decimal` → `Decimal128`, binary types → `Binary`, `Utf8` otherwise — either
+  streamed in `batch_size` batches (`extract_full_table_for_each_batch`) or materialized into one
+  batch (`extract_full_table`). It has no filters/pushdown, no `TableProvider`, no
+  parallel/distributed execution and no checkpointed jobs.
+- **Not yet shared:** `engine::ExtractContext` hard-codes `PostgresTableProvider`, and
+  `distributed::DistributedContext` hard-codes the Postgres codecs. A `SourceConnector` trait
+  sketch (two methods, `dialect` and `table_metadata`) is in `connector/mod.rs`, not wired into
+  anything.
 
 ## What the MySQL prototype revealed
 
@@ -26,58 +39,48 @@ Generic (already reused unchanged by MySQL):
 - `types::{TableMetadata, ColumnMetadata}` — the catalog contract holds across backends.
 - `pushdown::dialect::SqlDialect` — a second dialect (`MysqlDialect`) implements it cleanly.
 
-Leaks to fix during the lift:
-- `SqlDialect` and `Fidelity` live under `connector::postgres::pushdown`, so MySQL imports a
-  Postgres module. They must move to a shared location.
-- `connector::errors::ExtractorError` messages say "PostgreSQL error" — make them backend-neutral. (DONE — now "Source error" / "Unsupported source type".)
+Two leaks it exposed shaped the current layout:
+- `SqlDialect` and fidelity belong to the shared layer, not to a Postgres module: the dialect
+  trait is `crate::pushdown::dialect::SqlDialect`, and fidelity is decided once at translation
+  from the engine-neutral `pushdown::ColumnKind`.
+- `connector::errors::ExtractorError` messages are backend-neutral ("Source error" /
+  "Unsupported source type").
 
 Stays connector-specific (never shared):
 - The SQL dialect impl (`PostgresDialect` / `MysqlDialect`), placeholders (`$1` vs `?`),
   identifier quoting (`"..."` vs `` `...` ``).
 - Catalog + statistics + EXPLAIN queries (`pg_stats`/`pg_read_all_stats`/EXPLAIN vs MySQL).
 - Type mapping to Arrow and row decoding.
-- Cursor/streaming mechanics (`DECLARE ... WITH HOLD` is Postgres-only).
+- Cursor/streaming mechanics (`DECLARE ... CURSOR WITHOUT HOLD` + `FETCH` is Postgres-only).
 - Parallel strategy: `ctid` is Postgres-physical; MySQL is keyset-only.
 - Ballista logical/physical codecs (each serializes its own `TableProvider`/`ExecutionPlan`).
 
 ## Target module layout
 
-```
-src/
-  pushdown/                 # shared, connector-agnostic (DONE — now at crate root)
-    dialect.rs              # SqlDialect trait (PostgresDialect re-exported for compat)
-    mod.rs                  # Fidelity, Predicate, SqlSink, translate/decide, policy
-    cost_model.rs           # CostParams, cost math
-    # RESIDUAL Postgres-coupled (relocate next): explain.rs, stats.rs collector,
-    # PgParamSink (in mod.rs), optimizer_rule.rs (imports PostgresTableProvider)
-  engine/                   # NEW generic DataFrame builder over a SourceConnector
-  distributed/              # NEW generic Ballista orchestration; codecs supplied per connector
-  connector/
-    mod.rs                  # SourceDescriptor (exists) + SourceConnector (new, see below)
-    postgres/
-      dialect.rs            # PostgresDialect: pushdown::dialect::SqlDialect (DONE)
-      explain.rs, stats.rs  # Postgres catalog/EXPLAIN
-      table_provider.rs, execution_plan.rs, extractor.rs, parallel.rs, row_adapter.rs
-      distributed/          # Postgres codecs + connection descriptor + pool
-    mysql/
-      dialect.rs            # MysqlDialect: pushdown::dialect::SqlDialect (DONE)
-      schema_reader.rs, type_mapper.rs, extractor.rs, query_builder.rs
-```
+The layout differs from the current one in [architecture](architecture.md#2-crate-layout) in
+these places only:
 
-The crate-root shims are deleted once callers use `connector::postgres::*` / `sql::*` directly.
+- `src/engine/` (new, step 2): the generic DataFrame builder over a `SourceConnector`, moved out
+  of `connector/postgres/engine/`.
+- `src/distributed/` (new, step 3): generic Ballista orchestration. The codecs, connection
+  descriptor and pool registry stay under `connector/postgres/distributed/`, since each
+  connector serializes its own `TableProvider` / `ExecutionPlan`.
+- `connector/mod.rs`: `SourceConnector` grows the methods below.
+- `connector/mysql/`: gains a `TableProvider`, pushdown and a pool registry as the prototype is
+  promoted.
 
-## Proposed `SourceConnector` trait (sketch — not yet added)
+## Proposed `SourceConnector` trait
 
 The engine and distributed layers depend on this instead of `PostgresTableProvider` directly.
-Only add it when the second connector actually needs it (AGENTS.md: abstraction must be required,
-not hypothetical) — i.e. as part of the lift, not before.
+Only `dialect` and `table_metadata` exist today. The rest is added as part of the lift, when the
+second connector actually needs it, not before.
 
 ```rust
 /// A source backend the generic engine/distributed layers can drive.
 #[async_trait::async_trait]
 pub trait SourceConnector: Send + Sync {
     /// Backend SQL dialect (rendering, placeholders, quoting, fidelity).
-    fn dialect(&self) -> &dyn sql::SqlDialect;
+    fn dialect(&self) -> &dyn pushdown::dialect::SqlDialect;
 
     /// Read a table's schema into the shared catalog contract.
     async fn table_metadata(&self, table: &str) -> Result<TableMetadata, AppError>;
@@ -101,21 +104,14 @@ pub trait SourceConnector: Send + Sync {
 
 ## Compile-safe migration order
 
-Each step should build and pass `cargo clippy -- -D warnings` before the next.
+The shared `pushdown` module and the Postgres-only placement of dialect, statistics, `EXPLAIN`,
+parameter binding, engine, pipeline and distributed code are in place. The remaining steps each
+build and pass `cargo clippy -- -D warnings` before the next starts:
 
-1. DONE — `pushdown` moved to `src/pushdown/` (crate root, shared). `PostgresDialect` moved to
-   `connector/postgres/dialect.rs` (re-exported from `pushdown::dialect` for compat);
-   `MysqlDialect` under `connector/mysql`. NEXT within this step: relocate the residual
-   Postgres-coupled items still living in `pushdown` (`explain.rs`, the `stats.rs` collector +
-   `impl TableStatsSource for PgPool`, `PgParamSink`, `optimizer_rule.rs`) into
-   `connector/postgres`, leaving only connector-agnostic code in `pushdown`.
-2. Add `SourceConnector` + `PostgresConnector`'s impl of it; leave the fast-path CLI code as-is.
-3. Make `engine::ExtractContext` generic over `SourceConnector` (drop the hard-coded
+1. Add `SourceConnector` + `PostgresConnector`'s impl of it; leave the fast-path CLI code as-is.
+2. Make `engine::ExtractContext` generic over `SourceConnector` (drop the hard-coded
    `PostgresTableProvider` in `source()`); move `engine` to the crate root.
-4. Make `distributed::DistributedContext` take codecs via `SourceConnector::ballista_codecs`;
+3. Make `distributed::DistributedContext` take codecs via `SourceConnector::ballista_codecs`;
    move the generic parts to the crate root, leave codecs/descriptor/pool under postgres.
-5. Add `source.kind` to `JobConfig` + a connector registry; wire `PostgresConnector`/(later)
+4. Add `source.kind` to `JobConfig` + a connector registry; wire `PostgresConnector`/(later)
    `MysqlConnector` selection.
-6. Delete the transitional crate-root shims once no caller depends on them.
-
-Do not start step N+1 until step N compiles green.

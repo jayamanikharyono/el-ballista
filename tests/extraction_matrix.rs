@@ -12,9 +12,10 @@
 //!
 //! Comparison method: every cell — from Arrow and from the DB's `CAST(... AS text)` — is reduced to
 //! ONE canonical string by [`canon`], then per-column value multisets are sorted and compared. The
-//! same `canon` runs on all sides, so decimal scale (`100.00` vs `100`) and timestamp precision
-//! (`…:57.62` vs `…:57.620000`) converge; genuinely equal values compare equal regardless of how
-//! each engine renders them.
+//! normalisation is chosen per COLUMN from its type ([`column_kind`]) and the same one runs on all
+//! four sides: decimal scale (`100.00` vs `100`) converges only for decimal columns, timestamp
+//! precision (`…:57.62` vs `…:57.620000`) only for timestamp columns, `character(n)` padding only
+//! for `character(n)` columns; every other value is compared verbatim.
 //!
 //! Structurally-incomparable columns are excluded per table (see `MATRIX`), and why:
 //!   * `film.special_features` — Postgres `text[]` vs MySQL text; different shapes.
@@ -24,8 +25,9 @@
 //!     render binary identically on both engines. DB-level bytes DO match now (the seed UNHEX-decodes
 //!     the COPY `\\x<hex>` text — see `gen_mysql_seed.py`); parity is covered by the picture test in
 //!     `dvdrental_cross_engine.rs`, which compares Arrow `Binary` on both sides.
-//!   * `customer.activebool` / `staff.active` — Postgres `bool` (`true`/`false`) vs MySQL
-//!     `tinyint` (`1`/`0`); not comparable without a bool mapping.
+//!   * `customer.activebool` / `staff.active` — both connectors now yield Arrow `Boolean`
+//!     (MySQL `TINYINT(1)` is BOOLEAN), but the direct-SQL oracle renders Postgres `true`/`false`
+//!     vs MySQL `1`/`0`, so layer 1 would need a per-engine bool rendering.
 //!
 //! Everything else on all 15 tables is compared cell-for-cell.
 //!
@@ -210,6 +212,24 @@ fn parse(url: &str, default_port: u16) -> (String, u16, String, String, String) 
         database.to_string(),
     )
 }
+/// Name of the env var the filtered-extraction `JobConfig` reads its password from.
+const MATRIX_PASSWORD_ENV: &str = "MATRIX_PG_PASSWORD";
+static MATRIX_PASSWORD_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Set [`MATRIX_PASSWORD_ENV`] exactly once per process and never remove it: mutating the
+/// environment while other test threads read it (the old per-test `set_var` / `remove_var`) is a
+/// data race. Every test in this file calls this as its FIRST statement, so all of them block in
+/// `call_once` until the single write is done — no env read in this binary can overlap it.
+fn matrix_password_env() -> &'static str {
+    MATRIX_PASSWORD_ONCE.call_once(|| {
+        let (_, _, _, pw, _) = parse(&pg_url(), 5432);
+        // SAFETY: runs once, inside `call_once`, and the value is never changed or removed
+        // afterwards; every reader of this variable goes through this function first.
+        unsafe { std::env::set_var(MATRIX_PASSWORD_ENV, pw) };
+    });
+    MATRIX_PASSWORD_ENV
+}
+
 async fn pg_pool() -> PgPool {
     PgPoolOptions::new().max_connections(4).connect(&pg_url()).await.unwrap_or_else(|e| {
         panic!("cannot connect to Postgres ({e}). Is the compose stack up? `docker compose -f tests/docker/compose.yaml up -d --wait`.")
@@ -236,19 +256,90 @@ async fn my_extractor() -> (MysqlExtractor, String) {
 
 // ---- canonicalization ----
 
-/// One canonical string per value, applied identically on every side. Trims trailing spaces
-/// first (`bpchar`/`CHAR(n)` pads to length on store while `CAST(... AS text/CHAR)` trims, so the
-/// padded connector value and the trimmed oracle text converge), then trailing zeros in a
-/// fractional part (and a bare trailing dot), which converges decimal scale and timestamp precision
-/// across Arrow rendering and each engine's `CAST(... AS text)`; leaves other values alone.
-fn canon(s: &str) -> String {
-    let s = s.trim_end_matches(' ');
-    if s.contains('.') {
-        let t = s.trim_end_matches('0');
-        let t = t.trim_end_matches('.');
-        return t.to_string();
+/// How a column's values are normalised before comparison — decided per COLUMN from its type
+/// (see [`column_kind`]), never guessed from the shape of an individual string, so a text value
+/// that merely contains a `.` (an email, `"1.50"` in a varchar) is compared verbatim.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    /// Compare verbatim.
+    Exact,
+    /// Postgres `character(n)` pads to length on store while `CAST(... AS text)` (and MySQL
+    /// `CHAR`) trim, so trailing spaces are dropped — only for these columns.
+    PaddedChar,
+    /// Exact decimal (`numeric`/`DECIMAL`): trailing zeros of the fractional part (and a bare
+    /// trailing dot) are dropped, so decimal scale converges (`100.00` vs `100`).
+    Decimal,
+    /// Timestamp: trailing zeros of the fractional seconds (and a bare trailing dot) are dropped,
+    /// so precision converges (`…:57.62` vs `…:57.620000`).
+    Timestamp,
+}
+
+/// One canonical string per value, applied identically on every side of a comparison.
+fn canon(kind: Kind, s: &str) -> String {
+    match kind {
+        Kind::Exact => s.to_string(),
+        Kind::PaddedChar => s.trim_end_matches(' ').to_string(),
+        Kind::Decimal => {
+            let digits = s.strip_prefix('-').unwrap_or(s);
+            let is_decimal_literal = match digits.split_once('.') {
+                Some((i, f)) => {
+                    !i.is_empty()
+                        && i.bytes().all(|b| b.is_ascii_digit())
+                        && f.bytes().all(|b| b.is_ascii_digit())
+                }
+                None => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+            };
+            assert!(is_decimal_literal, "matrix: {s:?} is not a decimal literal");
+            strip_fraction_zeros(s)
+        }
+        Kind::Timestamp => {
+            // `YYYY-MM-DD HH:MM:SS[.ffffff]`: only the fractional-seconds part is touched.
+            match s.rsplit_once(':') {
+                Some((head, secs)) if secs.contains('.') => {
+                    format!("{head}:{}", strip_fraction_zeros(secs))
+                }
+                _ => s.to_string(),
+            }
+        }
     }
-    s.to_string()
+}
+
+/// `"12.3400"` → `"12.34"`, `"5.000"` → `"5"`; strings without a `.` are unchanged.
+fn strip_fraction_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The comparison [`Kind`] of `table.col`, from the Postgres connector's Arrow type plus the
+/// Postgres catalog type (the shared dvdrental schema has the same shape on both engines).
+async fn column_kind(pool: &PgPool, batch: &RecordBatch, table: &str, col: &str) -> Kind {
+    let idx = batch
+        .schema()
+        .index_of(col)
+        .unwrap_or_else(|_| panic!("column {col} in batch"));
+    match batch.schema().field(idx).data_type() {
+        DataType::Decimal128(_, _) => Kind::Decimal,
+        DataType::Timestamp(_, _) => Kind::Timestamp,
+        DataType::Utf8 => {
+            let data_type: String = sqlx::query_scalar(
+                "SELECT data_type::text FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+            )
+            .bind(table)
+            .bind(col)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("pg catalog type of {table}.{col}: {e}"));
+            if data_type == "character" {
+                Kind::PaddedChar
+            } else {
+                Kind::Exact
+            }
+        }
+        _ => Kind::Exact,
+    }
 }
 
 fn decimal_str(v: i128, scale: i8) -> String {
@@ -270,7 +361,7 @@ fn decimal_str(v: i128, scale: i8) -> String {
 
 /// Render one Arrow cell to its raw string (pre-`canon`). Only the types used by `MATRIX` columns
 /// are handled; anything else means an excluded column slipped in.
-fn arrow_cell(col: &ArrayRef, i: usize) -> Option<String> {
+fn arrow_cell(col: &ArrayRef, i: usize, kind: Kind) -> Option<String> {
     if col.is_null(i) {
         return None;
     }
@@ -345,23 +436,23 @@ fn arrow_cell(col: &ArrayRef, i: usize) -> Option<String> {
         }
         other => panic!("matrix: unexpected Arrow type {other:?} (excluded column leaked in?)"),
     };
-    Some(canon(&s))
+    Some(canon(kind, &s))
 }
 
 /// A connector-extracted column as a sorted multiset of canonical strings.
-fn conn_col(batch: &RecordBatch, col: &str) -> Vec<Option<String>> {
+fn conn_col(batch: &RecordBatch, col: &str, kind: Kind) -> Vec<Option<String>> {
     let idx = batch
         .schema()
         .index_of(col)
         .unwrap_or_else(|_| panic!("column {col} in batch"));
     let arr = batch.column(idx);
-    let mut v: Vec<Option<String>> = (0..arr.len()).map(|i| arrow_cell(arr, i)).collect();
+    let mut v: Vec<Option<String>> = (0..arr.len()).map(|i| arrow_cell(arr, i, kind)).collect();
     v.sort();
     v
 }
 
 /// The same column read directly from Postgres via `CAST(... AS text)`, canonicalized and sorted.
-async fn pg_col(pool: &PgPool, table: &str, col: &str) -> Vec<Option<String>> {
+async fn pg_col(pool: &PgPool, table: &str, col: &str, kind: Kind) -> Vec<Option<String>> {
     let sql = format!("SELECT CAST(\"{col}\" AS text) FROM public.\"{table}\"");
     let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
@@ -372,7 +463,7 @@ async fn pg_col(pool: &PgPool, table: &str, col: &str) -> Vec<Option<String>> {
         .map(|r| {
             r.try_get::<Option<String>, _>(0)
                 .unwrap()
-                .map(|s| canon(&s))
+                .map(|s| canon(kind, &s))
         })
         .collect();
     v.sort();
@@ -380,7 +471,13 @@ async fn pg_col(pool: &PgPool, table: &str, col: &str) -> Vec<Option<String>> {
 }
 
 /// The same column read directly from MySQL via `CAST(... AS CHAR)`, canonicalized and sorted.
-async fn my_col(pool: &MySqlPool, db: &str, table: &str, col: &str) -> Vec<Option<String>> {
+async fn my_col(
+    pool: &MySqlPool,
+    db: &str,
+    table: &str,
+    col: &str,
+    kind: Kind,
+) -> Vec<Option<String>> {
     let sql = format!("SELECT CAST(`{col}` AS CHAR) FROM `{db}`.`{table}`");
     let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
@@ -391,7 +488,7 @@ async fn my_col(pool: &MySqlPool, db: &str, table: &str, col: &str) -> Vec<Optio
         .map(|r| {
             r.try_get::<Option<String>, _>(0)
                 .unwrap()
-                .map(|s| canon(&s))
+                .map(|s| canon(kind, &s))
         })
         .collect();
     v.sort();
@@ -400,6 +497,7 @@ async fn my_col(pool: &MySqlPool, db: &str, table: &str, col: &str) -> Vec<Optio
 
 #[tokio::test]
 async fn full_extraction_matches_direct_sql_on_both_engines_and_cross_engine() {
+    matrix_password_env();
     let pgp = pg_pool().await;
     let myp = my_pool().await;
     let pgx = pg_extractor().await;
@@ -417,10 +515,11 @@ async fn full_extraction_matches_direct_sql_on_both_engines_and_cross_engine() {
             .unwrap_or_else(|e| panic!("MySQL extract {}: {e}", t.name));
 
         for col in t.cols {
-            let pg_conn = conn_col(&pg_batch, col);
-            let my_conn = conn_col(&my_batch, col);
-            let pg_sql = pg_col(&pgp, t.name, col).await;
-            let my_sql = my_col(&myp, &db, t.name, col).await;
+            let kind = column_kind(&pgp, &pg_batch, t.name, col).await;
+            let pg_conn = conn_col(&pg_batch, col, kind);
+            let my_conn = conn_col(&my_batch, col, kind);
+            let pg_sql = pg_col(&pgp, t.name, col, kind).await;
+            let my_sql = my_col(&myp, &db, t.name, col, kind).await;
 
             // Layer 1: each connector matches its own DB queried directly.
             assert_eq!(
@@ -441,19 +540,18 @@ async fn full_extraction_matches_direct_sql_on_both_engines_and_cross_engine() {
 
 #[tokio::test]
 async fn pg_filtered_extraction_matches_direct_sql() {
+    let env_var = matrix_password_env();
     use rust_ballista_extraction_layer::config::{
         CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
-        ParallelScanConfig, PushdownConfig, SinkConfig, SourceConfig,
+        ParallelScanConfig, PushdownConfig, SourceConfig,
     };
     use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
     // Differential oracle: a caller-provided id-range predicate pushed to the source
     // must return exactly what the same predicate returns over direct SQL.
-    let (h, p, u, pw, db) = parse(&pg_url(), 5432);
-    let env_var = "MATRIX_PG_PASSWORD";
-    unsafe { std::env::set_var(env_var, &pw) };
+    let (h, p, u, _pw, db) = parse(&pg_url(), 5432);
     let config = JobConfig {
-        job_id: "matrix-filtered".to_string(),
+        job_id: "matrix-filtered".to_string().parse().unwrap(),
         table: "public.rental".to_string(),
         columns: Some(vec!["rental_id".to_string()]),
         filters: vec![
@@ -471,9 +569,6 @@ async fn pg_filtered_extraction_matches_direct_sql() {
             application_name: "rbel-matrix".to_string(),
             schema: "public".to_string(),
         },
-        sink: SinkConfig {
-            path: "/tmp/rbel_matrix_sink".to_string(),
-        },
         checkpoint: CheckpointConfig::default(),
         pushdown: PushdownConfig::default(),
         parallel_scan: ParallelScanConfig::default(),
@@ -481,6 +576,7 @@ async fn pg_filtered_extraction_matches_direct_sql() {
         distributed: DistributedConfig::default(),
     };
     let batches = PostgresConnector::from_config(config)
+        .expect("valid job config")
         .extract()
         .standalone()
         .collect()
@@ -488,7 +584,7 @@ async fn pg_filtered_extraction_matches_direct_sql() {
         .expect("filtered extraction");
     let mut conn_ids = Vec::new();
     for batch in &batches {
-        conn_ids.extend(conn_col(batch, "rental_id"));
+        conn_ids.extend(conn_col(batch, "rental_id", Kind::Exact));
     }
     conn_ids.sort();
 
@@ -504,7 +600,7 @@ async fn pg_filtered_extraction_matches_direct_sql() {
         .map(|r| {
             r.try_get::<Option<String>, _>(0)
                 .unwrap()
-                .map(|s| canon(&s))
+                .map(|s| canon(Kind::Exact, &s))
         })
         .collect();
     sql_ids.sort();
@@ -517,11 +613,11 @@ async fn pg_filtered_extraction_matches_direct_sql() {
         conn_ids, sql_ids,
         "filtered extraction != direct SQL over the same range"
     );
-    unsafe { std::env::remove_var(env_var) };
 }
 
 #[tokio::test]
 async fn pg_keyset_partitions_union_equals_full() {
+    matrix_password_env();
     let pgx = pg_extractor().await;
 
     // Metamorphic oracle: two keyset partitions tiling the id space must union to the full scan
@@ -545,11 +641,11 @@ async fn pg_keyset_partitions_union_equals_full() {
         .await
         .expect("keyset b");
 
-    let mut union: Vec<Option<String>> = conn_col(&a, "actor_id");
-    union.extend(conn_col(&b, "actor_id"));
+    let mut union: Vec<Option<String>> = conn_col(&a, "actor_id", Kind::Exact);
+    union.extend(conn_col(&b, "actor_id", Kind::Exact));
     union.sort();
 
-    let full_ids = conn_col(&full, "actor_id");
+    let full_ids = conn_col(&full, "actor_id", Kind::Exact);
     assert_eq!(
         union, full_ids,
         "keyset partitions union must equal the full actor scan"

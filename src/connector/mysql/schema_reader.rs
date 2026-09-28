@@ -4,6 +4,7 @@
 
 use sqlx::MySqlPool;
 
+use super::error::MysqlError;
 use crate::types::{ColumnMetadata, TableMetadata};
 
 /// One `information_schema.COLUMNS` row, decoded as strings (robust across MySQL versions/types).
@@ -16,12 +17,31 @@ struct InformationSchemaColumn {
     collation_name: Option<String>,
 }
 
+/// Reads table metadata from `information_schema` for one MySQL connection pool.
 pub struct MysqlSchemaReader<'a> {
     pool: &'a MySqlPool,
     default_schema: String,
 }
 
 impl<'a> MysqlSchemaReader<'a> {
+    /// A reader over `pool`; unqualified table names resolve in `default_schema`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
+    /// use rust_ballista_extraction_layer::connector::mysql::schema_reader::MysqlSchemaReader;
+    ///
+    /// # let password = std::env::var("MYSQL_PASSWORD")?;
+    /// # let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "sakila", 4).await?;
+    /// let reader = MysqlSchemaReader::new(ex.pool(), "sakila");
+    /// let meta = reader.get_table_metadata("actor").await?; // or "sakila.actor"
+    /// for c in &meta.columns {
+    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub fn new(pool: &'a MySqlPool, default_schema: impl Into<String>) -> Self {
         Self {
             pool,
@@ -29,7 +49,34 @@ impl<'a> MysqlSchemaReader<'a> {
         }
     }
 
-    pub async fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, sqlx::Error> {
+    /// Column metadata for `table_name` (`table` or `schema.table`), in ordinal order.
+    ///
+    /// `COLUMN_TYPE` is carried in [`ColumnMetadata::udt_name`]: the type mapper needs it to tell
+    /// `tinyint(1)` (BOOLEAN), `unsigned`, `bit(n)` and `decimal(p,s)` apart.
+    ///
+    /// # Errors
+    ///
+    /// [`MysqlError::TableNotFound`] when `information_schema` lists no columns for the table
+    /// (missing table, or no privilege on any column) — never an empty `TableMetadata`, which
+    /// would otherwise render as `SELECT  FROM …`. [`MysqlError::Source`] on query failure.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
+    /// use rust_ballista_extraction_layer::connector::mysql::schema_reader::MysqlSchemaReader;
+    ///
+    /// # let password = std::env::var("MYSQL_PASSWORD")?;
+    /// # let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "sakila", 4).await?;
+    /// let reader = MysqlSchemaReader::new(ex.pool(), "sakila");
+    /// let meta = reader.get_table_metadata("actor").await?; // or "sakila.actor"
+    /// for c in &meta.columns {
+    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn get_table_metadata(&self, table_name: &str) -> Result<TableMetadata, MysqlError> {
         let (schema, table) = match table_name.split_once('.') {
             Some((s, t)) => (s.to_string(), t.to_string()),
             None => (self.default_schema.clone(), table_name.to_string()),
@@ -55,6 +102,10 @@ impl<'a> MysqlSchemaReader<'a> {
         .fetch_all(self.pool)
         .await?;
 
+        if rows.is_empty() {
+            return Err(MysqlError::TableNotFound { schema, table });
+        }
+
         let columns = rows
             .into_iter()
             .map(|r| ColumnMetadata {
@@ -64,6 +115,8 @@ impl<'a> MysqlSchemaReader<'a> {
                 numeric_precision: None,
                 numeric_scale: None,
                 udt_name: r.column_type,
+                // TODO(mysql-pushdown): collation is read but not yet used anywhere; text
+                // pushdown must consult it (MySQL defaults are case/accent-insensitive).
                 collation_name: r.collation_name,
             })
             .collect();

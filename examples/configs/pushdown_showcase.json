@@ -1,0 +1,77 @@
+{
+  "job_id": "pushdown_showcase",
+  "table": "payment",
+  "columns": [
+    "payment_id",
+    "customer_id",
+    "staff_id",
+    "rental_id",
+    "amount",
+    "payment_date"
+  ],
+  "filters": [
+    {
+      "column": "customer_id",
+      "op": ">=",
+      "value": 300
+    },
+    {
+      "column": "payment_date",
+      "op": ">=",
+      "value": "2007-04-06T00:00:00Z"
+    },
+    {
+      "column": "payment_date",
+      "op": "<",
+      "value": "2007-04-07T00:00:00Z"
+    },
+    {
+      "column": "staff_id",
+      "op": "!=",
+      "value": 1
+    },
+    {
+      "column": "amount",
+      "op": ">",
+      "value": 5
+    },
+    {
+      "column": "rental_id",
+      "op": ">=",
+      "value": 1000
+    }
+  ],
+  "source": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password_env": "PGPASSWORD",
+    "database": "test",
+    "pool_max": 8,
+    "statement_timeout_ms": 300000,
+    "application_name": "el-ballista-showcase",
+    "schema": "public"
+  },
+  "checkpoint": {
+    "dir": "./.checkpoints"
+  },
+  "pushdown": {
+    "policy": "cost_based",
+    "deny": [
+      "rental_id"
+    ],
+    "push": []
+  },
+  "parallel_scan": {
+    "strategy": "none",
+    "partitions": 1,
+    "partition_column": "payment_id"
+  },
+  "execution": {
+    "batch_size": 8192
+  },
+  "distributed": {
+    "scheduler_url": "",
+    "workers": 2
+  }
+}

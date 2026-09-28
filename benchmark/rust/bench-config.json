@@ -15,9 +15,6 @@
   "checkpoint": {
     "dir": "/tmp/.checkpoints"
   },
-  "sink": {
-    "path": "/tmp/bench_sink"
-  },
   "pushdown": {
     "policy": "cost_based",
     "deny": [],
@@ -29,7 +26,8 @@
     "partition_column": "order_id"
   },
   "execution": {
-    "batch_size": 64000
+    "batch_size": 64000,
+    "use_copy": true
   },
   "distributed": {
     "scheduler_url": "http://bench-scheduler:50050",

@@ -1,11 +1,16 @@
 pub mod arrow_type_mapper;
+pub mod copy;
 pub mod dialect;
 pub mod execution_plan;
+pub mod explain;
 pub mod extractor;
+pub mod inline_sql;
 pub mod parallel;
+pub mod param_sink;
 mod query_builder;
 pub mod row_adapter;
 pub mod schema_reader;
+pub mod stats;
 pub mod table_provider;
 
 // Relocated under the Postgres connector (AGENTS.md: all Postgres code lives here).
@@ -18,4 +23,4 @@ pub mod api;
 pub use api::{DEFAULT_SCHEDULER_URL, PostgresConnector};
 
 pub use extractor::PostgresExtractor;
-pub use table_provider::PostgresTableProvider;
+pub use table_provider::{PostgresTableProvider, register_table};

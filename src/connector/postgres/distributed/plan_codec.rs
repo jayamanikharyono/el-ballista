@@ -35,6 +35,20 @@ impl Default for PostgresPhysicalCodec {
 }
 
 impl PostgresPhysicalCodec {
+    /// A codec that carries `PostgresExecutionPlan` as a JSON payload and delegates every other
+    /// node to Ballista's default physical codec.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+    /// use rust_ballista_extraction_layer::connector::postgres::distributed::PostgresPhysicalCodec;
+    ///
+    /// // Handed to Ballista (scheduler/executor config) in place of its default codec.
+    /// let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(PostgresPhysicalCodec::new());
+    /// # let _ = codec;
+    /// ```
     pub fn new() -> Self {
         Self {
             default: BallistaPhysicalExtensionCodec::default(),
@@ -93,8 +107,9 @@ mod tests {
     use super::*;
     use crate::types::table_metadata::TableMetadata;
 
-    fn descriptor() -> crate::distributed::connection::PostgresConnectionDescriptor {
-        crate::distributed::connection::PostgresConnectionDescriptor {
+    fn descriptor()
+    -> crate::connector::postgres::distributed::connection::PostgresConnectionDescriptor {
+        crate::connector::postgres::distributed::connection::PostgresConnectionDescriptor {
             host: "localhost".to_string(),
             port: 5432,
             user: "postgres".to_string(),
@@ -120,6 +135,9 @@ mod tests {
             pushed_filters: vec![],
             pushed_limit: None,
             batch_size: 8192,
+            use_copy: false,
+            copy_statement_timeout_ms: None,
+            max_batch_bytes: 16 * 1024 * 1024,
             partitions: vec![],
             run_id: "r_test".to_string(),
         };

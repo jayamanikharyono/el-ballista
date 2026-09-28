@@ -1,5 +1,7 @@
 # Phase 2 Implementation Plan — DataFrame API and the Cost Model
 
+> Archived planning document (September 2026). Not a description of the current code — see [../roadmap.md](../roadmap.md) and [../architecture.md](../architecture.md).
+
 **Status**: ✓ COMPLETE (as of September 11, 2026 — second pass; see amendment below)
 
 This document tracks the evolution from Phase 1 (working single-node PostgreSQL extractor with checkpoint-driven incremental extraction) to Phase 2 (cost-based filter pushdown with statistics integration).

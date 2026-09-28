@@ -2,22 +2,26 @@
 //! A workload that saturates one machine should scale across three without increasing the load
 //! on the source database — each process opens only `pool_max / workers` connections.
 //!
-//!   cargo run --example distributed_extraction -- <config.json> [workers]
+//!   cargo run --example distributed_extraction -- <config.json> [workers] [output.parquet]
 //!
-//! The JSON config is the same job spec `rel run` uses
-//! (`examples/configs/extract.example.json`); the example
-//! prints the first rows of the table (or the filtered range) exactly as the cluster
-//! returns them.
+//! The JSON config is the same job spec the library and CLI use
+//! (`examples/configs/extract.example.json`). The connector applies the config's filters
+//! (schema-coerced, pushed to the source when possible) and column projection; this example
+//! streams the cluster's result straight into one local Parquet file (memory stays O(batch)).
+//! Materializing output is the caller's job — this project is not a sink.
+//!
+//! Needs a running cluster: `rel scheduler` plus `[workers]` `rel worker` processes, at the
+//! config's `distributed.scheduler_url` (default `http://localhost:50050`), e.g.
+//!
+//!   rel scheduler &
+//!   rel worker --scheduler-url http://localhost:50050 &
+//!   rel worker --scheduler-url http://localhost:50050 --port 50061 --grpc-port 50062 &
 
-use arrow::datatypes::SchemaRef;
-use datafusion::logical_expr::Expr;
-use datafusion::prelude::col;
+use std::fs::{self, File};
+
+use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
-use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline;
-use rust_ballista_extraction_layer::distributed::DistributedContext;
-use std::fs;
-use std::fs::File;
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,63 +32,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "examples/configs/extract.example.json".to_string());
-    let workers: usize = std::env::args()
-        .nth(2)
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(2);
+    let workers: usize = match std::env::args().nth(2) {
+        Some(raw) => raw.parse()?,
+        None => 2,
+    };
+    let output_path = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "output/distributed_extraction.parquet".to_string());
 
-    let config = JobConfig::from_file(&config_path)?;
-    // The pipeline is the single choke point for what the config's `filters`
-    // mean — every path (standalone, distributed, CLI) funnels through
-    // `filter_exprs_with_schema`, so this example reuses it instead of
-    // re-parsing filters. Skipping this loop silently extracts the FULL table.
-    let pipeline = Pipeline::from_config(config);
-    println!("  Table: {}", pipeline.config().resolved_table());
-    println!("  Filters: {:?}", pipeline.config().filters);
+    let connector = PostgresConnector::from_config_file(&config_path)?;
+    println!("  Table: {}", connector.config().resolved_table());
+    println!("  Filters: {:?}", connector.config().filters);
 
-    let ctx = DistributedContext::standalone(pipeline.config(), workers).await?;
-    ctx.register_source(pipeline.config()).await?;
+    // The configured scheduler (else the standard local endpoint); the registered executors
+    // are checked against the connection budget before the scan starts.
+    let mut stream = connector
+        .extract()
+        .distributed()
+        .workers(workers)
+        .stream()
+        .await?;
+    println!("distributed extraction (workers={workers})");
 
-    let mut df = ctx.session.table(&pipeline.config().table).await?;
-    // Same application as `Pipeline::extract_distributed`: one `filter()` per
-    // AND-conjunct (an OR-group lowers to a single `a OR b` expression), then
-    // the config's column projection. Each `filter()` is AND semantics.
-    {
-        let schema = df.schema().inner().clone();
-        for expr in pipeline.filter_exprs_with_schema(&schema)? {
-            df = df.filter(expr)?;
-        }
-        if let Some(columns) = &pipeline.config().columns {
-            let proj: Vec<Expr> = columns.iter().map(|c| col(c.as_str())).collect();
-            df = df.select(proj)?;
-        }
-    }
-
-    println!("distributed extraction (workers={})", ctx.workers);
-    println!("\n► Step 6: Write results to Parquet (local sink)");
-
-    let schema: SchemaRef = df.schema().inner().clone();
-    let results = df.collect().await?;
-    // Output location comes from the job spec's `sink.path`, not a hardcoded
-    // string: `<sink.path>.parquet` next to the configured sink directory.
-    let output_path = format!("{}.parquet", pipeline.config().sink.path);
     if let Some(parent) = std::path::Path::new(&output_path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
     {
         fs::create_dir_all(parent)?;
     }
-
     let file = File::create(&output_path)?;
-    let mut writer = ArrowWriter::try_new(file, schema, None)?;
-    for batch in &results {
-        writer.write(batch)?;
+    let mut writer = ArrowWriter::try_new(file, stream.schema(), None)?;
+    let mut rows = 0usize;
+    while let Some(batch) = stream.try_next().await? {
+        rows += batch.num_rows();
+        writer.write(&batch)?;
     }
     writer.close()?;
 
     let file_size = fs::metadata(&output_path)?.len();
-    println!("  ✓ Parquet file written: {}", output_path);
-    println!("  ✓ File size: {} bytes", file_size);
-
+    println!("  ✓ {rows} row(s) written to {output_path} ({file_size} bytes)");
     Ok(())
 }

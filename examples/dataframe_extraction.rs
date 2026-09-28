@@ -9,7 +9,7 @@
 
 use datafusion::prelude::{col, lit};
 use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::engine::ExtractContext;
+use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,10 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Same builder shape as docs/roadmap.md Phase 2, minus watermarks.
     let batches = ctx
-        .source("postgres", "public.orders")
+        .source("postgres", "public.payment")
         .await?
-        .filter(col("status").eq(lit("PAID")))?
-        .select(vec![col("order_id"), col("amount")])?
+        .filter(col("customer_id").gt_eq(lit(300i64)))?
+        .select(vec![col("payment_id"), col("amount")])?
         .with_column("amount_x2", col("amount") * lit(2.0))?
         .limit(0, Some(1000))?
         .collect()
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SQL entry point against the same registered sources.
     let sql_rows = ctx
-        .sql("SELECT COUNT(*) AS n FROM public.orders")
+        .sql("SELECT COUNT(*) AS n FROM public.payment")
         .await?
         .collect()
         .await?;

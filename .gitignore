@@ -39,6 +39,8 @@ target/
 
 # Data Testing
 data/
+# ...but the integration-test fixtures under tests/data/ are source (hostile.sql, dvdrental).
+!tests/data/
 
 
 output/
@@ -52,4 +54,7 @@ benchmark/output/
 # Generated per run by benchmark/run.sh (do NOT confuse with the
 # benchmark/rust/bench-config.json template, which is tracked: the Docker build
 # fallback and the config file test both read it)
-benchmark/bench-config.json
+benchmark/bench-config*.json
+
+
+Claude outputs/

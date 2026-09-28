@@ -1,12 +1,14 @@
-//! PostgreSQL SQL dialect — the Postgres implementation of the shared [`SqlDialect`] trait.
-//! Lives with its connector (dialects are backend-specific); the generic trait is in
-//! [`crate::pushdown::dialect`].
+//! PostgreSQL pushdown semantics: the Postgres implementation of the shared [`SqlDialect`]
+//! trait, and the mapping from Postgres column types to engine-neutral [`ColumnKind`]s that
+//! drives translation fidelity.
 //!
 //! [`SqlDialect`]: crate::pushdown::dialect::SqlDialect
 
-use crate::pushdown::Fidelity;
+use std::collections::HashSet;
+
 use crate::pushdown::dialect::SqlDialect;
-use crate::types::ColumnMetadata;
+use crate::pushdown::{CastType, Collation, ColumnKind, ColumnKinds};
+use crate::types::{ColumnMetadata, TableMetadata};
 
 /// PostgreSQL SQL dialect.
 pub struct PostgresDialect;
@@ -20,96 +22,127 @@ impl SqlDialect for PostgresDialect {
         format!("${}", param_index)
     }
 
-    fn column_literal_fidelity(
-        &self,
-        column: &ColumnMetadata,
-        literal_is_text: bool,
-        literal_is_float: bool,
-    ) -> Fidelity {
-        if literal_is_float {
-            // NaN and infinity ordering differs between Postgres and IEEE-754.
-            return Fidelity::Inexact;
-        }
-
-        if literal_is_text {
-            // Text comparisons depend on collation. Check if column has a known-safe collation.
-            if let Some(collation) = &column.collation_name {
-                // "C" and "POSIX" collations are deterministic and Unicode-safe.
-                // Binary-safe equality is OK, but ordering might diverge on non-ASCII.
-                // Conservative: only equality on deterministic ASCII-safe collations is Exact.
-                if collation == "C" || collation == "POSIX" {
-                    return Fidelity::Exact;
-                }
-
-                // Non-deterministic collations (citext, others) are always Inexact.
-                if !is_deterministic_collation(collation) {
-                    return Fidelity::Inexact;
-                }
-            }
-
-            // No collation metadata: conservative assumption is Inexact.
-            Fidelity::Inexact
-        } else {
-            // Integer and boolean comparisons are Exact.
-            Fidelity::Exact
+    fn cast_type_name(&self, to: CastType) -> &'static str {
+        match to {
+            CastType::Text => "text",
         }
     }
 
-    fn column_column_fidelity(
-        &self,
-        left_column: &ColumnMetadata,
-        right_column: &ColumnMetadata,
-    ) -> Fidelity {
-        // If types differ significantly, be conservative.
-        if left_column.data_type != right_column.data_type {
-            return Fidelity::Inexact;
-        }
-
-        // String types: check collation consistency.
-        if is_text_type(&left_column.data_type) {
-            let left_collation = left_column.collation_name.as_deref();
-            let right_collation = right_column.collation_name.as_deref();
-
-            match (left_collation, right_collation) {
-                (Some(l), Some(r)) if l == r && (l == "C" || l == "POSIX") => Fidelity::Exact,
-                (Some(l), Some(r)) if l == r && is_deterministic_collation(l) => Fidelity::Exact,
-                _ => Fidelity::Inexact,
-            }
-        } else if is_float_type(&left_column.data_type) {
-            // Float comparisons always have NaN/infinity hazards.
-            Fidelity::Inexact
-        } else {
-            // Numeric and boolean columns: Exact.
-            Fidelity::Exact
+    fn collation_name(&self, collation: Collation) -> &'static str {
+        match collation {
+            // The "C" collation compares strcmp-style on the encoded bytes; on a UTF-8
+            // database that is Rust/Arrow `str` ordering.
+            Collation::Binary => "\"C\"",
         }
     }
 }
 
-fn is_text_type(data_type: &str) -> bool {
-    matches!(
-        data_type,
-        "text" | "character varying" | "character" | "citext"
-    )
+/// Classify one Postgres column (from `information_schema.columns`) for translation.
+///
+/// - integer types, `boolean`, timestamps, `date`, floats: their primitive kinds;
+/// - `text` / `character varying`: [`ColumnKind::Text`], compared under `COLLATE "C"`;
+///   `bytewise_collation` is true only for an explicit `C`/`POSIX` column collation (unknown
+///   or database-default collations are never assumed byte-wise);
+/// - `character(n)`: [`ColumnKind::Opaque`] — `bpchar` comparisons ignore trailing blanks, so
+///   no comparison is exact or a superset of Arrow's on the padded value;
+/// - enum (`is_enum`, from `pg_enum`): [`ColumnKind::Label`];
+/// - `uuid`, `json`, `jsonb`, and other `USER-DEFINED` types (incl. `citext`), which the
+///   extractor emits as their text form: [`ColumnKind::TextCast`];
+/// - everything else (numeric, bytea, arrays, ...): [`ColumnKind::Opaque`].
+///
+/// # Examples
+/// ```
+/// use rust_ballista_extraction_layer::connector::postgres::dialect::column_kind;
+/// use rust_ballista_extraction_layer::pushdown::ColumnKind;
+/// use rust_ballista_extraction_layer::types::ColumnMetadata;
+/// let uuid = ColumnMetadata {
+///     column_name: "u".into(), data_type: "uuid".into(), is_nullable: true,
+///     numeric_precision: None, numeric_scale: None, udt_name: Some("uuid".into()),
+///     collation_name: None,
+/// };
+/// assert_eq!(column_kind(&uuid, false), ColumnKind::TextCast);
+/// ```
+pub fn column_kind(column: &ColumnMetadata, is_enum: bool) -> ColumnKind {
+    match column.data_type.as_str() {
+        "smallint" | "integer" | "bigint" => ColumnKind::Integer,
+        "boolean" => ColumnKind::Boolean,
+        "timestamp with time zone" | "timestamp without time zone" => ColumnKind::Timestamp,
+        "date" => ColumnKind::Date,
+        "real" | "double precision" => ColumnKind::Float,
+        "text" | "character varying" => ColumnKind::Text {
+            bytewise_collation: matches!(column.collation_name.as_deref(), Some("C" | "POSIX")),
+        },
+        "USER-DEFINED" if is_enum => ColumnKind::Label,
+        "uuid" | "json" | "jsonb" | "USER-DEFINED" => ColumnKind::TextCast,
+        _ => ColumnKind::Opaque,
+    }
 }
 
-fn is_float_type(data_type: &str) -> bool {
-    matches!(data_type, "real" | "double precision")
-}
-
-fn is_deterministic_collation(collation: &str) -> bool {
-    !collation.contains("_") || collation == "C" || collation == "POSIX"
+/// Column kinds for every column of a table. `enum_columns` are the true enums (`pg_enum`).
+///
+/// `server_utf8` is whether the server encoding is UTF8. `COLLATE "C"` compares the
+/// server-encoded bytes, which equals Arrow's (UTF-8) string order only under UTF8; under any
+/// other encoding text and enum-label columns are downgraded to [`ColumnKind::TextCast`]
+/// (equality/inequality only — byte equality is encoding-independent), so no ordering
+/// comparison is pushed.
+///
+/// # Examples
+/// ```
+/// use std::collections::HashSet;
+/// use rust_ballista_extraction_layer::connector::postgres::dialect::column_kinds;
+/// use rust_ballista_extraction_layer::types::TableMetadata;
+/// let table = TableMetadata { schema_name: "public".into(), table_name: "t".into(), columns: vec![] };
+/// assert!(column_kinds(&table, &HashSet::new(), true).is_empty());
+/// ```
+pub fn column_kinds(
+    table: &TableMetadata,
+    enum_columns: &HashSet<String>,
+    server_utf8: bool,
+) -> ColumnKinds {
+    table
+        .columns
+        .iter()
+        .map(|c| {
+            let kind = match column_kind(c, enum_columns.contains(&c.column_name)) {
+                ColumnKind::Text { .. } | ColumnKind::Label if !server_utf8 => ColumnKind::TextCast,
+                kind => kind,
+            };
+            (c.column_name.clone(), kind)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn col(
-        data_type: &str,
-        collation: Option<&str>,
-        _numeric_precision: Option<i32>,
-        _numeric_scale: Option<i32>,
-    ) -> ColumnMetadata {
+    #[test]
+    fn non_utf8_server_downgrades_text_ordering() {
+        // COLLATE "C" orders server-encoded bytes, equal to Arrow's UTF-8 order only on
+        // a UTF8 server; elsewhere only equality may push.
+        let table = TableMetadata {
+            schema_name: "public".into(),
+            table_name: "t".into(),
+            columns: vec![
+                col("text", None),
+                col("USER-DEFINED", None),
+                col("bigint", None),
+            ],
+        };
+        let mut t = table.clone();
+        t.columns[1].column_name = "mood".into();
+        t.columns[2].column_name = "id".into();
+        let enums: HashSet<String> = ["mood".to_string()].into();
+        let utf8 = column_kinds(&t, &enums, true);
+        let latin1 = column_kinds(&t, &enums, false);
+        assert!(matches!(utf8["test_col"], ColumnKind::Text { .. }));
+        assert!(matches!(utf8["mood"], ColumnKind::Label));
+        assert!(matches!(latin1["test_col"], ColumnKind::TextCast));
+        assert!(matches!(latin1["mood"], ColumnKind::TextCast));
+        assert!(matches!(latin1["id"], ColumnKind::Integer));
+    }
+
+    fn col(data_type: &str, collation: Option<&str>) -> ColumnMetadata {
         ColumnMetadata {
             column_name: "test_col".to_string(),
             data_type: data_type.to_string(),
@@ -136,60 +169,62 @@ mod tests {
     }
 
     #[test]
-    fn test_column_literal_fidelity() {
-        let dialect = PostgresDialect;
-
-        let int_col = col("integer", None, None, None);
+    fn test_column_kind_mapping() {
         assert_eq!(
-            dialect.column_literal_fidelity(&int_col, false, true),
-            Fidelity::Inexact
+            column_kind(&col("integer", None), false),
+            ColumnKind::Integer
         );
         assert_eq!(
-            dialect.column_literal_fidelity(&int_col, false, false),
-            Fidelity::Exact
+            column_kind(&col("boolean", None), false),
+            ColumnKind::Boolean
         );
-
-        let c_text_col = col("text", Some("C"), None, None);
         assert_eq!(
-            dialect.column_literal_fidelity(&c_text_col, true, false),
-            Fidelity::Exact
+            column_kind(&col("double precision", None), false),
+            ColumnKind::Float
         );
-
-        let unknown_text_col = col("text", None, None, None);
         assert_eq!(
-            dialect.column_literal_fidelity(&unknown_text_col, true, false),
-            Fidelity::Inexact
+            column_kind(&col("timestamp without time zone", None), false),
+            ColumnKind::Timestamp
         );
-    }
-
-    #[test]
-    fn test_column_column_fidelity() {
-        let dialect = PostgresDialect;
-
-        let col1 = col("text", Some("C"), None, None);
-        let col2 = col("text", Some("C"), None, None);
         assert_eq!(
-            dialect.column_column_fidelity(&col1, &col2),
-            Fidelity::Exact
+            column_kind(&col("text", Some("C")), false),
+            ColumnKind::Text {
+                bytewise_collation: true
+            }
         );
-
-        let col3 = col("text", Some("de_DE"), None, None);
         assert_eq!(
-            dialect.column_column_fidelity(&col1, &col3),
-            Fidelity::Inexact
+            column_kind(&col("character varying", Some("en-US-x-icu")), false),
+            ColumnKind::Text {
+                bytewise_collation: false
+            }
         );
-
-        let int_col = col("integer", None, None, None);
         assert_eq!(
-            dialect.column_column_fidelity(&col1, &int_col),
-            Fidelity::Inexact
+            column_kind(&col("text", None), false),
+            ColumnKind::Text {
+                bytewise_collation: false
+            }
         );
-
-        let float_col1 = col("real", None, None, None);
-        let float_col2 = col("real", None, None, None);
         assert_eq!(
-            dialect.column_column_fidelity(&float_col1, &float_col2),
-            Fidelity::Inexact
+            column_kind(&col("character", None), false),
+            ColumnKind::Opaque
         );
+        assert_eq!(column_kind(&col("uuid", None), false), ColumnKind::TextCast);
+        assert_eq!(
+            column_kind(&col("jsonb", None), false),
+            ColumnKind::TextCast
+        );
+        assert_eq!(
+            column_kind(&col("USER-DEFINED", None), true),
+            ColumnKind::Label
+        );
+        assert_eq!(
+            column_kind(&col("USER-DEFINED", None), false),
+            ColumnKind::TextCast
+        );
+        assert_eq!(
+            column_kind(&col("numeric", None), false),
+            ColumnKind::Opaque
+        );
+        assert_eq!(column_kind(&col("bytea", None), false), ColumnKind::Opaque);
     }
 }

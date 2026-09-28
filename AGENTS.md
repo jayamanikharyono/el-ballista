@@ -1,35 +1,24 @@
 # AGENTS.md — For AI Coding Agents
 
-> **How to use this file:** You are an AI agent working on this repo. Every change must simultaneously pass three lenses. Do not reason from one perspective alone. If you satisfy Rust ownership but break Arrow semantics or DB correctness, the change is rejected.
+> **How to use this file:** every change must pass three lenses at once: Rust, Arrow/DataFusion/Ballista, and the database. Do not reason from one perspective alone. A change that satisfies Rust ownership but breaks Arrow semantics or DB correctness is rejected.
 
 ## Project Overview
 
-Experimental Rust-native **extraction and processing layer** — streaming path `Source DB → Arrow RecordBatch stream → DataFusion → (optional) Ballista`.
+El Ballista is an experimental Rust **extraction layer**: `Source DB → Arrow RecordBatch stream → DataFusion`, run in one process (plain DataFusion) or on a Ballista cluster. `rel` below is the `rust-ballista-extraction-layer` binary (`cargo run --release --bin rust-ballista-extraction-layer -- …`).
 
-Focus: database extraction, Arrow as data contract, bounded-memory streaming, source-aware pushdown, full/filtered extraction, DataFusion/Ballista.
+Focus: database extraction, Arrow as the data contract, bounded-memory streaming, source-aware pushdown, full/filtered extraction, split checkpoints.
 
-**Not** a data sink, warehouse, or storage system. Do not add destination/storage unless explicitly requested.
+Out of scope: sinks (the layer hands out Arrow batches; there is no destination or storage), watermark / incremental state, CDC. Do not add a sink or watermark state unless explicitly requested; the incremental design is parked in `docs/deferred/incremental-extraction.md`.
 
 ```
-             ┌──────────────────┐
-             │   Source DB      │  PostgreSQL, etc.
-             └────────┬─────────┘
-                      │ Extraction + Pushdown
-                      ▼
-             ┌──────────────────┐  Arrow Stream
-             │   RecordBatch    │  (bounded memory)
-             └────────┬─────────┘
-                      ▼
-             ┌──────────────────┐
-             │    DataFusion    │  Query / Process
-             └────────┬─────────┘
-                Optional
-                      ▼
-             ┌──────────────────┐
-             │     Ballista     │  Distributed Exec
-             └──────────────────┘
+Source DB (PostgreSQL; MySQL prototype)
+   │  extraction + pushdown
+   ▼
+Arrow RecordBatch stream (bounded memory)
+   ▼
+DataFusion (standalone)   or   Ballista scheduler + workers (distributed)
 
-Boundaries: Source connectors ⟷ Extraction ⟷ Arrow conversion ⟷ DataFusion ⟷ Ballista. No circular deps.
+Boundaries: source connectors ⟷ extraction ⟷ Arrow conversion ⟷ DataFusion ⟷ Ballista. No circular deps.
 ```
 
 ## Core Principle: Unified Three-Lens Evaluation
@@ -39,190 +28,176 @@ A change is **not done** unless it is correct from **all three** at once:
 | Concern | Rust asks | DataFusion/Ballista asks | Database asks |
 |---------|-----------|--------------------------|---------------|
 | **Data moves** | Who owns it? Is cloning minimal? Is `Send/Sync` and drop correct? | Is schema/nullability/type preserved? Is streaming kept? (batch boundaries may differ between stages) | Is ordering deterministic? Can rows duplicate/skip under concurrent writes? |
-| **Query is pushed** | Is error propagation explicit and credential-safe? | Is pushdown semantically `Exact`? Would `Inexact` require re-check? | Is index used? Does `NULL`/timestamp/collation match source semantics? |
+| **Query is pushed** | Is error propagation explicit and credential-safe? | Is pushdown semantically `Exact`? Would `Inexact` require re-check? | Is an index used? Does `NULL`/timestamp/collation match source semantics? |
 | **Job tracks splits** | Is split completion recorded after *successful* processing? | Does schema stay consistent across batches? | Are completed splits skipped on retry? Does failure record the split without blocking others? |
-| **Work is distributed** | Is there a global source-resource budget that workers share? Are resources `Send` and cleaned up on cancel? | Is partitioning deterministic? Is plan serializable (`POSTGRES_SCAN_MAGIC`)? Can task retry? | Does N workers keep source load flat (not `N×pool_max`)? |
-| **Memory** | Avoid `collect()` of whole dataset; reuse buffers | Avoid materializing `Vec<RecordBatch>` | Avoid `LIMIT/OFFSET` on huge mutating tables; prefer keyset `WHERE (ts,id) > (...) ORDER BY` |
+| **Work is distributed** | Is there a global source-resource budget that workers share? Are resources `Send` and cleaned up on cancel? | Is partitioning deterministic? Is the plan serializable (`POSTGRES_SCAN_MAGIC`)? Can the task retry? | Do N workers keep source load flat (not `N×pool_max`)? |
+| **Memory** | Avoid `collect()` of the whole dataset; reuse buffers | Avoid materializing `Vec<RecordBatch>` | Avoid `LIMIT/OFFSET` on huge mutating tables; prefer keyset `WHERE (ts,id) > (...) ORDER BY` |
 
-**Mental model before any edit:**
+**Before any edit ask:** is this abstraction required by the current architecture, or designed for a hypothetical future? Prefer the former. Is there evidence this is a bottleneck? If not, prioritize correctness and simplicity.
 
-> Is this abstraction required by current architecture, or am I designing for a hypothetical future? — Prefer the former.
-> Do I have evidence this is a bottleneck? — If not, prioritize correctness/simplicity.
+## 1. Rust
 
-## 1. Rust — Idiomatic, Safe, Maintainable
+**Avoid in library paths:** `unwrap()` / `expect()` (except an impossible invariant), `clone()` to please the borrow checker, global mutable state / `static mut`, hidden side effects, large generics without a use case. If ownership gets complex, reconsider the API/dataflow before adding `Arc<Mutex>` or cloning. `unsafe` only with a `// SAFETY:` comment proving the invariant.
 
-**Prefer:** explicit ownership/borrowing, small focused types, strong types, `RAII`, composition over inheritance-like abstractions, explicit lifetimes only when needed.
+**Project conventions:**
+- **Types:** newtypes for IDs (`JobId`), `#[non_exhaustive]` on public enums that may grow, `From`/`TryFrom` instead of `as`.
+- **Errors are public behavior:** typed `thiserror` enums (`AppError`, `ExtractorError`); keep the cause with `#[source]` and name the table/column in the message. **Never** leak credentials. **Never** turn a failure into an empty dataset: **extraction failure ≠ zero rows**.
+- **Async:** `tokio` only. I/O paths must be cancel-safe, every `spawn`'s `JoinHandle` handled, dropping a stream must stop the source query. Check connection limits, backpressure, cancellation, cleanup, memory growth. Do not add `rayon` / `spawn_blocking` because it looks faster.
+- **Resource lifecycle:** create late, reuse when safe, release deterministically (drop order matters for pools; `Drop` guards like `CopyCancelGuard` and `JobLock` release resources).
+- **API surface:** small and intent-revealing (`stream` / `collect` / `run` / `run_with`), rustdoc with `# Examples` on every `pub fn` (compiled by `cargo test --doc`). On API change: update all callers, examples, tests and docs.
+- **Quality:** `cargo fmt` + `clippy --all-targets --all-features -- -D warnings` must pass; no `#[allow(clippy::…)]` without a justification.
 
-**Avoid in production/library paths:**
-- `unwrap()` / `expect()` (except impossible invariant), `clone()` to please borrow checker, global mutable state, hidden side effects, large generics without use case.
-- If ownership gets complex, **reconsider API/dataflow first** before adding `Arc/Mutex` or cloning.
-
-**Rust Best Practices (enforce in this repo):**
-- **Types:** newtype for IDs (`JobId(String)` > raw `String`), `#[non_exhaustive]` for public enums that may grow, `From`/`TryFrom` for conversions not `as`.
-- **Ownership:** take `impl Into<String>` / `&str` for constructors, `&self` vs `&mut self` vs `self` intentionally, return `impl Iterator` / `impl Stream` where zero-cost; prefer `Arc` for shared read-only config, `Arc<Mutex>` only for shared mutable state with documented `Send/Sync` (tune per workload — `Arc` vs `Arc<Mutex>` is a recommendation, not an invariant).
-- **Error handling — part of public behavior:** use `thiserror` for library crates (typed `enum AppError` already in repo), `anyhow` only at binary edges. Always `#[source]` the cause, add `context("failed to …: {table}")`, match on error kind to distinguish `source/database` vs `transformation/execution`. **Never** leak credentials. **Never** turn failure into empty dataset — `extraction failure ≠ zero rows`.
-- **Async/Concurrency:** `tokio` runtime only; every `async fn` that touches I/O must be cancel-safe, every `spawn` must have `JoinHandle` handled, every `select!` must have cancellation branch. Explicitly check: connection limits, backpressure (`channel bound`), task cancellation, drop/cleanup (`Drop` impl for pools), ordering, memory growth, error propagation. Do not add `rayon`/`spawn_blocking` because it looks faster.
-- **Resource lifecycle:** create late, reuse when safe, release deterministically (`drop` order matters for pools). Verify init/reuse/error/drop/concurrent access for pools/clients/streams. No `static mut`.
-- **API surface:** keep small, intent-revealing (`extract`/`collect`/`run`), `#[must_use]` on builders, `Rustdoc` with `# Examples` on every `pub fn`. On API change: check all callers + examples + tests + docs.
-- **Quality:** `cargo fmt` + `clippy --all-targets --all-features -- -D warnings` must pass. No `#[allow(clippy::…)]` without justification. Tests use `tokio::test`, `proptest` for fuzzing parsers. Unsafe only if `// SAFETY:` comment proves invariant.
-- **Performance:** correctness first. For hot paths: avoid materialization/copies, prefer streaming, reuse `RecordBatch` buffers (`MutableArrayData`/`ArrayBuilder`), be mindful of `RecordBatch` allocation (`row_count` vs `allocated`). Optimize only with evidence (bench/profile/`EXPLAIN`/`perf`).
-
-**Rust × Data Pipeline — Engineering Best Practices:**
-- **Direct Arrow construction:** `sqlx Row → ArrayBuilder → RecordBatch → DataFusion` with no intermediate `Vec<Struct>` (not literally zero-copy). Use `ArrayRef` + `Arc` sharing; slice (`batch.slice(offset,len)`) not `clone`. Verify `batch.get_array_memory_size()` stays bounded per `batch_size`.
-- **Bounded channels:** every pipeline stage is `bounded(m)` (e.g. `tokio::sync::mpsc::channel(8)` as a starting recommendation, tune per workload) with explicit backpressure. Never `unbounded()`. Source `FETCH` size and DataFusion `batch_size` are separate controls — prefer alignment as a starting point but don't require an invariant (e.g. `batch_size` is a recommendation, `Arc` vs `Arc<Mutex>` depends on sharing).
-- **Schema as code:** never hardcode `Field` list twice. Single `build_schema(&TableMetadata) -> Schema` owned by connector, used by provider *and* plan. Test: `empty result still has correct schema` + `schema evolution` (add nullable column must not break old batches).
-- **Row vs batch errors:** row-level decode error (`type mismatch`) → `Err` that fails the stream by default. Never silently skip failed batches — `Stream<Item=Result<RecordBatch>>` must surface `Err`; `SkipFailedBatch` only as an explicit, opt-in recovery policy. Use `Stream<Item=Result<RecordBatch>>` not `Stream<RecordBatch>` + panic.
-- **Checkpoint = commit point:** pipeline `Stream` is fused with checkpoint `advance` only after downstream processing acknowledgement (this project is not a sink — not `writer.flush()`). Use explicit checkpoint state/commit semantics; `Drop` handles resource cleanup, not checkpoint rollback. Test crash-recovery: kill mid-batch, restart, assert no gap/duplicate with `(ts,id)` cursor.
-- **Metrics per batch, not per row:** `tracing::info!(rows=, batch_bytes=, split=, partition=)` per `RecordBatch`. Never per-row. Use `metrics` crate (`counter!`, `histogram!`) for `extracted_rows`, `pushdown_hit`, `checkpoint_lag_seconds`.
-- **Config vs code:** batch size, `target_partitions`, `pool_max` are `ExecutionConfig`/`SourceConfig`, not constants (recommendations, validate `batch_size > 0`). Builder takes `impl Into<ExecutionConfig>` and validates `batch_size > 0`.
-- **Testing pipelines:** unit: `TestTableProvider` with in-memory `MemTable` + `assert_batches_eq!` (lightweight, no hostile fixture needed); integration: `testcontainers-postgres` + `pg_dump` snapshot; property: `proptest` generates `Predicate` → assert `Exact` pushdown still `collect() == scan_without_pushdown.collect()`.
-- **Dependencies for pipelines:** `arrow` + `datafusion` + `tokio` cover 90%. Do not add `polars`/`rayon`/`serde_json` for pipeline path unless it replaces a handwritten `RecordBatch` loop.
-- **Capability boundaries:** DB-specific semantics (collation, `NULL` ordering, timestamp precision) belong in connectors. Generic extraction/DataFusion code must not contain scattered `if postgres {}` branches.
-- **Isolation semantics:** document transaction/isolation assumptions for extraction under concurrent writes (e.g. read-committed vs repeatable-read, snapshot `SET TRANSACTION` if used, or explicit "no snapshot guarantee" if not).
+**Rust × data pipeline:**
+- **Direct Arrow construction:** binary rows → `ArrayBuilder` → `RecordBatch` with no intermediate `Vec<Struct>` (not literally zero-copy). Share `ArrayRef`s, slice rather than clone. Batch memory stays bounded by `batch_size` and the builder byte cap.
+- **Bounded channels only** (e.g. the scan task's `mpsc::channel(2)`), never `unbounded()`. Source `FETCH` size and batch size are config, not constants.
+- **Schema as code:** one `build_arrow_schema` per connector, used by the provider, the execution plan and the extractor. Never write a `Field` list twice. Empty results still carry the full schema.
+- **Row vs batch errors:** a decode error fails the stream (`Stream<Item = Result<RecordBatch>>`). There is no skip-failed-batch policy; never skip silently.
+- **Checkpoint = commit point:** a split is marked complete only after the consumer acknowledges it (`run_with`); `Drop` cleans up resources, it does not roll back checkpoints.
+- **Metrics per batch, not per row:** `src/telemetry.rs` records `rel_extracted_rows`, `rel_extracted_batches`, `rel_batch_bytes`, `rel_splits`, `rel_pushdown_decisions` through the `metrics` facade. Never per row.
+- **Config vs code:** `batch_size`, partitions, `pool_max` live in `ExecutionConfig` / `SourceConfig` / `ParallelScanConfig` and are validated (`batch_size > 0`).
+- **Dependencies:** `arrow` + `datafusion` + `tokio` cover the pipeline. Do not add `polars` / `rayon` unless it replaces a hand-written `RecordBatch` loop.
+- **Capability boundaries:** DB-specific semantics (collation, `NULL` ordering, timestamp precision) belong in the connector. No scattered `if postgres {}` in generic code.
+- **Isolation semantics:** state the transaction/isolation assumption for extraction under concurrent writes (see the `connector::postgres::extractor` module docs); never imply a snapshot that is not taken.
 
 ## 2. Arrow / Streaming / Schema — Data Contract
 
-Arrow `RecordBatch` is the contract. Preserve: schema, types, nullability, column order, counts, batch boundaries, streaming behavior. Avoid `DB → structs → Vec → JSON → Arrow`.
+Arrow `RecordBatch` is the contract. Preserve schema, types, nullability, column order, row counts and streaming behavior. Avoid `DB → structs → Vec → JSON → Arrow`.
 
-**Streaming first — bounded memory:**
-`Source → batch → process → batch …`  Ask: *What is max source data resident here?* If "entire dataset", find streaming alternative. `collect()` needs justification.
+**Streaming first:** ask *what is the max source data resident here?* If the answer is "the entire dataset", find a streaming alternative. `collect()` needs a justification.
 
-**Schema discipline:** verify DB type→Arrow mapping, nullable, timestamp precision/timezone, numeric precision, string/binary, empty result still exposes correct schema, consistency across batches.
+**Schema discipline:** verify DB type → Arrow mapping, nullability, timestamp unit and timezone (Postgres timestamps map to `Timestamp(Microsecond, None)`, `timestamptz` to `Timestamp(Microsecond, Some("UTC"))`), numeric precision, string/binary, empty-result schema, consistency across batches.
 
 ## 3. DataFusion / Pushdown / Ballista
 
-**DataFusion — use it, don't reimplement it:** `SessionContext` + `LogicalPlan` + `DataFrame` + `TableProvider`/`ExecutionPlan`. Do not duplicate: `filter`/`project`/`aggregate`/`join`/`window` is DataFusion's job. Check `datafusion::prelude::*` solves it first. Keep extraction useful without tight coupling to engine internals — wrap `TableProvider` not `SessionContext`.
+**Use DataFusion, don't reimplement it:** `SessionContext` + `TableProvider` / `ExecutionPlan` + `DataFrame`. Filter/project/aggregate/join/window are DataFusion's job. Wrap a `TableProvider`, not `SessionContext` internals.
 
-**DataFusion Best Practices (54.1.0 in this repo):**
-- **Construction:** `SessionContext::new()` + `ctx.register_table("orders", Arc::new(PostgresTableProvider::new(...)))` → `ctx.sql()` / `ctx.read_table()`. Do not build `LogicalPlan` by hand unless optimizer rule. Reuse `SessionContext` (holds optimizer, catalog); do not create per-query.
-- **Schema & types:** DataFusion `DataType` must match Arrow `RecordBatch` exactly (including `nullable` + `Timestamp(nanos, Some("UTC"))` vs `None`). Use `Schema::new` + `Field::new` with explicit nullability; test `empty RecordBatch still has correct schema`. Prefer `arrow::datatypes` helpers, never `as`.
-- **Memory & streaming:** `DataFrame::collect().await` materializes — **avoid** on large scans. Prefer `DataFrame::execute_stream().await` → `SendableRecordBatchStream` → `while let Some(batch)` . `RecordBatch` reuse via `RecordBatch::new` + `ArrayRef` sharing, not `clone`. Watch `batch.get_array_memory_size()` vs `num_rows`. Set `SessionConfig::with_target_partitions` / `with_batch_size` explicitly if changing.
-- **Pushdown — correctness over performance:** only push `projection / filter` (caller-provided predicates) when source semantics == DataFusion semantics. `DataFusion filter updated_at > $lo` → `WHERE updated_at > $lo` only if null/type/order/duplicate semantics identical. Use DataFusion's `TableProviderFilterPushDown::Exact / Inexact / Unsupported` correctly: `Exact` if provider guarantees correctness (DF drops filter), `Inexact` if provider filters but DF must re-check. Never push `ORDER BY`/`LIMIT` unless source guarantees stable sort + deterministic limit.
-- **Logical/Physical:** `TableProvider::scan` returns `Arc<dyn ExecutionPlan>` (your `PostgresScanExec`). `ExecutionPlan::execute` must be `Send + Sync` and produce `SendableRecordBatchStream` with correct `Partitioning` + `EquivalenceProperties`. Test with `datafusion::assert_batches_eq!` + `datafusion::physical_plan::test::TestContext`.
-- **SQL & Expr:** prefer `col("updated_at").gt(lit(checkpoint))` builder over raw `Expr::Column` + `Operator`. If parsing SQL, go through `SessionContext::sql` — do not hand-roll parser. Handle `ScalarValue::Utf8` null vs `""` distinctly.
-- **UDFs/Aggregates:** register via `ctx.register_udf` / `register_udaf` only if extraction needs custom logic; otherwise keep in source.
-- **Quality:** enable `datafusion` feature `backtrace` in dev to surface plan errors; log `LogicalPlan::display_indent()` for debugging, never log `RecordBatch` data.
+**DataFusion (54.1.0):**
+- **Construction:** register `PostgresTableProvider` (or `connector::postgres::register_table(&ctx, &config)`), then `ctx.sql()` / `ctx.table()`. Do not build `LogicalPlan`s by hand. Reuse the `SessionContext`.
+- **Types:** the provider's schema must match the emitted batches exactly, nullability and timezone included.
+- **Streaming:** `DataFrame::collect()` materializes; prefer `execute_stream()`. Set `target_partitions` / `batch_size` explicitly when changing them.
+- **Pushdown — correctness over performance:** push a filter only when the source returns exactly what Arrow would (null / type / collation / ordering semantics). `Exact` = the provider guarantees the result and DataFusion drops the filter; `Inexact` = the source pre-filters and DataFusion re-checks. The provider decides the whole filter set (`supports_filters_pushdown` → `decide_all`). Never push `ORDER BY` / `LIMIT` without a stable sort.
+- **Physical plan:** `TableProvider::scan` returns a `PostgresExecutionPlan`; its streams are `Send` and report correct partitioning.
+- **Expr / SQL:** prefer `col(..).gt(lit(..))` builders; parse SQL only through `SessionContext::sql`. Keep `ScalarValue::Utf8` NULL and `""` distinct. Log `LogicalPlan::display_indent()` for debugging, never row data.
 
-**Ballista — distributed, optional:**
-`Source extraction → Arrow/DataFusion → Ballista`. `BallistaContext` wraps `SessionContext`. Consider partitioning, network/serde, scheduling, source load, locality. Keep Ballista coupling out of engine-agnostic code. Assume tasks can retry/duplicate — design for idempotence or document actual guarantees. Never claim `exactly-once` unless proven. `Ballista` and `DataFusion` versions must be compatible and tested together (often matching numbers like 54.1.0 here) — bump together and verify Arrow compat, don't assume numeric equality is the invariant.
+**Ballista:** `DistributedContext` (`connector::postgres::distributed`) holds a `SessionContext` connected to a remote scheduler. Keep Ballista out of engine-agnostic code. Assume tasks can retry or duplicate: design for idempotence or document the real guarantee. **Never claim exactly-once unless proven.** Bump DataFusion, Ballista and Arrow together and verify compatibility.
 
 ## 4. Database — Correctness First
 
-Assume table mutates during extraction (concurrent writes, tx isolation, deletes, clock skew, non-monotonic `updated_at`).
+Assume the table mutates during extraction (concurrent writes, deletes, non-monotonic `updated_at`).
 
-**Filtered:** caller-provided predicates or ranges (a time range for incremental-style jobs, a historical range for backfills). Watermark management, incremental state, and backfill orchestration live in the orchestrator, not this layer. For range determinism, prefer keyset predicates with deterministic `ORDER BY`.
+- **Filtered extraction:** the caller passes predicates or ranges (e.g. a time window). Watermarks, incremental state and backfill orchestration belong to the orchestrator, not this layer.
+- **Checkpoint safety:** `read boundary → extract → consumer succeeds → advance checkpoint`. A failed extraction never advances a checkpoint.
+- **Ordering:** without `ORDER BY` the order is unspecified; encode it where pagination, cursors or checkpoints depend on it.
+- **Pagination:** no `LIMIT/OFFSET` at scale; use keyset ranges with deterministic ordering.
+- **Load:** evaluate every source query for index use, selectivity, full scans, locking and connection pressure. Parallelism first asks whether the source can absorb it.
+- **Consistency:** do not claim `consistent / snapshot / exactly-once / lossless` unless implemented.
 
-**Checkpoint safety:**
-```
-Read boundary → Extract → Successfully process → Advance checkpoint
-```
-Failed extraction **must not** advance checkpoint (no data loss on retry). Never advance before success.
+## 5. Checklists
 
-**Ordering:** without `ORDER BY`, order is unspecified — encode explicitly if needed for pagination/cursor/compound checkpoint/batch boundaries.
+### Before changing SQL
+- [ ] Ordering deterministic where required? Index-friendly, not an accidental full scan?
+- [ ] Concurrent writes, `NULL`, duplicates/skips handled? A failed extraction records the failed split and leaves completed splits untouched?
+- [ ] Pushdown `Exact`? Null/type/timestamp/collation semantics identical to DataFusion?
+- [ ] Checkpoint advancement safe? Pagination keyset, not `OFFSET`?
+- [ ] Errors keep the cause, leak no credentials, never hide a failure as an empty set?
 
-**Pagination:** avoid `LIMIT/OFFSET` at scale; prefer keyset/cursor `WHERE (ts,id) > (:ts,:id) ORDER BY … LIMIT`. Choice depends on index, size, mutation rate, planner.
-
-**Performance & load:** evaluate every source query for index/selectivity/planner/full scan/locking/IO/network/connection pressure. Be a good citizen: no excessive connections/queries/scans/large batches. Parallelism first asks: can source absorb it?
-
-**Transactions/Consistency:** be explicit — consistent snapshot? repeatable-read? eventual? Do not claim `consistent/snapshot/exactly-once/lossless` unless implemented.
-
-## 5. Unified Checklists — Use Before Every Change
-
-### Before any code change
-- [ ] Inspected relevant module + existing similar impl
-- [ ] Understood ownership/lifecycle and Arrow/DF/Ballista integration
-- [ ] Identified which of 3 perspectives are affected (often all 3)
-
-### Before changing SQL (merge DB + Rust + DF)
-- [ ] Ordering deterministic (`ORDER BY` if required)?
-- [ ] Index-friendly / selectivity / planner not full-scanning?
-- [ ] Handles concurrent writes, `NULL`, duplicate/skip, failed extraction → failed split recorded, completed splits untouched?
-- [ ] Pushdown `Exact`? Null/type/timestamp/ordering/duplicate semantics identical to DF?
-- [ ] Checkpoint advancement safe? Pagination is keyset, not `OFFSET` at scale?
-- [ ] Rust: error preserves cause, no credential leak, no `unwrap` hiding failure as empty set?
-
-### Before changing Arrow / DataFusion (merge Rust + DF + DB)
-- [ ] Schema preserved (types, nullability, timezone, precision)?
-- [ ] Streaming preserved (no `collect()` of whole dataset, memory bounded, reuse buffers)?
-- [ ] Pushdown semantically equivalent and budgeted (source not overloaded)?
-- [ ] Schema/types/values/streaming correct? (batch sizes may differ between stages) Column ordering / record counts correct?
-- [ ] Empty result still yields correct schema?
-- [ ] Source semantics (null/timestamp) unchanged?
-- [ ] No scattered `if postgres {}` in generic code? Is capability boundary respected?
+### Before changing Arrow / DataFusion
+- [ ] Schema preserved (types, nullability, timezone, precision), empty result included?
+- [ ] Streaming preserved (no whole-dataset `collect()`, memory bounded)?
+- [ ] Column order and row counts correct? Source semantics unchanged?
+- [ ] Capability boundary respected (no `if postgres {}` in generic code)?
 
 ### Before changing Ballista / distributed
-- [ ] Partitioning deterministic and covers all rows without overlap/duplicate?
-- [ ] What crosses network (plan vs data) and its serialized size?
-- [ ] Task is retriable/idempotent? Handles duplicate execution/partial progress?
-- [ ] Source load flat (shared global budget, not `N×pool_max`)? e.g. `pool_max / workers` is one way, but require a shared budget in general.
-- [ ] Benefit actually measured vs single-node overhead?
-- [ ] Rust: pool/client ownership clear, deterministic cleanup, `Send/Sync` correct?
-- [ ] Isolation semantics documented (read-committed vs snapshot, or explicit "no snapshot guarantee")?
+- [ ] Partitioning deterministic, covering all rows without overlap?
+- [ ] What crosses the network (plan vs data) and how big is it?
+- [ ] Task retriable? Duplicate execution / partial progress handled?
+- [ ] Source load flat (one shared budget, not `N×pool_max`)?
+- [ ] Mode separation kept (§6 "Execution modes"): no in-process Ballista, no Ballista outside `connector/postgres/distributed/` + CLI, no fallback between modes, mode table updated?
+- [ ] Benefit measured against single-node overhead?
 
 ### Before introducing abstraction / optimizing
-- Abstraction: *Is it required now, not hypothetical?* → former only.
-- Optimization: *Do I have evidence of bottleneck (bench/profile)?* → otherwise keep it correct/simple.
+- Abstraction: *is it required now, not hypothetical?* Only the former.
+- Optimization: *is there evidence of a bottleneck (bench/profile/`EXPLAIN`)?* Otherwise keep it correct and simple.
 
 ## 6. Cross-Cutting Rules
 
-**Memory & data movement:** `Source → batch → process → …` Keep max resident bounded. Distinguish movement vs representation vs processing vs storage — this project provides extraction/processing, **not** persistent sink.
+**Dependencies:** check whether an existing crate solves it; mind DataFusion/Ballista/Arrow/sqlx version coupling. Do not bump DataFusion/Ballista/Arrow casually: verify build, tests, examples and APIs.
 
-**Dependencies:** check existing crate solves it, DF/Ballista/Arrow/sqlx version coupling, compile time/binary size, maintenance. Do not bump major DF/Ballista/Arrow casually — verify compilation, tests, examples, Arrow compat, DF/Ballista APIs, runtime.
+**Observability:** log source, operation, query context, batch size, rows, duration, partition/task. **Never** passwords, connection strings, tokens or row data.
 
-**Observability:** log source type, operation, query context, batch size, rows, duration, partition/task — **never** passwords, connection strings, tokens, row data. Prefer structured context.
+**Documentation:** describe what the code actually does. Do not claim `exactly-once / zero-copy / snapshot / unlimited scale / production-ready` unless proven. Mark experimental as experimental.
 
-**Documentation:** describe what code *actually* does. Do not claim `exactly-once / zero-copy / snapshot / unlimited scale / production-ready` unless proven. Mark experimental as experimental.
+**Change discipline:** smallest fix that solves the problem, behavior preserved unless intentional, tests added/updated, docs updated if observable, no unrelated refactors.
 
-**Change discipline:** smallest fix that solves problem → preserve behavior unless intentional → add/update tests → update docs if observable → no unrelated refactors.
+**Benchmarks:** a number is quotable only under the equal-spec rule. Read the method and "Equal-spec rule" sections of [`benchmark/README.md`](benchmark/README.md) before running, changing or quoting a benchmark.
 
-**Benchmark comparability (equal-spec rule):** a benchmark number is only quotable when every engine ran the same spec — same data (`SCALE_ROWS`, same seed), same container budget (default: `--cpuset-cpus 0-3` + `--memory 4g`, shared across the distributed deployment), same scan fan-out derivation (default `ceil(rows/64000)` both sides), same batch knob (explicit `--batch-size` both sides, or label the run "tool defaults"), sequential runs, best-of-`REPEAT`. Equality is enforced ONLY at the container boundary: inside, runtimes run unrestricted (Spark `local[*]`, DataFusion defaults, Ballista visible-CPU slots) — never cap one side from the inside (`--spark-cores`, `BENCH_CONCURRENT_TASKS` are diagnostics only). `run.sh` prints this spec card on every run and bakes it into `results/summary.md`; a missing item means the numbers are smoke, not headlines. Never compare `output_bytes` across engines (different Parquet writers); the gate compares row *sets*. Never claim kernel-equality for `elapsed_ms` (Spark's timed section includes a read-back count, Rust's includes schema discovery) — report system-vs-system with the spec attached.
+**Execution modes — standalone vs distributed (MANDATORY):** exactly two modes, strictly separated. There is no third, hybrid or "in-process cluster" mode. The source database is the input to both modes, not a component of either; the table lists what each mode needs besides it.
 
-**Postgres connector modularization (MANDATORY):** all PostgreSQL-specific code lives under `src/connector/postgres/` — nothing Postgres-specific outside it. This keeps the connector self-contained and the rest of the crate connector-agnostic.
-- New Postgres code (SQL building, cursors, type mapping, pushdown dialect/EXPLAIN, Ballista distributed execution, the extraction pipeline) goes under `src/connector/postgres/` — never at the crate root or in a sibling top-level module.
-- Callers use the connector entry point, not its internals: `connector::postgres::PostgresConnector::from_config(cfg).extract()`, then `.standalone()` or `.distributed()`, finishing with `.collect()` (Arrow batches) or `.run()` (operational job). Do not reach into `pipeline`, `distributed`, `engine`, or `extractor` from outside the connector.
-- Standalone vs distributed is one builder-selected path, not two parallel APIs. `.distributed()` defaults to the config's `distributed.scheduler_url`, or `DEFAULT_SCHEDULER_URL` (`http://localhost:50050`) when empty; `.scheduler(url)` / `.in_process()` / `.workers(n)` override it.
-- `src/lib.rs` re-exports `distributed`, `engine`, `pipeline`, `pushdown` from `connector::postgres` as TRANSITIONAL shims so older paths still resolve. Do not write new code against these crate-root aliases; prefer `connector::postgres::*`. Remove the shims once all callers use `PostgresConnector`.
-- The generic infrastructure now under `connector/postgres/pushdown` (the `SqlDialect` trait, `Predicate`, cost model) is connector-agnostic by design; when a second backend is added, lift it back out to a shared module and keep only the Postgres dialect + EXPLAIN under the connector.
+| | **Standalone** | **Distributed** |
+|---|---|---|
+| Engine | DataFusion only — a plain `SessionContext`, no Ballista | DataFusion planned by the client, executed by Ballista |
+| Entry point | `PostgresConnector::…extract().standalone()`, or `connector::postgres::register_table(&ctx, &config)` into your own `SessionContext` | `…extract().distributed()` (`.scheduler(url)`, `.workers(n)`), or `DistributedContext::remote(&config, url, workers)` + `register_source` |
+| Processes | 1 (the caller's) | client + 1 `rel scheduler` + `workers` × `rel worker` |
+| Required components | none beyond the calling process | a running `rel scheduler` (push-based scheduling, the default); exactly `distributed.workers` running `rel worker` processes — **this crate's binary**, since stock Ballista executors cannot decode the Postgres scan plans; network paths client → scheduler, scheduler ↔ workers, client and workers → source database; the `source.password_env` variable set in **every worker's** environment |
+| Optional | — | the scheduler REST API (on in `rel scheduler`): verifies the executor count against the budget (unreachable = warning, more executors than `workers` = error) and feeds the job watchdog (without it only `distributed.job_timeout_secs` can catch a hang) |
+| Failure handling | a failed split is recorded; `run_with` re-runs it on the next call | job watchdog: a worker that stops heartbeating (`distributed.executor_timeout_secs`, default 30) or is dropped, or `job_timeout_secs`, marks the job hung; it is cancelled and re-run up to `distributed.max_retries` (default 2), then `DistributedJobAborted`. Workers heartbeat every `--heartbeat-secs` (5); the scheduler drops them after `--executor-timeout-secs` (30) |
+| Source connections | the whole `pool_max` for the one process (planning included) | `pool_max / workers` per executor process, plus the client's planning pool |
+| Parallelism | DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU); at most `execution.concurrent_partitions` (default `pool_max`) query the source at once | executor task slots (`rel worker --concurrent-tasks`, default: visible CPUs); at most `pool_max / workers` scans per worker query the source |
+| Checkpoint splits (`run_with`) | one per keyset partition | the whole distributed scan is one split |
+| Benchmark label | `rust-datafusion-standalone` | `rust-ballista-remote` |
+
+Rules:
+- **Never reintroduce in-process Ballista** (`SessionContext::standalone*`, `new_standalone_scheduler*` / `new_standalone_executor*`, an `in_process()` builder) — not in the library, examples, benchmark or tests. It hard-codes pull scheduling (a 50 ms poll per empty task request) and a second Tokio runtime that splits the connection pool.
+- **Ballista stays behind the boundary:** `ballista*` crates are used only in `src/connector/postgres/distributed/` and the CLI's `rel scheduler` / `rel worker`. Standalone code must not construct or import anything from Ballista.
+- **No silent fallback:** `.distributed()` with no reachable cluster is an error. Never degrade to standalone, and never let standalone start a cluster.
+- **A distributed job never hangs:** every distributed query runs under `distributed/watchdog.rs`. Ballista 54 never re-offers a lost executor's tasks, so do not rely on Ballista to recover a job, and never add a distributed terminal that bypasses the watchdog. Re-run only before the first delivered batch (a later re-run would duplicate rows); after that, a hang is an error. Keep `rel worker --heartbeat-secs` well below both timeouts. The benchmark turns the client retry off (`max_retries: 0`) and retries whole attempts on a fresh cluster instead, so no number comes from a degraded cluster.
+- **Tests match the mode:** distributed-path tests run on a real cluster (`tests/common/cluster.rs` starts `rel scheduler` + `rel worker` child processes); standalone tests use plain DataFusion. Do not test one mode through the other.
+- **Changing either mode** (entry point, budget, parallelism, required components) means updating this table, the README's "Standalone or distributed" section and the benchmark README in the same change.
+
+**Postgres connector modularization (MANDATORY):** all PostgreSQL-specific code lives under `src/connector/postgres/`, so the rest of the crate stays connector-agnostic.
+- New Postgres code (SQL building, cursors, type mapping, pushdown dialect/EXPLAIN, distributed execution, the extraction pipeline) goes under `src/connector/postgres/`, never at the crate root or in a sibling top-level module.
+- **What is extracted is data, never hand-written SQL:** table, filters and projection come from the job config (`table`, structured `filters`, `columns`) or the same fields on `JobConfig` — never from a caller-built SQL string (no `SELECT … WHERE` in examples, benchmark harnesses or extraction tools). SQL over *already extracted* data (`ExtractContext::sql`, DataFusion queries on the result) is processing and stays allowed.
+- Callers use the connector entry point, not its internals: `connector::postgres::PostgresConnector::from_config(cfg)?.extract()`, then `.standalone()` or `.distributed()`, finishing with `.run_with(consumer)` (the checkpointed job: a split is marked completed only after the consumer returns `Ok`), `.stream()` (bounded-memory batches, no checkpoints), `.collect()` (materializes every batch) or `.run()` (count-only diagnostic, never touches checkpoints). Do not reach into `pipeline`, `distributed`, `engine` or `extractor` from outside the connector; there are no crate-root re-exports of them.
+- Standalone vs distributed is one builder-selected path, not two parallel APIs. `.distributed()` defaults to the config's `distributed.scheduler_url`, or `DEFAULT_SCHEDULER_URL` (`http://localhost:50050`) when empty; `.scheduler(url)` / `.workers(n)` override it.
+- `src/pushdown` holds only engine-agnostic pushdown infrastructure (the `SqlDialect` trait, `Predicate` IR, translation, policy, cost model). Postgres specifics (dialect/column kinds, parameter sink, EXPLAIN, statistics) live under `src/connector/postgres/`; a new backend adds its own dialect under its connector.
 
 ## 7. Testing & Live DB
 
-Run when applicable:
+See [`docs/testing-plan.md`](docs/testing-plan.md) for the suite, counts and CI steps. Run when applicable:
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
+cargo test --lib --bins && cargo test --doc
+docker compose -f tests/docker/compose.yaml up -d --wait   # Postgres 17 + MySQL 8, dvdrental
+cargo test --tests -- --test-threads=1
 ```
 
-**Rule: Every integration test must declare its oracle.** An oracle is the independent source of `expected` you compare `actual` against. No oracle = no correctness proof.
+Unit tests are pure logic next to the code, with hand-written expected values and no database. Integration tests never skip: an unreachable database is a failure.
+
+**Rule: every integration test declares its oracle** — the independent source of `expected` that `actual` is compared against. No oracle, no correctness proof.
 
 | Oracle type | `expected` comes from | Use for |
 |---|---|---|
-| **Trivial** | Hand-built `RecordBatch` via `StringBuilder`/`TimestampMicrosecondBuilder` | Schema, nullability, type mapping, empty-batch |
-| **Reference** | Direct `sqlx::query("SELECT COUNT(*) …")` against Postgres | Row count / checksum independent of Arrow decode |
-| **Differential** | Same logical query *with* pushdown vs *without* (filter in Arrow) | Pushdown `Exact`/`Inexact` correctness — the gold standard for this repo |
-| **Metamorphic** | Same data via `collect()` vs `execute_stream()` vs 3 Ballista workers | Batch boundary / partitioning / distributed determinism |
+| **Trivial** | Hand-written values or schema | Schema, nullability, type mapping, empty batch |
+| **Reference** | Direct `sqlx` SQL against the source (`COUNT(*)`, `::text`, `extract(epoch …)`) | Row counts / values independent of Arrow decoding |
+| **Differential** | The same query with pushdown policy `always` vs `never` (filter evaluated in Arrow) | Pushdown `Exact`/`Inexact` correctness — the gold standard for this repo |
+| **Metamorphic** | The same data via `collect()` vs `stream()`, or 1 vs 3 Ballista workers | Batch boundaries, partitioning, distributed determinism |
 
-Example differential oracle for pushdown:
-```rust
-let actual = extract_with_pushdown("status='PAID'").await;
-let expected = extract_without_pushdown().await.filter_in_arrow(|r| r.status=="PAID");
-assert_batches_eq!(actual, expected);
-```
+A differential test compares row sets, e.g. the sorted ids from a context registered with `PushdownPolicy::Always` against one with `PushdownPolicy::Never` (`tests/pg_pushdown.rs`, randomized in `tests/pg_pushdown_prop.rs`), and checks that the plan actually pushed something so the comparison is not vacuous.
 
-**Test matrix (each row must name its oracle):**
+**Test matrix (each row names its oracle):**
+- **Extraction:** empty, single row, multiple batches, NULL, type conversion, DB/query failure, stream termination, batch boundaries — *trivial + reference*
+- **Filtered:** full vs filtered agreement, empty filter keeps schema, duplicate timestamps all returned — *differential + reference*
+- **Splits:** per-partition completion, failed split retry, second run skips completed splits with identical rows — *split checkpoint + reference*
+- **DataFusion:** schema preservation, projection/predicate pushdown, counts — *differential*
+- **Distributed:** multiple partitions, worker loss, retry, serialization — *metamorphic (1 vs 3 workers) + reference*
 
-- **Extraction:** empty, single row, multiple batches, large, NULL, type conversion, DB/connection/query failure, stream termination, batch boundaries — *oracle: trivial + reference count*
-- **Filtered:** full vs filtered agreement, empty filter keeps schema, duplicate timestamps all returned — *oracle: differential (pushed filter vs direct SQL) + reference count*
-- **Splits:** per-partition completion, failed split retry, second run skips completed with identical row count — *oracle: split-checkpoint read + reference query*
-- **DataFusion:** schema preservation, projection/predicate pushdown, empty/multiple batches, counts — *oracle: differential (pushed vs local)*
-- **Distributed:** multiple partitions, task failure/retry/serialization/network/duplicate execution — *oracle: metamorphic (1 worker vs 3 workers checksum)*
+**Hostile fixture:** DB tests use `tests/data/hostile.sql` (NULL in every nullable column, `''` vs NULL, INT MIN/MAX, `1.0` vs `1.00` decimals, 1970/2038/9999 timestamps, `bytea` `0x00`/`0xFF`, `text[]` with NULL elements, a 5-row timestamp tie). `TestDb` (`tests/common/postgres.rs`) loads it into a private schema `test_<pid>_<n>` on the compose Postgres and drops the schema afterwards. Never `TRUNCATE` a shared table.
 
-**Hostile fixture (for DB/integration tests, not every unit test):** DB/integration tests use `tests/data/hostile.sql` — null in every nullable col, `""` vs `NULL`, `MIN/MAX` ints, `1.0` vs `1.00` decimals, `1970-01-01`/`2038-01-19`/`9999-12-31` timestamps, `bytea 0x00/0xFF`, `text[]` with null elements, 5-row `ts` tie. Loaded via `testcontainers-postgres` into isolated `CREATE SCHEMA test_{pid}_{thread} + DROP CASCADE`. Never `TRUNCATE` shared DB. Keep pure unit DataFusion tests lightweight — use `MemTable` + `assert_batches_eq!` without the hostile fixture unless they specifically test DB semantics.
-
-- **Live DB (preferred for SQL/type/tx/index behavior):** Postgres is primary. Do not put Postgres-specific logic in generic abstraction unless that abstraction *is* Postgres.
+Postgres is the primary live database for SQL/type/transaction/index behavior. Do not put Postgres-specific logic in a generic abstraction unless that abstraction *is* Postgres.
 
 ## 8. Definition of Done
 
-A change is **done** when: implementation correct **and** API understandable **and** memory bounded **and** DB semantics (ordering/pagination/tx) understood **and** Arrow/DF semantics preserved **and** distributed implications considered **and** relevant tests pass **and** `fmt`/`clippy` pass **and** docs accurately reflect reality **and** no unsupported guarantees added.
+A change is **done** when the implementation is correct, the API understandable, memory bounded, DB semantics (ordering/pagination/transactions) understood, Arrow/DataFusion semantics preserved, distributed implications considered, relevant tests pass, `fmt`/`clippy` pass, docs reflect reality, and no unsupported guarantee was added.
 
-Preferred implementation = clearest correctness + ownership + data semantics + operational characteristics, not most abstractions.
+Preferred implementation = clearest correctness, ownership, data semantics and operational behavior — not the most abstractions.

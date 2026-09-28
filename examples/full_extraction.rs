@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run --example full_extraction
+//! PGPASSWORD=... cargo run --example full_extraction
 //! ```
 
 use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
@@ -21,6 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
     rust_ballista_extraction_layer::logging::init_from_env_and_args();
+
+    // Never hard-code credentials: the password comes from the environment.
+    let password = std::env::var("PGPASSWORD")
+        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/test (the dvdrental demo database)")?;
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Full Load Example");
@@ -34,8 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "localhost",
         5432,
         "postgres",
-        "postgres",
-        "app",
+        &password,
+        "test",
         5,
         30000,
         "full_load_example",
@@ -47,13 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Define extraction parameters
     println!("\n► Step 2: Define extraction parameters");
-    let table_name = "public.orders";
+    let table_name = "public.payment";
     let columns = Some(vec![
-        "order_id",
-        "user_id",
+        "payment_id",
+        "customer_id",
         "amount",
-        "status",
-        "updated_at",
+        "staff_id",
+        "payment_date",
     ]);
 
     println!("  Table: {}", table_name);

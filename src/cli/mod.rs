@@ -5,9 +5,12 @@
 //! the environment this was written in, so new dependencies were kept to ones already resolved
 //! in Cargo.Lock transitively. `clap` was not one of them.
 //!
-//! Subcommands: `rel run` / `rel distribute` (full or filtered extraction with
-//! split-execution checkpointing), `rel checkpoint show|reset` (split status),
-//! `rel demo`, and `rel plan` (per-filter push/keep decisions, docs/pushdown.md).
+//! Subcommands: `rel run` / `rel distribute` (DIAGNOSTIC full or filtered extraction:
+//! scans, counts rows, discards them — no data delivered, no checkpoint written; this
+//! project is not a sink, the operational job is the library's `run_with(consumer)`),
+//! `rel checkpoint show|reset` (split status of `run_with` jobs), `rel runs list|show` (the
+//! per-run reports under `<checkpoint.dir>/runs/`), `rel demo`, and
+//! `rel plan` (per-filter push/keep decisions plus a limited row preview, docs/pushdown.md).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,27 +20,27 @@ use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_
 use ballista_scheduler::cluster::BallistaCluster;
 use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::start_server;
-use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::Expr;
-use datafusion::prelude::SessionContext;
 
+use rust_ballista_extraction_layer::checkpoint::CheckpointStore;
 use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-use rust_ballista_extraction_layer::checkpoint::{CheckpointStore, JobKey};
-use rust_ballista_extraction_layer::config::{FilterEntry, FilterInput, JobConfig};
+use rust_ballista_extraction_layer::config::{
+    FilterEntry, FilterInput, JobConfig, PushdownPolicy, policy_name,
+};
+use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+use rust_ballista_extraction_layer::connector::postgres::distributed::{
+    PostgresLogicalCodec, PostgresPhysicalCodec,
+};
 use rust_ballista_extraction_layer::connector::postgres::pipeline::parse_filter_expr;
-use rust_ballista_extraction_layer::connector::postgres::{
-    PostgresConnector, PostgresTableProvider,
-};
-use rust_ballista_extraction_layer::distributed::{
-    PostgresConnectionDescriptor, PostgresLogicalCodec, PostgresPhysicalCodec,
-};
 use rust_ballista_extraction_layer::errors::AppError;
-use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
+use rust_ballista_extraction_layer::run_report::{list_reports, read_report};
 
-const USAGE: &str = "usage:\n  rel run --config <path> [--filter 'col=value' ...]\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel demo\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value'] [--limit n]\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port] [--filter 'col=value' ...]\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N]\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also REL_LOG_FILE)\n  note: at debug level every generated SQL query is logged\n  note: `rel run` extracts the full table unless the config sets `filters` or --filter flags are given";
+/// Rows `rel plan` previews when `--limit` is not given.
+const DEFAULT_PLAN_LIMIT: usize = 20;
 
-pub async fn dispatch() -> Result<(), AppError> {
+pub(crate) const USAGE: &str = "usage:\n  rel run --config <path> [--filter 'col=value' ...]\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port (default: config, else http://localhost:50050)] [--filter 'col=value' ...]\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value' ...] [--limit n]\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel runs list --config <path>\n  rel runs show --config <path> [--run <run_id> (default: the latest run)]\n  rel demo\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>] [--executor-timeout-secs N (default 30)]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N] [--port P] [--grpc-port P] [--heartbeat-secs N (default 5)]\n\n  `rel run` / `rel distribute` are DIAGNOSTIC: they scan the job (full table, or the\n  config `filters` plus --filter flags), count rows and discard them. No data is delivered\n  and no checkpoint is read or written. This project is not a sink: the operational,\n  checkpointed job is the library API `PostgresConnector::...run_with(consumer)`, whose\n  split state `rel checkpoint show|reset` inspects and clears.\n  Every `run_with` run also writes a run report (`<checkpoint.dir>/runs/<job>/<run_id>.json`),\n  listed by `rel runs list` and printed by `rel runs show`.\n  `rel plan` prints each filter's pushdown decision and previews --limit rows (default 20).\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also REL_LOG_FILE)\n  note: at debug level every generated SQL query is logged";
+
+pub(crate) async fn dispatch() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
@@ -76,7 +79,17 @@ pub async fn dispatch() -> Result<(), AppError> {
         Some("scheduler") => {
             let scheduler_url = optional_flag(&args, "--scheduler-url");
             let bind_host = optional_flag(&args, "--bind-host");
-            run_scheduler(scheduler_url.as_deref(), bind_host.as_deref()).await
+            let executor_timeout = secs_flag(
+                &args,
+                "--executor-timeout-secs",
+                DEFAULT_EXECUTOR_TIMEOUT_SECS,
+            )?;
+            run_scheduler(
+                scheduler_url.as_deref(),
+                bind_host.as_deref(),
+                executor_timeout,
+            )
+            .await
         }
         Some("worker") => {
             let scheduler_url = expect_flag(&args, "--scheduler-url")?;
@@ -91,11 +104,24 @@ pub async fn dispatch() -> Result<(), AppError> {
                     })
                 })
                 .transpose()?;
+            let port = |flag: &str, default: u16| -> Result<u16, AppError> {
+                optional_flag(&args, flag).map_or(Ok(default), |s| {
+                    s.parse::<u16>()
+                        .map_err(|e| AppError::Config(format!("{flag} must be a port number: {e}")))
+                })
+            };
+            let ports = WorkerPorts {
+                flight: port("--port", 50051)?,
+                grpc: port("--grpc-port", 50052)?,
+            };
+            let heartbeat = secs_flag(&args, "--heartbeat-secs", DEFAULT_HEARTBEAT_SECS)?;
             run_worker(
                 &scheduler_url,
                 bind_host.as_deref(),
                 external_host.as_deref(),
                 concurrent_tasks,
+                ports,
+                heartbeat,
             )
             .await
         }
@@ -112,6 +138,20 @@ pub async fn dispatch() -> Result<(), AppError> {
                 "unknown 'checkpoint' subcommand: {other:?}\n{USAGE}"
             ))),
         },
+        Some("runs") => match args.get(1).map(String::as_str) {
+            Some("list") => {
+                let config_path = expect_flag(&args, "--config")?;
+                runs_list(&config_path).await
+            }
+            Some("show") => {
+                let config_path = expect_flag(&args, "--config")?;
+                let run_id = optional_flag(&args, "--run");
+                runs_show(&config_path, run_id.as_deref()).await
+            }
+            other => Err(AppError::Config(format!(
+                "unknown 'runs' subcommand: {other:?}\n{USAGE}"
+            ))),
+        },
         other => Err(AppError::Config(format!(
             "unknown command: {other:?}\n{USAGE}"
         ))),
@@ -121,6 +161,29 @@ pub async fn dispatch() -> Result<(), AppError> {
 fn expect_flag(args: &[String], flag: &str) -> Result<String, AppError> {
     optional_flag(args, flag)
         .ok_or_else(|| AppError::Config(format!("missing required flag {flag}\n{USAGE}")))
+}
+
+/// `rel worker` heartbeat interval. Ballista's own default is 60 s, which lets a dead worker
+/// go unnoticed for minutes; 5 s lets the scheduler and the client-side job watchdog
+/// (`distributed.executor_timeout_secs`) spot one within seconds.
+const DEFAULT_HEARTBEAT_SECS: u64 = 5;
+/// `rel scheduler`: an executor whose heartbeat is older than this is removed (Ballista's
+/// default is 180 s). Must stay well above the worker heartbeat interval.
+const DEFAULT_EXECUTOR_TIMEOUT_SECS: u64 = 30;
+/// How often the scheduler checks for executors past their timeout (Ballista default 15 s).
+const EXPIRE_DEAD_EXECUTOR_INTERVAL_SECS: u64 = 5;
+
+/// A positive whole number of seconds from `flag`, else `default`.
+fn secs_flag(args: &[String], flag: &str, default: u64) -> Result<u64, AppError> {
+    match optional_flag(args, flag) {
+        None => Ok(default),
+        Some(s) => match s.parse::<u64>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(AppError::Config(format!(
+                "{flag} must be a whole number of seconds >= 1 (got '{s}')"
+            ))),
+        },
+    }
 }
 
 fn optional_flag(args: &[String], flag: &str) -> Option<String> {
@@ -158,34 +221,114 @@ fn load_config_with_filters(
     Ok(config)
 }
 
-/// Runs the extraction job: full table scan when no filters are given, otherwise a
-/// filtered extraction with caller-provided predicates pushed to the source.
-/// Split progress is checkpointed so a retry skips completed splits. The project
-/// ships no sink layer by design — the extraction output is the Arrow batch, and
-/// materialization is the downstream consumer's responsibility.
+/// `rel run` — DIAGNOSTIC: scan the job's splits (full table, or its filters pushed to
+/// the source), count rows, discard the batches. Reads and writes no checkpoint and delivers
+/// no data; the operational job is the library's `run_with(consumer)`.
 async fn run_job(config_path: &str, cli_filters: &[String]) -> Result<(), AppError> {
     let config = load_config_with_filters(config_path, cli_filters)?;
     let job_id = config.job_id.clone();
     let filtered = !config.filters.is_empty();
-    let connector = PostgresConnector::from_config(config);
+    log::info!(
+        "job '{job_id}': diagnostic run (rows are counted and discarded; no checkpoint is written)"
+    );
+    let connector = PostgresConnector::from_config(config)?;
     let outcome = connector.extract().standalone().run().await?;
     println!(
-        "job '{}' ({}): extracted {} row(s), splits {}/{}",
+        "job '{}' ({}, diagnostic): counted {} row(s) in {} split(s); nothing delivered, no checkpoint written",
         job_id,
         if filtered { "filtered" } else { "full" },
         outcome.rows_extracted,
-        outcome.splits_completed,
         outcome.splits_total,
     );
+    if let Some(path) = &outcome.report_path {
+        println!("run report: {}", path.display());
+    }
+    Ok(())
+}
+
+fn report_io(what: &str, e: std::io::Error) -> AppError {
+    AppError::Config(format!("cannot read run reports ({what}): {e}"))
+}
+
+/// `rel runs list` — one line per run report of the job, oldest first.
+async fn runs_list(config_path: &str) -> Result<(), AppError> {
+    let config = JobConfig::from_file(config_path)?;
+    let dir = std::path::Path::new(&config.checkpoint.dir);
+    let reports = list_reports(dir, &config.job_id)
+        .await
+        .map_err(|e| report_io("list", e))?;
+    if reports.is_empty() {
+        println!("no run reports yet for job '{}'", config.job_id);
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<10} {:<12} {:<11} {:<25} {:>10} {:>14} {:>10}",
+        "run_id", "status", "kind", "mode", "started_at", "ms", "rows_delivered", "splits"
+    );
+    for r in &reports {
+        println!(
+            "{:<14} {:<10} {:<12} {:<11} {:<25} {:>10} {:>14} {:>10}",
+            r.run_id,
+            json_name(&r.status),
+            json_name(&r.kind),
+            json_name(&r.mode),
+            r.started_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            r.duration_ms.map_or("-".to_string(), |ms| ms.to_string()),
+            r.totals.rows_delivered,
+            format!(
+                "{}/{}{}",
+                r.totals.splits_completed,
+                r.totals.splits_total,
+                if r.totals.splits_failed > 0 {
+                    format!(" ({} failed)", r.totals.splits_failed)
+                } else {
+                    String::new()
+                }
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// The serialized (snake_case) name of a report enum value.
+fn json_name<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// `rel runs show` — the full report of one run (default: the latest) as JSON.
+async fn runs_show(config_path: &str, run_id: Option<&str>) -> Result<(), AppError> {
+    let config = JobConfig::from_file(config_path)?;
+    let dir = std::path::Path::new(&config.checkpoint.dir);
+    let report = match run_id {
+        Some(run_id) => read_report(dir, &config.job_id, run_id)
+            .await
+            .map_err(|e| report_io(run_id, e))?,
+        None => match list_reports(dir, &config.job_id)
+            .await
+            .map_err(|e| report_io("list", e))?
+            .pop()
+        {
+            Some(report) => report,
+            None => {
+                println!("no run reports yet for job '{}'", config.job_id);
+                return Ok(());
+            }
+        },
+    };
+    let text = serde_json::to_string_pretty(&report)
+        .map_err(|e| AppError::Config(format!("cannot render run report: {e}")))?;
+    println!("{text}");
     Ok(())
 }
 
 async fn checkpoint_show(config_path: &str) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
-    let key = JobKey::new(config.job_id.clone());
 
-    match store.read(&key).await? {
+    match store.read(&config.job_id).await? {
         Some(checkpoint) => println!("{checkpoint:#?}"),
         None => println!("no checkpoint yet for job '{}'", config.job_id),
     }
@@ -194,104 +337,62 @@ async fn checkpoint_show(config_path: &str) -> Result<(), AppError> {
 }
 
 /// Delete the split checkpoint so the next run starts fresh — the operator escape
-/// hatch for a wedged or stale split state.
+/// hatch after a plan change (`PlanMismatch`) or for a wedged split state. Takes the job's
+/// run lock first, so it refuses while a run is active.
 async fn checkpoint_reset(config_path: &str) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let store = JsonCheckpointStore::new(&config.checkpoint.dir)?;
-    let key = JobKey::new(config.job_id.clone());
-    store.reset(&key).await?;
+    let ttl = std::time::Duration::from_secs(config.checkpoint.lock_ttl_secs);
+    let lock = store.lock(&config.job_id, ttl).await?;
+    let reset = store.reset(&config.job_id).await;
+    lock.release().await?;
+    reset?;
     println!("checkpoint reset for job '{}'", config.job_id);
     Ok(())
 }
 
-/// `rel plan` — docs/pushdown.md's `rel plan --explain`, scoped down: rather than parsing
-/// arbitrary SQL and walking the resulting logical plan (which needs DataFusion internals this
-/// pass couldn't verify against a compiler), filters come in as simple `column<op>value` CLI
-/// flags and are built directly into `Expr`s with the shared [`parse_filter_expr`] helper.
-/// Prints each filter's push/keep decision — mirroring the worked
-/// example in docs/architecture.md §3 — then actually runs the query so the numbers are real,
-/// not just a plan.
+/// `rel plan` — docs/pushdown.md's `rel plan --explain`, scoped down: filters come from the
+/// config's `filters` plus `column<op>value` `--filter` flags. Uses exactly the path every
+/// run uses ([`Pipeline::explain_filters`], schema-coerced predicates, the same provider), so
+/// the preview cannot disagree with execution. Prints each filter's push/keep decision, then
+/// previews at most `--limit` rows (default 20 — never the whole table).
+///
+/// [`Pipeline::explain_filters`]: rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline::explain_filters
 async fn plan_explain(
     config_path: &str,
     policy_str: Option<&str>,
     filter_strs: &[String],
     limit: Option<usize>,
 ) -> Result<(), AppError> {
-    let config = JobConfig::from_file(config_path)?;
-
-    let policy_str = policy_str.unwrap_or(&config.pushdown.policy).to_string();
-    let policy = PushdownPolicy::parse(&policy_str);
-    let deny = config.pushdown.deny.clone();
-
-    let exprs: Vec<Expr> = filter_strs
-        .iter()
-        .map(|raw| parse_filter_expr(raw))
-        .collect::<Result<_, _>>()?;
-
-    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
-    let provider = PostgresTableProvider::new(
-        descriptor,
-        &config.resolved_table(),
-        policy,
-        deny,
-        config.pushdown.push.clone(),
-        rust_ballista_extraction_layer::pushdown::cost_model::CostParams {
-            max_source_cost: config.pushdown.max_source_cost,
-            keep_threshold: config.pushdown.keep_threshold,
-        },
-        config.pushdown.statistics_ttl_secs,
-        config.execution.batch_size,
-    )
-    .await?;
-
-    let expr_refs: Vec<&Expr> = exprs.iter().collect();
-    // Warm EXPLAIN estimates first so cost-based decisions below use them, exactly as a
-    // warmed production provider would.
-    provider.warm_explain(&exprs).await;
-    let decisions = provider.supports_filters_pushdown(&expr_refs)?;
-
-    println!("policy: {policy_str}");
-    if filter_strs.is_empty() {
-        println!("  (no --filter flags given)");
+    let mut config = load_config_with_filters(config_path, filter_strs)?;
+    if let Some(raw) = policy_str {
+        config.pushdown.policy =
+            PushdownPolicy::parse(raw).map_err(|e| AppError::Config(e.to_string()))?;
     }
-    for ((raw, expr), decision) in filter_strs.iter().zip(exprs.iter()).zip(decisions.iter()) {
-        println!(
-            "  {raw:<40} -> {decision:?} ({})",
-            provider.explain_decision(expr)
-        );
+    let policy = policy_name(config.pushdown.policy);
+    let connector = PostgresConnector::from_config(config)?;
+    let pipeline = connector.pipeline();
+
+    println!("policy: {policy}");
+    let decisions = pipeline.explain_filters().await?;
+    if decisions.is_empty() {
+        println!("  (no filters: full extraction)");
+    }
+    for d in &decisions {
+        println!("  {:<40} -> {:?} ({})", d.filter, d.pushdown, d.reason);
     }
 
-    let ctx = {
-        use datafusion::execution::session_state::SessionStateBuilder;
-        let state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_optimizer_rule(Arc::new(
-                rust_ballista_extraction_layer::pushdown::optimizer_rule::SourceAwarePushdownRule,
-            ))
-            .build();
-        SessionContext::new_with_state(state)
-    };
-    ctx.register_table(&config.table, Arc::new(provider))?;
-    let mut df = ctx.table(&config.table).await?;
-
-    for expr in exprs {
-        df = df.filter(expr)?;
-    }
-
-    if let Some(n) = limit {
-        df = df.limit(0, Some(n))?;
-    }
-
-    df.show().await?;
-
+    let limit = limit.unwrap_or(DEFAULT_PLAN_LIMIT);
+    println!("preview (at most {limit} row(s); --limit to change):");
+    pipeline.preview(limit).await?.show().await?;
     Ok(())
 }
 
-/// `rel distribute` — docs/roadmap.md Phase 4. Same job semantics as `rel run` (full or
-/// filtered extraction with split checkpointing), but the extraction itself is
-/// executed by a Ballista cluster: in-proc (`standalone`) or against a `rel scheduler`/`rel
-/// worker` deployment. The table is registered so each scan splits into `workers` keyset
-/// partitions, and every process budgets its source pool to `pool_max / workers`.
+/// `rel distribute` — docs/roadmap.md Phase 4. DIAGNOSTIC like `rel run` (rows counted and
+/// discarded, no checkpoint), but the extraction itself is executed by a running Ballista
+/// cluster (`rel scheduler` + `rel worker`s) at `--scheduler-url`, else the config's
+/// `distributed.scheduler_url`, else `http://localhost:50050`. Every executor process budgets
+/// its source pool to `pool_max / workers`.
 async fn run_distributed(
     config_path: &str,
     workers: Option<usize>,
@@ -300,25 +401,25 @@ async fn run_distributed(
 ) -> Result<(), AppError> {
     let config = load_config_with_filters(config_path, cli_filters)?;
     let job_id = config.job_id.clone();
-    let connector = PostgresConnector::from_config(config);
-    // No --scheduler-url keeps `rel distribute`'s zero-config behavior: an in-process cluster.
+    let connector = PostgresConnector::from_config(config)?;
+    // No --scheduler-url: the config's scheduler, else the standard local endpoint.
     let mut extraction = connector.extract().distributed();
-    extraction = match scheduler_url {
-        Some(url) => extraction.scheduler(url),
-        None => extraction.in_process(),
-    };
+    if let Some(url) = scheduler_url {
+        extraction = extraction.scheduler(url);
+    }
     if let Some(n) = workers {
         extraction = extraction.workers(n);
     }
     let outcome = extraction.run().await?;
     println!(
-        "job '{}' (distributed, workers={}): extracted {} row(s), splits {}/{}",
+        "job '{}' (distributed, workers={}, diagnostic): counted {} row(s); nothing delivered, no checkpoint written",
         job_id,
         outcome.workers.unwrap_or(0),
         outcome.rows_extracted,
-        outcome.splits_completed,
-        outcome.splits_total,
     );
+    if let Some(path) = &outcome.report_path {
+        println!("run report: {}", path.display());
+    }
     Ok(())
 }
 
@@ -326,9 +427,16 @@ async fn run_distributed(
 /// process so it stays up across `rel worker` restarts. Workers (`rel worker`) connect to the
 /// URL it advertises. `bind_host` is the local interface to listen on (default: 127.0.0.1 for
 /// `localhost`, else the URL host); containers pass `0.0.0.0` so other containers reach it.
+///
+/// `executor_timeout_secs` (`--executor-timeout-secs`, default 30) is how long an executor may
+/// go without a heartbeat before the scheduler removes it; the dead-executor check runs every
+/// 5 s. Note Ballista 54 then puts the lost executor's tasks back in the queue but never hands
+/// them out again, so the job itself stalls: the client-side watchdog
+/// ([`crate::connector::postgres::distributed::watchdog`]) cancels and re-runs it.
 async fn run_scheduler(
     scheduler_url: Option<&str>,
     bind_host: Option<&str>,
+    executor_timeout_secs: u64,
 ) -> Result<(), AppError> {
     let (host, port) = parse_scheduler_url(scheduler_url.unwrap_or("localhost:50050"))?;
     let bind_host = bind_host.map(str::to_string).unwrap_or_else(|| {
@@ -354,6 +462,9 @@ async fn run_scheduler(
         // free slots (all 4 scan tasks landing on one worker), RoundRobin deals one task
         // per executor. With partitions == workers this forces an even 1:1:1:1 split.
         task_distribution: TaskDistributionPolicy::RoundRobin,
+        executor_timeout_seconds: executor_timeout_secs,
+        expire_dead_executor_interval_seconds: EXPIRE_DEAD_EXECUTOR_INTERVAL_SECS
+            .min(executor_timeout_secs),
         ..SchedulerConfig::default()
     };
 
@@ -382,12 +493,17 @@ async fn run_scheduler(
 /// (`0.0.0.0` + the container name), otherwise the scheduler cannot reach the executor.
 /// `concurrent_tasks` (default: host CPU count) is the task-slot budget — the closest thing
 /// Ballista has to "CPUs per executor" (there is no CPU pinning; tasks run on a shared Tokio
-/// runtime over all visible cores).
+/// runtime over all visible cores). `ports` defaults to 50051 (Arrow Flight, shuffle data) and
+/// 50052 (gRPC); set them to run several workers on one host. `heartbeat_secs`
+/// (`--heartbeat-secs`, default 5) is how often it reports to the scheduler; keep it well below
+/// the scheduler's `--executor-timeout-secs` and the job's `distributed.executor_timeout_secs`.
 async fn run_worker(
     scheduler_url: &str,
     bind_host: Option<&str>,
     external_host: Option<&str>,
     concurrent_tasks: Option<usize>,
+    ports: WorkerPorts,
+    heartbeat_secs: u64,
 ) -> Result<(), AppError> {
     let (scheduler_host, scheduler_port) = parse_scheduler_url(scheduler_url)?;
     let concurrent_tasks = match concurrent_tasks {
@@ -400,14 +516,15 @@ async fn run_worker(
 
     let opt = Arc::new(ExecutorProcessConfig {
         bind_host: bind_host.unwrap_or("127.0.0.1").to_string(),
-        port: 50051,
-        grpc_port: 50052,
+        port: ports.flight,
+        grpc_port: ports.grpc,
         scheduler_host,
         scheduler_port,
         concurrent_tasks,
         override_logical_codec: Some(Arc::new(PostgresLogicalCodec::new())),
         override_physical_codec: Some(Arc::new(PostgresPhysicalCodec::new())),
         external_host: external_host.map(str::to_string),
+        executor_heartbeat_interval_seconds: heartbeat_secs,
         ..ExecutorProcessConfig::default()
     });
 
@@ -417,6 +534,15 @@ async fn run_worker(
     start_executor_process(opt).await.map_err(|e| {
         AppError::DataFusion(DataFusionError::External(format!("executor: {e}").into()))
     })
+}
+
+/// Listen ports of one `rel worker`.
+#[derive(Debug, Clone, Copy)]
+struct WorkerPorts {
+    /// Arrow Flight service (shuffle / result data), `--port`.
+    flight: u16,
+    /// Executor gRPC service, `--grpc-port`.
+    grpc: u16,
 }
 
 /// `"http://localhost:50050"` or `"localhost:50050"` → `(host, port)`; port defaults to 50050.

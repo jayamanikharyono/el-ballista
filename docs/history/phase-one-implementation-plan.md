@@ -1,6 +1,8 @@
 # Phase 1 Implementation Plan — Single-Node PostgreSQL Extractor
 
-Status reference: [roadmap.md](../roadmap.md#phase-1--single-node-postgresql-extractor). This plan
+> Archived planning document (September 2026). Not a description of the current code — see [../roadmap.md](../roadmap.md) and [../architecture.md](../architecture.md).
+
+Status reference: [roadmap.md](../roadmap.md#phase-1--single-node-postgresql-extraction). This plan
 takes the current code in `../../src` (a single-binary proof of concept: schema read → hardcoded window
 query → Arrow decode → optional `TableProvider` registration) to the Phase 1 exit criteria:
 

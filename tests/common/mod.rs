@@ -30,3 +30,10 @@ mod postgres;
 // harness API, and an itemized `pub use` would trip `unused_imports` in the binaries
 // that don't need every name.
 pub use postgres::*;
+
+// Real-cluster harness (`rel scheduler` + `rel worker` child processes). Only the
+// distributed suites start one, so the re-export is unused in the others.
+#[path = "cluster.rs"]
+mod cluster;
+#[allow(unused_imports)]
+pub use cluster::*;

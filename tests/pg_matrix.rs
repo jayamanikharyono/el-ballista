@@ -1,4 +1,4 @@
-//! Test-matrix gaps from the review (T-4): metamorphic worker count, multi-batch through the
+//! Cross-cutting test matrix: metamorphic worker count, multi-batch through the
 //! provider, `collect()` vs `stream()`, and full empty-result schema equality.
 //!
 //! Every test names its oracle (AGENTS.md §7):
@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use common::{TEST_PASSWORD_ENV, TestDb};
+use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
 use datafusion::prelude::{SessionContext, col, lit};
 use futures::TryStreamExt;
 use rust_ballista_extraction_layer::config::{
@@ -75,6 +75,7 @@ fn job(db: &TestDb, table: &str, partitions: usize, batch_size: usize) -> JobCon
         distributed: DistributedConfig {
             scheduler_url: String::new(),
             workers: 1,
+            ..DistributedConfig::default()
         },
     }
 }
@@ -148,24 +149,26 @@ async fn source_ids(db: &TestDb, table: &str) -> Result<Vec<i64>, sqlx::Error> {
 
 #[tokio::test]
 async fn one_vs_three_workers_return_identical_rows() -> R {
-    // Oracle: metamorphic (1 vs 3 in-process Ballista workers over the same 3 keyset
+    // Oracle: metamorphic (1 vs 3 Ballista worker processes over the same 3 keyset
     // partitions must return the same multiset of whole rows) + reference (the ids by direct
     // SQL, so both sides being equally wrong cannot pass).
     let db = TestDb::connect().await;
     create_wide(&db).await?;
+    let one_worker = TestCluster::start(1, 2).await;
+    let three_workers = TestCluster::start(3, 2).await;
     for table in ["hostile", "wide"] {
         let connector = PostgresConnector::from_config(job(&db, table, 3, 256))?;
         let one = connector
             .extract()
             .distributed()
-            .in_process()
+            .scheduler(&one_worker.url)
             .workers(1)
             .collect()
             .await?;
         let three = connector
             .extract()
             .distributed()
-            .in_process()
+            .scheduler(&three_workers.url)
             .workers(3)
             .collect()
             .await?;
@@ -269,16 +272,17 @@ async fn collect_and_stream_return_identical_rows() -> R {
         "standalone collect != stream"
     );
 
+    let cluster = TestCluster::start(1, 2).await;
     let collected = connector
         .extract()
         .distributed()
-        .in_process()
+        .scheduler(&cluster.url)
         .collect()
         .await?;
     let streamed: Vec<RecordBatch> = connector
         .extract()
         .distributed()
-        .in_process()
+        .scheduler(&cluster.url)
         .stream()
         .await?
         .try_collect()
@@ -396,7 +400,7 @@ async fn empty_result_schema_equals_the_table_schema() -> R {
     Ok(())
 }
 
-/// R5: `execution.copy_statement_timeout_ms` scopes a statement_timeout to each COPY scan and
+/// `execution.copy_statement_timeout_ms` scopes a statement_timeout to each COPY scan and
 /// never leaks into the pooled session. Oracles: the server's own timeout error (57014), then
 /// a follow-up scan on the same connector and the direct-SQL row set.
 #[tokio::test]

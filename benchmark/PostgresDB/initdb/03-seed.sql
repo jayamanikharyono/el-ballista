@@ -1,5 +1,5 @@
--- Deterministic seed data: 500 users, 20k orders spread over the last 90 days,
--- so an incremental window over `updated_at` always has rows to find.
+-- Deterministic benchmark seed: 500 users, 20k orders spread over the last 90 days.
+-- benchmark/run.sh then grows `orders` to SCALE_ROWS with scale.sql.
 SELECT setseed(0.42);
 
 INSERT INTO public.users (email, full_name, country, is_active, created_at, updated_at)

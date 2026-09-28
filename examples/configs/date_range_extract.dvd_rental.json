@@ -1,19 +1,30 @@
 {
   "job_id": "dvd_rental_date_range",
   "table": "payment",
-  "columns": ["payment_id", "customer_id", "staff_id", "rental_id", "amount", "payment_date"],
+  "columns": [
+    "payment_id",
+    "customer_id",
+    "staff_id",
+    "rental_id",
+    "amount",
+    "payment_date"
+  ],
   "filters": [
-    { "column": "payment_date", "op": ">", "value": "2007-02-16" }
+    {
+      "column": "payment_date",
+      "op": ">",
+      "value": "2007-02-16"
+    }
   ],
   "source": {
     "host": "localhost",
     "port": 5432,
     "user": "postgres",
-    "password_env": "ORDERS_PG_PASSWORD",
+    "password_env": "PGPASSWORD",
     "database": "test",
     "pool_max": 8,
     "statement_timeout_ms": 300000,
-    "application_name": "rust-extract-dvd-rental-date-range",
+    "application_name": "el-ballista-dvd-rental-date-range",
     "schema": "public"
   },
   "checkpoint": {

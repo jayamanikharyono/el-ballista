@@ -89,7 +89,7 @@ impl CopyBatchDecoder {
             ));
         }
         Ok(Self {
-            builder: RowBatchBuilder::with_capacity(table_metadata, batch_size)?,
+            builder: RowBatchBuilder::for_batches(table_metadata, batch_size, max_batch_bytes)?,
             ncols: table_metadata.columns.len(),
             batch_size,
             max_batch_bytes,
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn infinity_timestamps_and_dates_are_typed_errors() {
-        // B4: both signs, all three types; the error names the column.
+        // Both signs, all three types; the error names the column.
         for (ty, raw) in [
             ("timestamp with time zone", i64b(i64::MAX)),
             ("timestamp with time zone", i64b(i64::MIN)),

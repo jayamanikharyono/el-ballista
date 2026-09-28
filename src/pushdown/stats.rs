@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
 use crate::connector::errors::ExtractorError;
+use crate::pushdown::Literal;
 
 /// Per-column statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ColumnStats {
     pub column_name: String,
     /// Estimated number of distinct values, as an absolute count. Connectors convert any
@@ -20,6 +21,42 @@ pub struct ColumnStats {
     pub n_distinct: f64,
     pub null_frac: f32,
     pub avg_width: i32,
+    /// Equi-depth histogram bounds, ascending, for ordered column kinds (integer, timestamp,
+    /// date), as positions on the column's numeric axis — see [`ordinal`]. Each adjacent pair
+    /// holds the same share of the rows that are neither NULL nor a most-common value. Empty
+    /// when the source has no histogram for the column.
+    pub histogram_bounds: Vec<f64>,
+    /// Most common values on the same numeric axis, with their row fractions in
+    /// `most_common_freqs` (same length). Empty when unknown.
+    pub most_common_vals: Vec<f64>,
+    pub most_common_freqs: Vec<f64>,
+}
+
+/// A literal's position on the numeric axis that [`ColumnStats::histogram_bounds`] and
+/// [`ColumnStats::most_common_vals`] use: integers as themselves, timestamps as seconds since
+/// the Unix epoch, dates as days since 1970-01-01. `None` for unordered literals (text, bool,
+/// float), whose comparisons keep the default estimates.
+///
+/// # Examples
+/// ```
+/// use chrono::NaiveDate;
+/// use rust_ballista_extraction_layer::pushdown::Literal;
+/// use rust_ballista_extraction_layer::pushdown::stats::ordinal;
+/// assert_eq!(ordinal(&Literal::Int(7)), Some(7.0));
+/// let d = NaiveDate::from_ymd_opt(1970, 1, 11).unwrap();
+/// assert_eq!(ordinal(&Literal::Date(d)), Some(10.0));
+/// assert_eq!(ordinal(&Literal::Text("x".into())), None);
+/// ```
+pub fn ordinal(literal: &Literal) -> Option<f64> {
+    match literal {
+        Literal::Int(v) => Some(*v as f64),
+        Literal::Timestamp(ts) => Some(ts.timestamp_micros() as f64 / 1_000_000.0),
+        Literal::Date(d) => {
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            Some(d.signed_duration_since(epoch).num_days() as f64)
+        }
+        Literal::Bool(_) | Literal::Float(_) | Literal::Text(_) => None,
+    }
 }
 
 /// Per-table and per-column statistics used by the cost model.

@@ -1,11 +1,12 @@
-//! Property-based pushdown differential (review B1; AGENTS.md §7 "gold standard").
+//! Property-based pushdown differential (the "gold standard" oracle in AGENTS.md §7).
 //!
 //! Oracle: **differential** — for randomly generated predicates over a hostile little table
 //! (ICU- and case-insensitively-collated text, `-0.0`/`NaN`/NULL floats, integer extremes,
 //! booleans, an enum), the rows returned with pushdown policy `always` must equal the rows
 //! returned with `never` (every filter evaluated by DataFusion over Arrow). Any predicate the
 //! translator labels `Exact`/`Inexact` but that the source evaluates differently shows up as
-//! a mismatch, printed with the SQL that produced it (proptest then shrinks it).
+//! a mismatch, printed with the SQL that produced it (not shrunk: the check runs async
+//! against the database, see below).
 //!
 //! Deterministic: a fixed RNG seed, so a failure reproduces run-to-run.
 //! Run: `cargo test --test pg_pushdown_prop -- --test-threads=1` (needs the compose stack).

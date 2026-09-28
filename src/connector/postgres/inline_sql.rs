@@ -51,6 +51,7 @@ fn render_param_inline(param: &SqlParam) -> String {
         SqlParam::Float(v) => format!("{}::float8", quote_text(&v.to_string())),
         SqlParam::Text(v) => quote_text(v),
         SqlParam::Timestamp(v) => format!("{}::timestamptz", quote_text(&v.to_rfc3339())),
+        SqlParam::Date(v) => format!("{}::date", quote_text(&v.format("%Y-%m-%d").to_string())),
     }
 }
 
@@ -87,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_render_inline_escapes_backslash_with_e_string() {
-        // M9: `a\b` must reach Postgres as the 3-character string under either setting of
+        // `a\b` must reach Postgres as the 3-character string under either setting of
         // standard_conforming_strings.
         assert_eq!(text_eq(r"a\b").render_inline(), r#"("status" = E'a\\b')"#);
         assert_eq!(
@@ -116,6 +117,13 @@ mod tests {
             right: Box::new(Predicate::Literal(Literal::Float(f64::NAN))),
         };
         assert_eq!(p.render_inline(), r#"("x" = 'NaN'::float8)"#);
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
+        let p = Predicate::Cmp {
+            left: Box::new(Predicate::Column("shipped_on".to_string())),
+            op: CmpOp::GtEq,
+            right: Box::new(Predicate::Literal(Literal::Date(d))),
+        };
+        assert_eq!(p.render_inline(), r#"("shipped_on" >= '2026-09-27'::date)"#);
     }
 
     #[test]

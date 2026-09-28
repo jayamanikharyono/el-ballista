@@ -8,7 +8,8 @@
 //!
 //! This is a smoke test / illustration of the pieces wired together with DataFusion doing
 //! the in-memory transform work, not a production entry point. Run it with `rel demo`; it
-//! connects to `postgres@localhost:5432/app` with the password from the environment variable
+//! connects to the dvdrental demo database (`postgres@localhost:5432/test`, started by
+//! `docker compose -f tests/docker/compose.yaml up -d --wait`) with the password from the environment variable
 //! named by [`DEMO_PASSWORD_ENV`] (never a hard-coded password).
 
 /// Environment variable holding the demo database password.
@@ -46,34 +47,33 @@ pub(crate) async fn run() -> Result<(), AppError> {
         5432,
         "postgres",
         &password,
-        "app",
+        "test",
         4,
         30_000,
-        "rust-extract-layer-demo",
+        "el-ballista-demo",
     )
     .await
     .map_err(|source| AppError::SourceConnect {
-        target: "localhost:5432/app".to_string(),
+        target: "localhost:5432/test".to_string(),
         source,
     })?;
 
     let batch = extractor
         .extract_full_table(
-            "public.orders", // Now uses explicit schema
+            "public.payment",
             Some(vec![
-                "order_id",
-                "user_id",
-                "status",
+                "payment_id",
+                "customer_id",
+                "staff_id",
                 "amount",
-                "created_at",
-                "updated_at",
+                "payment_date",
             ]),
         )
         .await?;
 
     let num_rows_extracted = batch.num_rows();
     println!(
-        "  ✓ Extracted {} row(s) from public.orders (full scan)",
+        "  ✓ Extracted {} row(s) from public.payment (full scan)",
         num_rows_extracted
     );
 
@@ -113,9 +113,9 @@ pub(crate) async fn run() -> Result<(), AppError> {
     let stats_collector = StatisticsCollector::new(pool.clone(), 900);
 
     // Attempt to collect statistics (may fail if pg_stats is empty, but demonstrates the framework)
-    match stats_collector.get_statistics("public", "orders").await {
+    match stats_collector.get_statistics("public", "payment").await {
         Ok(stats) => {
-            println!("  ✓ Statistics collected for public.orders");
+            println!("  ✓ Statistics collected for public.payment");
             println!("    - Estimated rows: {:.0}", stats.row_count_estimate);
             println!("    - Table size: {} bytes", stats.table_size_bytes);
             println!("    - Columns with stats: {}", stats.columns.len());
@@ -128,34 +128,34 @@ pub(crate) async fn run() -> Result<(), AppError> {
     // DataFrame operations and metadata columns
     println!("\n► DataFusion transformation with Parquet output");
     let ctx = SessionContext::new();
-    ctx.register_batch("orders_raw", batch)?;
-    let df = ctx.table("orders_raw").await?;
+    ctx.register_batch("payment_raw", batch)?;
+    let df = ctx.table("payment_raw").await?;
 
     // 2. Filter.
-    let df = df.filter(col("status").eq(lit("PAID")))?;
-    println!("  ✓ Filtered to status='PAID'");
+    let df = df.filter(col("customer_id").gt_eq(lit(300i64)))?;
+    println!("  ✓ Filtered to customer_id >= 300");
 
     // 3. Transform: derive a new column from existing ones.
-    let df = df.with_column("amount_usd", col("amount") * lit(1.0_f64 / 15_800.0))?;
-    println!("  ✓ Added derived column: amount_usd");
+    let df = df.with_column("amount_cents", col("amount") * lit(100i64))?;
+    println!("  ✓ Added derived column: amount_cents");
 
     // 4. Drop/rename columns.
     let df = df.select(vec![
-        col("status"),
-        col("user_id").alias("customer_id"),
-        col("amount_usd"),
+        col("staff_id"),
+        col("customer_id").alias("customer"),
+        col("amount_cents"),
     ])?;
-    println!("  ✓ Projected columns: status, customer_id, amount_usd");
+    println!("  ✓ Projected columns: staff_id, customer, amount_cents");
 
     // 5. Aggregate.
     let df = df.aggregate(
-        vec![col("status")],
+        vec![col("staff_id")],
         vec![
-            sum(col("amount_usd")).alias("total_amount_usd"),
-            count(col("customer_id")).alias("order_count"),
+            sum(col("amount_cents")).alias("total_amount_cents"),
+            count(col("customer")).alias("payment_count"),
         ],
     )?;
-    println!("  ✓ Aggregated by status");
+    println!("  ✓ Aggregated by staff_id");
 
     df.clone().show().await?;
 
@@ -178,21 +178,21 @@ pub(crate) async fn run() -> Result<(), AppError> {
     // Demonstrate config framework
     println!("\n► Configuration framework");
     let _config = JobConfig {
-        job_id: JobId::new("demo_orders")?,
-        table: "orders".to_string(),
+        job_id: JobId::new("demo_payment")?,
+        table: "payment".to_string(),
         columns: None,
         filters: vec![FilterEntry::Single(FilterInput::Shorthand(
-            "status=PAID".to_string(),
+            "customer_id>=300".to_string(),
         ))],
         source: SourceConfig {
             host: "localhost".to_string(),
             port: 5432,
             user: "postgres".to_string(),
             password_env: DEMO_PASSWORD_ENV.to_string(),
-            database: "app".to_string(),
+            database: "test".to_string(),
             pool_max: 8,
             statement_timeout_ms: 300_000,
-            application_name: "rust-extract-layer".to_string(),
+            application_name: "el-ballista-demo".to_string(),
             schema: "public".to_string(),
         },
         checkpoint: CheckpointConfig::default(),
@@ -207,7 +207,7 @@ pub(crate) async fn run() -> Result<(), AppError> {
         parallel_scan: ParallelScanConfig {
             strategy: ParallelStrategy::None,
             partitions: 1,
-            partition_column: "order_id".to_string(),
+            partition_column: "payment_id".to_string(),
         },
         execution: ExecutionConfig::default(),
         distributed: DistributedConfig::default(),
@@ -218,12 +218,12 @@ pub(crate) async fn run() -> Result<(), AppError> {
     println!("    - keep_threshold: 0.30 (push if selectivity < 30%)");
     println!("    - statistics_ttl: 900 seconds");
     println!("  ✓ Parallel scan: disabled (strategy=none, partitions=1)");
-    println!("  ✓ Filtered extraction via caller-provided predicates (e.g. status=PAID)");
+    println!("  ✓ Filtered extraction via caller-provided predicates (e.g. customer_id>=300)");
 
     println!("\n=== Demo complete ===\n");
     println!("Output:");
     println!(
-        "  - {} rows extracted from public.orders",
+        "  - {} rows extracted from public.payment",
         num_rows_extracted
     );
     println!(

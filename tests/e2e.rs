@@ -1,16 +1,15 @@
 //! End-to-end suite: Postgres → extractor → Arrow → Ballista → validation.
 //!
-//! The E2E tests run entirely in-process for the compute side: the Ballista
-//! scheduler + executor run standalone in this same process
-//! (`DistributedContext::standalone`, the same in-proc path `tests/pg_distributed.rs`
-//! exercises). Postgres always comes from the Docker compose stack
+//! The distributed tests run on a real cluster: `rel scheduler` + two `rel worker` child
+//! processes of this crate's binary (`common::TestCluster`), exactly as deployed minus the
+//! containers. Postgres always comes from the Docker compose stack
 //! (`tests/docker/compose.yaml` — `DATABASE_URL` overrides the default endpoint); no
-//! embedded server, no external scheduler/workers, no silent skips.
+//! embedded server, no silent skips.
 //!
 //! Filtering is caller-provided (full scan or explicit predicates) with direct SQL
 //! as the oracle; split checkpointing is covered through `run_with` retries: a retry that
-//! skips (T-3, counted through `RunOutcome::splits_skipped` and consumer calls) and crash
-//! recovery (M15: a consumer failure and a cancelled run mid-split, then a retry whose
+//! skips (counted through `RunOutcome::splits_skipped` and consumer calls) and crash
+//! recovery (a consumer failure and a cancelled run mid-split, then a retry whose
 //! delivered-row union equals direct SQL with no duplicate or gap).
 //!
 //! ```bash
@@ -22,7 +21,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{TEST_PASSWORD_ENV, TestDb};
+use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
 use futures::TryStreamExt;
 use rust_ballista_extraction_layer::checkpoint::{
     CheckpointStore, SplitState, json_store::JsonCheckpointStore,
@@ -88,21 +87,23 @@ impl E2E {
             distributed: DistributedConfig {
                 scheduler_url: String::new(),
                 workers: 2,
+                ..DistributedConfig::default()
             },
         }
     }
 
-    /// In-process scheduler + executor (docs/roadmap.md Phase 4's "standalone" mode) — the
-    /// whole plan-shipping path (codecs, partition distribution, budgeted pools) runs for
-    /// real, with no separate scheduler/worker processes to stand up.
-    async fn standalone(
+    /// A two-worker cluster with the job's table registered over `partitions` keyset
+    /// partitions — the whole plan-shipping path (codecs, partition distribution, per-process
+    /// budgeted pools) runs for real. Keep the cluster alive while the context is used.
+    async fn cluster(
         &self,
         partitions: usize,
-    ) -> Result<DistributedContext, Box<dyn std::error::Error>> {
+    ) -> Result<(TestCluster, DistributedContext), Box<dyn std::error::Error>> {
         let config = self.job(partitions);
-        let ctx = DistributedContext::standalone(&config, partitions).await?;
+        let cluster = TestCluster::start(2, 2).await;
+        let ctx = DistributedContext::remote(&config, &cluster.url, 2).await?;
         ctx.register_source(&config).await?;
-        Ok(ctx)
+        Ok((cluster, ctx))
     }
 
     /// Direct-from-Postgres expected ids for a predicate (the oracle).
@@ -132,7 +133,7 @@ impl E2E {
     }
 }
 
-/// Always provisions a real, fully in-process E2E environment — never skips.
+/// Always provisions a real E2E environment (compose Postgres; a real cluster per distributed test) — never skips.
 macro_rules! live {
     () => {
         E2E::setup().await
@@ -142,7 +143,7 @@ macro_rules! live {
 #[tokio::test]
 async fn e2e_full_extraction() -> Result<(), Box<dyn std::error::Error>> {
     let e = live!();
-    let ctx = e.standalone(4).await?;
+    let (_cluster, ctx) = e.cluster(4).await?;
     let got = e.remote_ids(&ctx, "SELECT id FROM hostile").await?;
     assert_eq!(got, e.expected_ids("true").await?);
     assert_eq!(got.len(), common::HOSTILE_ROWS);
@@ -152,7 +153,7 @@ async fn e2e_full_extraction() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn e2e_filtered_extraction() -> Result<(), Box<dyn std::error::Error>> {
     let e = live!();
-    let ctx = e.standalone(2).await?;
+    let (_cluster, ctx) = e.cluster(2).await?;
 
     // Caller-provided range predicate: the extraction layer pushes it to the source,
     // and the result must match Postgres exactly (differential oracle).
@@ -207,7 +208,7 @@ async fn split_ids(
 
 #[tokio::test]
 async fn e2e_split_checkpoint_retry_skips_completed() -> Result<(), Box<dyn std::error::Error>> {
-    // T-3: the retry must be distinguishable from a re-extract. Oracle: the split checkpoint
+    // The retry must be distinguishable from a re-extract. Oracle: the split checkpoint
     // (all Completed), `splits_skipped`, the consumer call count (0 on retry), and direct SQL
     // for the first run's delivered ids.
     let e = live!();
@@ -264,7 +265,7 @@ async fn e2e_split_checkpoint_retry_skips_completed() -> Result<(), Box<dyn std:
 
 #[tokio::test]
 async fn e2e_crash_recovery_consumer_failure_mid_split() -> Result<(), Box<dyn std::error::Error>> {
-    // M15: run 1's downstream writer "crashes" on split-1 after its first batch (batch_size 1,
+    // Run 1's downstream writer "crashes" on split-1 after its first batch (batch_size 1,
     // so the split is mid-stream). Rows count as delivered only when a split's consumer
     // returns Ok (the writer commits per split). The retry with the same config must complete
     // only split-1, and the union of committed rows must equal direct SQL: no gap, no dup.
@@ -292,7 +293,7 @@ async fn e2e_crash_recovery_consumer_failure_mid_split() -> Result<(), Box<dyn s
             Ok(())
         })
         .await;
-    match first {
+    match first.as_ref().map_err(AppError::underlying) {
         Err(AppError::SplitsFailed { failures, .. }) => {
             let ids: Vec<_> = failures.iter().map(|f| f.split_id.as_str()).collect();
             assert_eq!(ids, vec!["split-1"]);
@@ -335,14 +336,14 @@ async fn e2e_crash_recovery_consumer_failure_mid_split() -> Result<(), Box<dyn s
 
 #[tokio::test]
 async fn e2e_crash_recovery_cancelled_run_mid_split() -> Result<(), Box<dyn std::error::Error>> {
-    // M15, process-crash flavour: the run is cancelled (future dropped) while split-1 is
+    // Process-crash flavour: the run is cancelled (future dropped) while split-1 is
     // mid-stream. split-0 was acknowledged and stays Completed; split-1 stays Running with
     // nothing committed. The dropped run releases its lock, and the retry re-runs split-1
     // only; committed rows == direct SQL.
     let e = live!();
     let mut config = e.job(2);
     config.execution.batch_size = 1;
-    config.execution.concurrent_partitions = 1; // split-0 finishes before split-1 starts
+    config.execution.concurrent_partitions = Some(1); // split-0 finishes before split-1 starts
     let dir = checkpoint_dir(&mut config, "crash_cancel");
 
     let committed: std::sync::Arc<Mutex<Vec<i64>>> = Default::default();
@@ -414,7 +415,7 @@ async fn e2e_crash_recovery_cancelled_run_mid_split() -> Result<(), Box<dyn std:
 #[tokio::test]
 async fn e2e_selective_extraction() -> Result<(), Box<dyn std::error::Error>> {
     let e = live!();
-    let ctx = e.standalone(2).await?;
+    let (_cluster, ctx) = e.cluster(2).await?;
     // Narrow projection + pushed filter, checked against the database itself.
     let got = e
         .remote_ids(&ctx, "SELECT id FROM hostile WHERE nick = 'seven'")
@@ -427,9 +428,9 @@ async fn e2e_selective_extraction() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn e2e_distributed_extraction() -> Result<(), Box<dyn std::error::Error>> {
     let e = live!();
-    // Same result through a 4-way partitioned in-process scan as from Postgres directly:
+    // Same result through a 4-way partitioned scan on two workers as from Postgres directly:
     // distribution must not lose, duplicate, or corrupt rows.
-    let ctx = e.standalone(4).await?;
+    let (_cluster, ctx) = e.cluster(4).await?;
     let got = e.remote_ids(&ctx, "SELECT id, amount FROM hostile").await?;
     assert_eq!(got, e.expected_ids("true").await?);
     Ok(())

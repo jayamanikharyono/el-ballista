@@ -88,9 +88,10 @@ byte strings) out of our hands.
 | Column reference | yes | Quoted per dialect; must be a known column of the table |
 | Literals: int (8/16/32/64-bit, unsigned ≤32-bit), float, bool, utf8 | yes | Bound as typed parameters |
 | Literals: timestamp-microsecond | yes | Bound as typed parameter |
-| Literals: date, decimal, binary, NULL, anything else | **no** | kept in Arrow |
+| Literals: date (`Date32`, years 1–9999) | yes | Bound as a Postgres `date` |
+| Literals: decimal, binary, NULL, anything else | **no** | kept in Arrow |
 | Comparison `= <> < <= > >=` against a literal | per column kind | See the table below and §3 |
-| Column-to-column comparison | same-kind integer / boolean / timestamp / text only | Text sides both `COLLATE "C"` |
+| Column-to-column comparison | same-kind integer / boolean / timestamp / date / text only | Text sides both `COLLATE "C"` |
 | `AND` / `OR` | yes | Fidelity is the *minimum* of the children's |
 | `NOT`, `IS [NOT] NULL` over a predicate | only over an `Exact` child | The negation of a superset is a subset |
 | `IS NULL` / `IS NOT NULL` on a column | yes, any known column | `Exact` |
@@ -104,8 +105,14 @@ byte strings) out of our hands.
 | Text (`text`, `varchar`) | all six, as `("col" COLLATE "C") op $n` | `Exact` |
 | Label (true enums from `pg_enum`) | all six, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
 | TextCast (`uuid`, `json`, `jsonb`, other `USER-DEFINED` incl. `citext`) | `=` and `<>` only, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
+| Date (`date`) | all six, as a plain `"col" op $n` against a bound `date` (a plain index on the column serves it) | `Exact` |
 | Float (`real`, `double precision`) | `=` only | `Inexact` |
-| Date, `character(n)`, numeric, bytea, arrays, other | none (only `IS [NOT] NULL`) | — |
+| `character(n)`, numeric, bytea, arrays, other | none (only `IS [NOT] NULL`) | — |
+
+Only plain column comparisons push. When DataFusion has to wrap the column in a cast to make a
+comparison type-check — a `date` column against a timestamp literal, `CAST(d AS VARCHAR) = '…'`
+— the filter is not a column comparison any more and stays in Arrow. Casts and aliases in the
+projection are always DataFusion's: only the column list is pushed.
 
 `COLLATE "C"` orders the **server-encoded** bytes, which equals Arrow's UTF-8 byte order only
 when `server_encoding = UTF8`. The provider reads `SHOW server_encoding` once; on any other
@@ -228,6 +235,7 @@ plan (Ballista scheduler/executors) carry no statistics and never refresh.
 | --- | --- |
 | Row count estimate | `pg_class.reltuples` |
 | Column selectivity | `pg_stats` — `n_distinct` (negative values are fractions of `reltuples` and are converted), `null_frac` |
+| Range selectivity (integer, date, timestamp columns) | `pg_stats` — `histogram_bounds`, `most_common_vals` / `most_common_freqs`, converted in SQL to numbers (dates as days, timestamps as epoch seconds). Best-effort: without them range estimates use the defaults below |
 | Index availability | `pg_index` + `pg_class` |
 | Plan cost / access method | `EXPLAIN (FORMAT JSON)` — plans without executing |
 | Table size | `pg_total_relation_size()` |
@@ -236,6 +244,32 @@ plan (Ballista scheduler/executors) carry no statistics and never refresh.
 whether the candidate predicate produces an index scan or a sequential scan, and at what estimated
 cost. It is one cheap round trip and the result is cached per (table, predicate shape). A plan
 without `Total Cost` is treated as *unknown* (the statistics estimate is used), never as free.
+
+### Range selectivity and windows
+
+A range comparison (`<`, `<=`, `>`, `>=`) on an integer, date or timestamp column is estimated
+from the column's distribution, the way Postgres does it: the most-common values inside the
+range, plus the histogram's share of the remaining (non-NULL, non-most-common) rows, linear
+inside a bucket. A column with most-common values but no histogram — typical for a date column
+with a few hundred distinct days — is estimated from the most-common values alone.
+
+Filters arrive at the provider as a set (DataFusion splits `AND` into separate filters). A range
+filter is estimated **together with the other range filters on the same column**, as one window:
+for `updated_at >= '2026-09-27'` and `updated_at < '2026-09-28'`, each side is judged by the
+one-day window's selectivity, not by its own open-ended half. Both sides therefore get the same
+decision. `rel plan` names the basis: `low selectivity (0.50% from histogram, window of 2 range
+filters)`.
+
+A window's cost is the table-size heuristic over the window's selectivity, even when an
+`EXPLAIN` of one side is cached: that `EXPLAIN` prices an open-ended half-range, not the window.
+It also keeps `rel plan` (which warms `EXPLAIN`) in agreement with a first run (which has not).
+
+Fallback: without the column's distribution (never analyzed, a type the distribution query does
+not cover, the query failed, or a provider rebuilt from a serialized plan), a range filter keeps
+the plain per-predicate estimate (0.33 per comparison) and gets no window discount — the model
+keeps rather than pushes on a guess.
+
+Equality still uses `1 / n_distinct`, and `OR` / `NOT` trees keep the per-predicate estimate.
 
 ### 4.2 The decision
 

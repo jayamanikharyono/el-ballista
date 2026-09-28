@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Never hard-code credentials: the password comes from the environment.
     let password = std::env::var("PGPASSWORD")
-        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/app")?;
+        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/test (the dvdrental demo database)")?;
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Full Load Example");
@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         5432,
         "postgres",
         &password,
-        "app",
+        "test",
         5,
         30000,
         "full_load_example",
@@ -51,13 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Define extraction parameters
     println!("\n► Step 2: Define extraction parameters");
-    let table_name = "public.orders";
+    let table_name = "public.payment";
     let columns = Some(vec![
-        "order_id",
-        "user_id",
+        "payment_id",
+        "customer_id",
         "amount",
-        "status",
-        "updated_at",
+        "staff_id",
+        "payment_date",
     ]);
 
     println!("  Table: {}", table_name);

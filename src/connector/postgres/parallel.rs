@@ -188,7 +188,7 @@ fn keyset_partitions_from_bounds(
 /// The one rendering of a keyset partition predicate (`col` already quoted).
 ///
 /// Both ends of the key space are open so the partitions cover every row even after the
-/// table changed since the bounds were computed (a resumed run reuses stored bounds, B2):
+/// table changed since the bounds were computed (a resumed run reuses stored bounds):
 /// partition 0 has no lower bound (`col < hi`, plus NULL keys), and `hi == None` is the
 /// open-ended tail. `lo` of partition 0 is therefore informational only.
 fn keyset_predicate(col: &str, partition_id: usize, lo: i64, hi: Option<i64>) -> String {
@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_keyset_partition_rebuilds_exactly_what_was_computed() {
-        // B2: a resumed job re-creates its stored splits from lo/hi alone; the predicate
+        // A resumed job re-creates its stored splits from lo/hi alone; the predicate
         // must be byte-identical to the one the original plan scanned.
         for (min, max, n) in [
             (1, 10, 3),
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_keyset_predicates_include_nulls_once_and_open_tail() {
-        // C1 + C2: exact generated SQL.
+        // Exact generated SQL.
         let partitions = keyset_partitions_from_bounds("k", 1, 10, 3);
         let preds: Vec<_> = partitions
             .iter()
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_keyset_partitions_i64_max_key_is_included() {
-        // C2: max = i64::MAX used to compute `max + 1` (overflow) and drop the max row.
+        // `max = i64::MAX` used to compute `max + 1` (overflow) and drop the max row.
         let partitions = keyset_partitions_from_bounds("id", 1, i64::MAX, 2);
         assert_eq!(partitions.len(), 2);
         assert_eq!(partitions[1].hi, None);
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_keyset_partitions_full_i64_span_does_not_overflow() {
-        // C2: max - min overflowed i64 for spans wider than i64::MAX (random/hashed keys).
+        // `max - min` overflowed i64 for spans wider than i64::MAX (random/hashed keys).
         let partitions = keyset_partitions_from_bounds("id", i64::MIN, i64::MAX, 4);
         assert_eq!(partitions.len(), 4);
         assert_eq!(partitions[0].lo, Some(i64::MIN));

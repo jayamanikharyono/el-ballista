@@ -509,7 +509,7 @@ impl ExecutionPlan for PostgresExecutionPlan {
         // streams batches; the driver persists progress.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DataFusionResult<RecordBatch>>(2);
         let task = runtime.spawn(async move {
-            // S1: the shared source budget. Wait (no timeout; dropping the stream aborts the
+            // The shared source budget. Wait (no timeout; dropping the stream aborts the
             // wait) for one of the process's `budgeted_max_connections` scan slots, and hold
             // it until this partition's scan is finished.
             let _slot = match scan_slots.acquire_owned().await {
@@ -849,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_first_partition_keeps_null_keys_and_is_parenthesized() {
-        // C1: `... AND (range) OR "k" IS NULL` without parentheses would bind the OR
+        // `... AND (range) OR "k" IS NULL` without parentheses would bind the OR
         // around the pushed filter and return NULL-key rows that fail the filter.
         let plan = keyset_plan(vec![Predicate::Cmp {
             left: Box::new(Predicate::Column("status".to_string())),

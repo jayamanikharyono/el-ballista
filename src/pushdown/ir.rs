@@ -5,7 +5,7 @@
 //! decoded from plan bytes. Literals are never interpolated: [`Predicate::render_to`] hands them
 //! to a [`SqlSink`], which binds them at render position.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::pushdown::dialect::SqlDialect;
@@ -110,6 +110,8 @@ pub enum Literal {
     Float(f64),
     Text(String),
     Timestamp(DateTime<Utc>),
+    /// A calendar date (no time, no zone). Compared against `date` columns only.
+    Date(NaiveDate),
 }
 
 impl Predicate {
@@ -197,6 +199,7 @@ pub enum SqlParam {
     Float(f64),
     Text(String),
     Timestamp(DateTime<Utc>),
+    Date(NaiveDate),
 }
 
 impl From<&Literal> for SqlParam {
@@ -207,6 +210,7 @@ impl From<&Literal> for SqlParam {
             Literal::Float(v) => SqlParam::Float(*v),
             Literal::Text(v) => SqlParam::Text(v.clone()),
             Literal::Timestamp(v) => SqlParam::Timestamp(*v),
+            Literal::Date(v) => SqlParam::Date(*v),
         }
     }
 }
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_every_node_is_parenthesized() {
-        // B5: `(NOT flag) IS NULL` must keep its grouping.
+        // `(NOT flag) IS NULL` must keep its grouping.
         let p = Predicate::IsNull(Box::new(Predicate::Not(col("flag"))));
         assert_eq!(render(&p).0, r#"((NOT "flag") IS NULL)"#);
 

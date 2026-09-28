@@ -5,8 +5,8 @@
 //! No policy ever changes the translated fidelity.
 
 use crate::pushdown::cost_model::{
-    CostDecision, CostInputs, column_has_plain_index, decide_push, estimate_selectivity_from_stats,
-    estimate_source_cost,
+    CostDecision, CostInputs, column_has_plain_index, decide_push, decision_cost,
+    estimate_selectivity,
 };
 use crate::pushdown::{ColumnKind, Fidelity, Literal, Predicate};
 
@@ -99,6 +99,7 @@ pub enum Decision {
 /// let (params, kinds) = (CostParams::default(), ColumnKinds::new());
 /// let inputs = CostInputs {
 ///     stats: &stats, params: &params, indexes: &[], explain: None, column_kinds: &kinds,
+///     siblings: &[],
 /// };
 /// let (fidelity, predicate) = translate(&col("id").eq(lit(7i64))).unwrap();
 /// let deny = ["id".to_string()];
@@ -139,6 +140,7 @@ pub fn decide_translated(
 /// let (params, kinds) = (CostParams::default(), ColumnKinds::new());
 /// let inputs = CostInputs {
 ///     stats: &stats, params: &params, indexes: &[], explain: None, column_kinds: &kinds,
+///     siblings: &[],
 /// };
 /// let (fidelity, predicate) = translate(&col("id").eq(lit(7i64))).unwrap();
 /// let (decision, reason) =
@@ -250,7 +252,8 @@ fn strict_gate(predicate: &Predicate, inputs: &CostInputs<'_>) -> StrictGate {
         return StrictGate::NonPrimitive;
     }
 
-    let selectivity = estimate_selectivity_from_stats(predicate, inputs.stats);
+    let estimate = estimate_selectivity(predicate, inputs.stats, inputs.siblings);
+    let selectivity = estimate.value;
     if selectivity >= inputs.params.keep_threshold {
         return StrictGate::Unselective {
             selectivity,
@@ -258,9 +261,7 @@ fn strict_gate(predicate: &Predicate, inputs: &CostInputs<'_>) -> StrictGate {
         };
     }
 
-    let estimated = inputs
-        .explain_cost()
-        .unwrap_or_else(|| estimate_source_cost(predicate, inputs.stats));
+    let estimated = decision_cost(&estimate, inputs);
     if estimated > inputs.params.max_source_cost {
         return StrictGate::OverBudget {
             cost: estimated,
@@ -271,7 +272,7 @@ fn strict_gate(predicate: &Predicate, inputs: &CostInputs<'_>) -> StrictGate {
     StrictGate::Push
 }
 
-/// Primitive shapes only: bool/int/timestamp literals over boolean/integer/timestamp/date
+/// Primitive shapes only: bool/int/timestamp/date literals over boolean/integer/timestamp/date
 /// columns. Anything else (float, text, casts, collations, unknown columns) fails closed.
 fn is_primitive_predicate(predicate: &Predicate, inputs: &CostInputs<'_>) -> bool {
     match predicate {
@@ -286,7 +287,7 @@ fn is_primitive_predicate(predicate: &Predicate, inputs: &CostInputs<'_>) -> boo
         ),
         Predicate::Literal(lit) => matches!(
             lit,
-            Literal::Bool(_) | Literal::Int(_) | Literal::Timestamp(_)
+            Literal::Bool(_) | Literal::Int(_) | Literal::Timestamp(_) | Literal::Date(_)
         ),
         Predicate::Cmp { left, right, .. }
         | Predicate::And(left, right)
@@ -392,6 +393,7 @@ mod tests {
                     n_distinct,
                     null_frac: 0.0,
                     avg_width: width,
+                    ..Default::default()
                 },
             );
         }
@@ -490,6 +492,7 @@ mod tests {
             indexes: &[],
             explain: None,
             column_kinds: &kinds,
+            siblings: &[],
         };
         let expr = col("secret").eq(lit(100i64));
         let deny = vec!["SECRET".to_string()];
@@ -539,6 +542,7 @@ mod tests {
             indexes: &indexes,
             explain: None,
             column_kinds: &kinds,
+            siblings: &[],
         };
         // `always` pushes everything translatable (text = is exact under binary collation,
         // float = is a superset, float > is not translatable); `cost_based` keeps the
@@ -565,6 +569,7 @@ mod tests {
             indexes: &indexes,
             explain: None,
             column_kinds: &kinds,
+            siblings: &[],
         };
         let push = vec!["status".to_string()];
         assert_eq!(
@@ -596,6 +601,7 @@ mod tests {
             indexes: &indexes,
             explain: None,
             column_kinds: &kinds,
+            siblings: &[],
         };
         let filters = [
             col("id").eq(lit(42i64)),       // indexed + bigint + selective → push
@@ -643,6 +649,7 @@ mod tests {
             indexes: &indexes,
             explain: None,
             column_kinds: &kinds,
+            siblings: &[],
         };
         let expr = col("id").eq(lit(42i64)).and(col("active").eq(lit(true)));
         let (fidelity, predicate) = translate_with(&expr, &kinds).unwrap();

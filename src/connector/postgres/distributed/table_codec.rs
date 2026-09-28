@@ -164,6 +164,7 @@ mod tests {
             enum_columns: vec!["status".to_string()],
             server_utf8: true,
             fixed_partitions: None,
+            run_id: Some("r_codec".to_string()),
         }
     }
 
@@ -205,6 +206,8 @@ mod tests {
         assert_eq!(model.parallel_workers, 4);
         assert_eq!(model.batch_size, 1024);
         assert_eq!(model.enum_columns, vec!["status".to_string()]);
+        // The run id survives, so a scheduler-side scan tags queries like the client's.
+        assert_eq!(model.run_id.as_deref(), Some("r_codec"));
     }
 
     #[test]

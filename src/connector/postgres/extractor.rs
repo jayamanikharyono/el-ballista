@@ -91,7 +91,7 @@ where
 {
     validate_batch_size(batch_size)?;
     // Build decoders before touching the source: unsupported types fail up front.
-    let builder = RowBatchBuilder::with_capacity(table_metadata, batch_size)?;
+    let builder = RowBatchBuilder::for_batches(table_metadata, batch_size, max_batch_bytes)?;
 
     let mut conn = pool.acquire().await?;
     let mut tx = conn.begin().await?;

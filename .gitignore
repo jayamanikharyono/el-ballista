@@ -54,8 +54,7 @@ benchmark/output/
 # Generated per run by benchmark/run.sh (do NOT confuse with the
 # benchmark/rust/bench-config.json template, which is tracked: the Docker build
 # fallback and the config file test both read it)
-benchmark/bench-config.json
+benchmark/bench-config*.json
 
 
 Claude outputs/
-scripts/verify-review.sh

@@ -393,7 +393,7 @@ async fn unknown_table_and_column_are_typed_errors() {
     db.cleanup().await;
 }
 
-/// C9 edges, oracle = trivial (the literal values inserted): unsigned maxima never wrap,
+/// Unsigned / boolean / YEAR / TIME / BIT edges, oracle = trivial (the literal values inserted): unsigned maxima never wrap,
 /// BOOLEAN is Boolean, YEAR is Int16, TIME is a signed Duration(µs), BIT(n) is UInt64.
 #[tokio::test]
 async fn unsigned_bool_year_time_bit_decode_losslessly() {
@@ -515,7 +515,7 @@ async fn password_with_url_metacharacters_connects() {
     db.cleanup().await;
 }
 
-/// Prior T4: MySQL zero dates and ENUM/SET decoding. Oracles: trivial (hand-written expected
+/// MySQL zero dates and ENUM/SET decoding. Oracles: trivial (hand-written expected
 /// values) and the typed error for the zero date. sqlx itself decodes `0000-00-00` as NULL;
 /// the connector must not let that pass as a real NULL.
 #[tokio::test]

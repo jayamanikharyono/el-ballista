@@ -101,6 +101,105 @@ fn absolute_n_distinct(raw: f64, row_count: f64) -> f64 {
     }
 }
 
+/// One row per ordered column: `(column, histogram_bounds, most_common_vals,
+/// most_common_freqs)`, the value arrays already on the numeric axis of
+/// [`crate::pushdown::stats::ordinal`].
+type DistributionRow = (
+    String,
+    Option<Vec<f64>>,
+    Option<Vec<Option<f64>>>,
+    Option<Vec<f64>>,
+);
+
+/// Histogram bounds and most-common values of the integer, date and timestamp columns, converted
+/// in SQL to `float8` positions: integers as-is, dates as days since 1970-01-01, timestamps as
+/// epoch seconds (`timestamp` without zone read as UTC, like the extractor). `pg_stats` exposes
+/// both as `anyarray`, so they go through their text form into the column's real array type.
+/// Infinite dates/timestamps are dropped. With inheritance or partitions, the `inherited = true`
+/// row (what a scan of the parent reads) wins by sorting last.
+async fn fetch_ordered_distributions(
+    pool: &PgPool,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Vec<DistributionRow>, sqlx::Error> {
+    sqlx::query_as::<_, DistributionRow>(
+        r#"
+        WITH cols AS (
+            SELECT s.attname::text AS attname,
+                   s.inherited,
+                   s.histogram_bounds::text AS hist,
+                   s.most_common_vals::text AS mcv,
+                   s.most_common_freqs::float8[] AS freqs,
+                   t.typname::text AS typname
+            FROM pg_stats s
+            JOIN pg_namespace n ON n.nspname = s.schemaname
+            JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = s.tablename
+            JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = s.attname
+            JOIN pg_type t ON t.oid = a.atttypid
+            WHERE s.schemaname = $1
+              AND s.tablename = $2
+              AND t.typname IN ('int2', 'int4', 'int8', 'date', 'timestamp', 'timestamptz')
+        )
+        SELECT attname,
+               CASE typname
+                   WHEN 'date' THEN ARRAY(
+                       SELECT (v - DATE '1970-01-01')::float8
+                       FROM unnest(hist::date[]) v WHERE isfinite(v))
+                   WHEN 'timestamp' THEN ARRAY(
+                       SELECT extract(epoch FROM v)::float8
+                       FROM unnest(hist::timestamp[]) v WHERE isfinite(v))
+                   WHEN 'timestamptz' THEN ARRAY(
+                       SELECT extract(epoch FROM v)::float8
+                       FROM unnest(hist::timestamptz[]) v WHERE isfinite(v))
+                   ELSE hist::float8[]
+               END AS histogram_bounds,
+               CASE typname
+                   WHEN 'date' THEN ARRAY(
+                       SELECT CASE WHEN isfinite(v) THEN (v - DATE '1970-01-01')::float8 END
+                       FROM unnest(mcv::date[]) WITH ORDINALITY u(v, i) ORDER BY i)
+                   WHEN 'timestamp' THEN ARRAY(
+                       SELECT CASE WHEN isfinite(v) THEN extract(epoch FROM v)::float8 END
+                       FROM unnest(mcv::timestamp[]) WITH ORDINALITY u(v, i) ORDER BY i)
+                   WHEN 'timestamptz' THEN ARRAY(
+                       SELECT CASE WHEN isfinite(v) THEN extract(epoch FROM v)::float8 END
+                       FROM unnest(mcv::timestamptz[]) WITH ORDINALITY u(v, i) ORDER BY i)
+                   ELSE mcv::float8[]
+               END AS most_common_vals,
+               freqs AS most_common_freqs
+        FROM cols
+        ORDER BY attname, inherited
+        "#,
+    )
+    .bind(schema_name)
+    .bind(table_name)
+    .fetch_all(pool)
+    .await
+}
+
+/// Histogram bounds as the cost model needs them: finite and ascending. Anything else (fewer
+/// than two bounds, NaN) is treated as "no histogram".
+fn finite_sorted(bounds: Vec<f64>) -> Vec<f64> {
+    let ok = bounds.len() >= 2
+        && bounds.iter().all(|b| b.is_finite())
+        && bounds.windows(2).all(|w| w[0] <= w[1]);
+    if ok { bounds } else { Vec::new() }
+}
+
+/// Most-common values paired with their frequencies. A length mismatch (should not happen)
+/// drops both. An infinite most-common value (NULL from the SQL above) is omitted, so its
+/// share is folded into the histogram part of the estimate — a small approximation for a
+/// rare case.
+fn paired_mcv(vals: Option<Vec<Option<f64>>>, freqs: Option<Vec<f64>>) -> (Vec<f64>, Vec<f64>) {
+    match (vals, freqs) {
+        (Some(vals), Some(freqs)) if vals.len() == freqs.len() => vals
+            .into_iter()
+            .zip(freqs)
+            .filter_map(|(v, f)| v.filter(|v| v.is_finite()).map(|v| (v, f)))
+            .unzip(),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
 #[async_trait]
 impl TableStatsSource for PgPool {
     async fn table_statistics(
@@ -147,7 +246,10 @@ impl TableStatsSource for PgPool {
             FROM pg_stats
             WHERE schemaname = $1
               AND tablename = $2
-            ORDER BY attname
+            -- With inheritance/partitions a column has an `inherited = true` row too (what a
+            -- scan of the parent reads); sorting it last makes it the one kept, matching the
+            -- histogram query below.
+            ORDER BY attname, inherited
             "#,
         )
         .bind(schema_name)
@@ -162,7 +264,7 @@ impl TableStatsSource for PgPool {
             source: e,
         })?;
 
-        let columns = stats_rows
+        let mut columns: HashMap<String, ColumnStats> = stats_rows
             .into_iter()
             .map(|(column_name, n_distinct, null_frac, avg_width)| {
                 let stat = ColumnStats {
@@ -170,10 +272,30 @@ impl TableStatsSource for PgPool {
                     n_distinct: absolute_n_distinct(n_distinct, row_count),
                     null_frac,
                     avg_width,
+                    ..Default::default()
                 };
                 (column_name, stat)
             })
             .collect();
+
+        // Histograms and most-common values are an estimate refinement: without them the
+        // cost model falls back to its defaults, so a failure here only logs.
+        match fetch_ordered_distributions(self, schema_name, table_name).await {
+            Ok(rows) => {
+                for (column_name, bounds, mcv, freqs) in rows {
+                    if let Some(stat) = columns.get_mut(&column_name) {
+                        stat.histogram_bounds = finite_sorted(bounds.unwrap_or_default());
+                        let (vals, freqs) = paired_mcv(mcv, freqs);
+                        stat.most_common_vals = vals;
+                        stat.most_common_freqs = freqs;
+                    }
+                }
+            }
+            Err(e) => log::warn!(
+                "histogram statistics unavailable for {schema_name}.{table_name}: {e}; range \
+                 estimates use defaults"
+            ),
+        }
 
         Ok(SourceStatistics {
             table_name: table_name.to_string(),
@@ -301,5 +423,33 @@ mod tests {
         assert_eq!(absolute_n_distinct(-0.5, 1000.0), 500.0);
         // Unknown row count: unknown distinctness, never negative.
         assert_eq!(absolute_n_distinct(-1.0, -1.0), 0.0);
+    }
+
+    #[test]
+    fn test_histogram_bounds_must_be_finite_and_ascending() {
+        assert_eq!(
+            finite_sorted(vec![1.0, 2.0, 2.0, 5.0]),
+            vec![1.0, 2.0, 2.0, 5.0]
+        );
+        assert!(finite_sorted(vec![1.0]).is_empty());
+        assert!(finite_sorted(vec![2.0, 1.0]).is_empty());
+        assert!(finite_sorted(vec![1.0, f64::NAN, 3.0]).is_empty());
+        assert!(finite_sorted(vec![1.0, f64::INFINITY]).is_empty());
+    }
+
+    #[test]
+    fn test_most_common_values_pair_with_frequencies() {
+        let (vals, freqs) = paired_mcv(
+            Some(vec![Some(3.0), None, Some(1.0)]),
+            Some(vec![0.5, 0.2, 0.1]),
+        );
+        // The infinite (NULL) value is dropped together with its frequency.
+        assert_eq!((vals, freqs), (vec![3.0, 1.0], vec![0.5, 0.1]));
+        // Mismatched lengths or a missing side: nothing.
+        assert_eq!(
+            paired_mcv(Some(vec![Some(1.0)]), Some(vec![])),
+            (vec![], vec![])
+        );
+        assert_eq!(paired_mcv(None, Some(vec![0.5])), (vec![], vec![]));
     }
 }

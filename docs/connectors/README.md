@@ -1,7 +1,8 @@
 # Connector SPI
 
 A connector is not "run SQL, return rows". It is the component that tells the planner **what the
-source can do well**, produces Arrow batches, and knows the specific ways its dialect will lie to you.
+source can do well**, produces Arrow batches, and knows the specific ways its dialect can return
+a different answer than Arrow would.
 
 Detailed implementation: **[PostgreSQL](postgres.md)**.
 
@@ -65,7 +66,7 @@ The PostgreSQL connector implements `TableProvider` (`supports_filters_pushdown`
 | Parallel scan splitting | keyset, `ctid` physical ranges | serial only (keyset planned) |
 | Filter pushdown | cost-based (`always`/`never`/`cost_based`/`strict`/`hinted`) | not implemented |
 | Column histograms | `pg_stats` (always maintained) | opt-in `COLUMN_STATISTICS` |
-| Log-based CDC (future) | logical replication / `pgoutput` (planned) | binlog (planned) |
+| Log-based CDC | out of scope | out of scope |
 
 ---
 
@@ -107,7 +108,7 @@ Three rules apply to both dialects:
 2. **Never widen silently to `Utf8`.** Falling back to a string for anything unrecognized produces
    a pipeline that "works" and a warehouse full of strings that nobody can aggregate. On Postgres
    an unmapped type is an `UnsupportedType` error before the scan starts. A per-column `cast_to`
-   escape hatch in the job spec is **NOT IMPLEMENTED** — and the MySQL prototype currently
+   escape hatch in the job spec is not implemented — and the MySQL prototype currently
    violates this rule (types outside its mapping table fall back to `Utf8`; see
    [mysql.md](mysql.md)), which must be fixed when the prototype is promoted.
 
@@ -116,8 +117,8 @@ Three rules apply to both dialects:
    column's `Decimal128` precision or scale (unconstrained `numeric` maps to
    `Decimal128(38, 10)`) fail the scan with `ExtractorError::UnsupportedValue` naming the
    column, on both the cursor and the COPY path. A configurable
-   `on_unrepresentable = "error" | "null"` (with a `rel_null_coerced_total` counter) is **NOT
-   IMPLEMENTED**.
+   `on_unrepresentable = "error" | "null"` (with a `rel_null_coerced_total` counter) is not
+   implemented.
 
 Per-dialect mapping tables live in each connector document.
 
@@ -130,10 +131,10 @@ production database. It is off by default and opt-in per job.
 
 | Strategy | Mechanism | Notes |
 | --- | --- | --- |
-| `keyset` | `pk >= :a AND pk < :b`, bounds split evenly over `[MIN(pk), MAX(pk)]` (first partition also takes `pk IS NULL`, last is open-ended) | Works everywhere; skewed if the key is not uniform. Histogram-derived bounds are **not implemented**. Postgres only today (the MySQL prototype is serial). |
-| `ctid` | Postgres `ctid` ranges over `relpages` | Fastest and evenly sized; only valid within one snapshot. Postgres only. **Exported snapshots not implemented.** |
-| `modulo` | `hash(pk) % n = i` | **NOT IMPLEMENTED** |
-| `native` | one partition per declarative table partition | **NOT IMPLEMENTED** |
+| `keyset` | `pk >= :a AND pk < :b`, bounds split evenly over `[MIN(pk), MAX(pk)]` (first partition also takes `pk IS NULL`, last is open-ended) | Works everywhere; skewed if the key is not uniform. Histogram-derived bounds are not implemented. Postgres only (the MySQL prototype is serial). |
+| `ctid` | Postgres `ctid` ranges over `relpages` | Fastest and evenly sized; only exact within one snapshot, and exported snapshots are not implemented. Postgres only. |
+| `modulo` | `hash(pk) % n = i` | Not implemented |
+| `native` | one partition per declarative table partition | Not implemented |
 
 The connection pool caps concurrency regardless of the requested partition count, and the pool is
 sized deliberately small for production sources. The failure mode we are avoiding is an extraction
@@ -150,11 +151,17 @@ production incident:
   slow query.
 - **Idle-in-transaction timeout is always set** (Postgres). A forgotten open transaction blocks
   Postgres autovacuum and pins undo log on other engines.
-- **Connections are identifiable.** `application_name` / connection attributes carry the job id, so
-  a DBA looking at `pg_stat_activity` or `performance_schema` can attribute every query.
+- **Connections and queries are identifiable.** Postgres connections set `application_name`
+  (`source.application_name`, default `el-ballista`). Every scan query starts with a SQL
+  comment tag (`connector::query_tag`), e.g.
+  `/* rust-extract query_id=q_… pipeline=el-ballista run_id=r_… strategy=full+pushdown partition=3/8 */`:
+  `pipeline` is the `application_name`, `run_id` is shared by every query of one run, and
+  `query_id` is fresh per query. A DBA looking at `pg_stat_activity` or the server log can
+  attribute every scan. The job id itself is not in either; give each job its
+  own `application_name` to tell jobs apart.
 - **Session settings are explicit.** Postgres pools set `TIME ZONE 'UTC'`, `statement_timeout`,
   `idle_in_transaction_session_timeout = '60s'` and `lock_timeout = '5s'` on every connection.
-  Read-only transactions are **not** set yet (the scans only `SELECT`/`COPY TO`).
+  Read-only transactions are not set (the scans only `SELECT`/`COPY TO`).
 - **Failures are recorded per split, retry is orchestrator-driven.** A failed split is marked
   `Failed` with its error without touching completed splits; re-running the job skips
   completed splits and retries the rest. There is no in-layer retry-with-backoff and no
@@ -164,10 +171,7 @@ production incident:
 
 ## 7. Adding a connector later
 
-Beyond Postgres, the SPI is deliberately shaped to accommodate sources that are *not*
-SQL databases, because that is where cross-source joins get interesting. A key-value or wide-column
-store declares `filter_pushdown: partition-key-only`, `ParallelScan::CtidRange` over token ranges,
-and `SnapshotSupport::None`; an object store declares full projection pushdown, statistics-based
-`Inexact` filtering, and effortless parallelism. Neither has been designed in detail, and neither
-should be started before the PostgreSQL connector is complete — the SPI is only proven once two
-genuinely different implementations sit behind it.
+A non-SQL source (a key-value store, an object store) would declare different capabilities:
+pushdown limited to what the source can evaluate exactly, its own split mechanism, and possibly
+no snapshot at all. None has been designed, and the SPI is only proven once two genuinely
+different implementations sit behind it.

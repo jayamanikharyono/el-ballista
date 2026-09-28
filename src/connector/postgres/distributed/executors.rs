@@ -1,4 +1,4 @@
-//! Remote-deployment check for the source connection budget (review S1).
+//! Remote-deployment check for the source connection budget.
 //!
 //! `pool_max` is split as `pool_max / workers` per executing process, so the budget only
 //! holds if exactly `workers` executor processes are registered with the scheduler. The
@@ -15,7 +15,8 @@
 //!   then simply not verified, as before.
 //!
 //! The request is a single plain-HTTP `GET` over a `TcpStream` with a short timeout, so no
-//! HTTP-client dependency is needed. `https://` scheduler URLs are not probed.
+//! HTTP-client dependency is needed. `https://` scheduler URLs are not probed. The same
+//! minimal client ([`rest_call`]) serves the job watchdog ([`super::watchdog`]).
 
 use std::time::Duration;
 
@@ -86,30 +87,46 @@ pub(crate) fn check_budget(
 /// Query `GET {scheduler_url}/api/executors`. `Ok(None)` means "could not verify" (https,
 /// unreachable, REST disabled, unexpected body); only a well-formed listing is `Some`.
 pub(crate) async fn fetch_registered_executors(scheduler_url: &str) -> Option<RegisteredExecutors> {
-    let Some(authority) = scheduler_url
-        .strip_prefix("http://")
-        .map(|rest| rest.split('/').next().unwrap_or(rest))
-        .filter(|a| !a.is_empty())
-    else {
+    let Some(authority) = rest_authority(scheduler_url) else {
         log::warn!("scheduler URL {scheduler_url:?} is not plain http://; executors not verified");
         return None;
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, http_get(authority, "/api/executors")).await {
-        Ok(Ok(body)) => match parse_executors(&body) {
+    match rest_call(authority, "GET", "/api/executors").await {
+        Ok(body) => match parse_executors(&body) {
             Ok(executors) => Some(executors),
             Err(e) => {
                 log::warn!("scheduler REST /api/executors: unexpected response ({e})");
                 None
             }
         },
-        Ok(Err(e)) => {
+        Err(e) => {
             log::warn!("scheduler REST /api/executors unavailable ({e}); executors not verified");
             None
         }
-        Err(_) => {
-            log::warn!("scheduler REST /api/executors timed out; executors not verified");
-            None
-        }
+    }
+}
+
+/// `http://host:port[/…]` → `host:port`; `None` for anything but a plain-http URL.
+pub(crate) fn rest_authority(scheduler_url: &str) -> Option<&str> {
+    scheduler_url
+        .strip_prefix("http://")
+        .map(|rest| rest.split('/').next().unwrap_or(rest))
+        .filter(|a| !a.is_empty())
+}
+
+/// One scheduler REST request (`GET`, or `PATCH` to cancel a job) bounded by
+/// [`PROBE_TIMEOUT`]; returns the body of a `2xx` response.
+pub(crate) async fn rest_call(
+    authority: &str,
+    method: &str,
+    path: &str,
+) -> std::io::Result<Vec<u8>> {
+    match tokio::time::timeout(PROBE_TIMEOUT, http_request(authority, method, path)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{method} {path} timed out after {PROBE_TIMEOUT:?}"),
+        )),
     }
 }
 
@@ -143,10 +160,10 @@ pub(crate) async fn verify_remote_executors(
     }
 }
 
-async fn http_get(authority: &str, path: &str) -> std::io::Result<Vec<u8>> {
+async fn http_request(authority: &str, method: &str, path: &str) -> std::io::Result<Vec<u8>> {
     let mut stream = tokio::net::TcpStream::connect(authority).await?;
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
@@ -164,7 +181,7 @@ async fn http_get(authority: &str, path: &str) -> std::io::Result<Vec<u8>> {
     http_body(&response).map_err(std::io::Error::other)
 }
 
-/// Extract the body of a `200` HTTP/1.1 response (identity or chunked encoding).
+/// Extract the body of a `2xx` HTTP/1.1 response (identity or chunked encoding).
 fn http_body(response: &[u8]) -> Result<Vec<u8>, String> {
     let split = response
         .windows(4)
@@ -173,7 +190,11 @@ fn http_body(response: &[u8]) -> Result<Vec<u8>, String> {
     let head = std::str::from_utf8(&response[..split]).map_err(|_| "non-UTF-8 headers")?;
     let body = &response[split + 4..];
     let status_line = head.lines().next().unwrap_or_default();
-    if status_line.split_whitespace().nth(1) != Some("200") {
+    if !status_line
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code.len() == 3 && code.starts_with('2'))
+    {
         return Err(format!("status {status_line:?}"));
     }
     let chunked = head.lines().any(|l| {

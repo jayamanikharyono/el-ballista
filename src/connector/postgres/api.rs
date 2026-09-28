@@ -32,8 +32,9 @@
 //!     .await?;
 //! println!("{} rows, {} splits skipped", outcome.rows_delivered, outcome.splits_skipped);
 //!
-//! // Distributed over Ballista (defaults to the configured / standard scheduler URL).
-//! let rows = connector.extract().distributed().in_process().workers(4).collect().await?;
+//! // Distributed over a running Ballista cluster (`rel scheduler` + `rel worker`s); the
+//! // endpoint defaults to the configured / standard scheduler URL.
+//! let rows = connector.extract().distributed().workers(4).collect().await?;
 //! # let _ = rows; Ok(()) }
 //! ```
 
@@ -167,8 +168,9 @@ impl<'a> ExtractBuilder<'a> {
 
     /// Distributed extraction over Ballista. The scheduler endpoint defaults to the config's
     /// `distributed.scheduler_url`, or [`DEFAULT_SCHEDULER_URL`] when that is empty; override with
-    /// [`DistributedExtraction::scheduler`] or run a local cluster with
-    /// [`DistributedExtraction::in_process`].
+    /// [`DistributedExtraction::scheduler`]. A running cluster (`rel scheduler` + `rel worker`
+    /// processes) is required; single-process extraction is [`Self::standalone`] (plain
+    /// DataFusion, no Ballista).
     ///
     /// # Examples
     ///
@@ -193,15 +195,15 @@ impl<'a> ExtractBuilder<'a> {
         };
         DistributedExtraction {
             pipeline: self.pipeline,
-            scheduler: Some(scheduler),
+            scheduler,
             workers: None,
         }
     }
 }
 
-/// A single-node extraction, ready for a terminal. Splits are the keyset partitions of
-/// `parallel_scan` (or one whole-table split), scanned at most
-/// `min(execution.concurrent_partitions, source pool size)` at a time.
+/// A single-node extraction — plain DataFusion, no Ballista — ready for a terminal. Splits are
+/// the keyset partitions of `parallel_scan` (or one whole-table split), scanned at most
+/// `execution.concurrent_partitions` at a time (default: the whole `pool_max`, never more).
 #[must_use = "an extraction does nothing until a terminal (collect/stream/run/run_with) is awaited"]
 pub struct StandaloneExtraction<'a> {
     pipeline: &'a Pipeline,
@@ -266,8 +268,11 @@ impl StandaloneExtraction<'_> {
     /// to `consumer` (up to `concurrency` splits at a time, so `consumer` must be `Fn`); a
     /// split is recorded **Completed only after `consumer` returns `Ok` having read its
     /// stream to the end**. A consumer error (or an unread / error-swallowed stream) records
-    /// the split Failed with that error; other splits continue, and the run then returns
-    /// [`AppError::SplitsFailed`] listing the failed split ids. A retry with the same config
+    /// the split Failed with that error; other splits continue, and the run then fails with
+    /// [`AppError::SplitsFailed`] listing the failed split ids. Every failure of a run that
+    /// started comes wrapped in [`AppError::RunFailed`], which carries the run's id and report
+    /// (match on [`AppError::underlying`]); the returned [`RunOutcome`] carries them on
+    /// success. A lock refusal is not wrapped: that run never started. A retry with the same config
     /// skips completed splits and re-scans the others with their stored bounds; a changed
     /// plan (filters, table, projection, partitioning) is a
     /// [`CheckpointError::PlanMismatch`](crate::checkpoint::CheckpointError::PlanMismatch).
@@ -311,8 +316,8 @@ impl StandaloneExtraction<'_> {
 #[must_use = "an extraction does nothing until a terminal (collect/stream/run/run_with) is awaited"]
 pub struct DistributedExtraction<'a> {
     pipeline: &'a Pipeline,
-    /// `Some(url)` connects to that scheduler; `None` spins up an in-process cluster.
-    scheduler: Option<String>,
+    /// The scheduler endpoint to connect to.
+    scheduler: String,
     workers: Option<usize>,
 }
 
@@ -336,22 +341,7 @@ impl DistributedExtraction<'_> {
     /// # let _ = outcome; Ok(()) }
     /// ```
     pub fn scheduler(mut self, url: impl Into<String>) -> Self {
-        self.scheduler = Some(url.into());
-        self
-    }
-
-    /// Run an in-process Ballista cluster instead of connecting to an external scheduler.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
-    /// let batches = connector.extract().distributed().in_process().collect().await?;
-    /// # let _ = batches; Ok(()) }
-    /// ```
-    pub fn in_process(mut self) -> Self {
-        self.scheduler = None;
+        self.scheduler = url.into();
         self
     }
 
@@ -363,7 +353,7 @@ impl DistributedExtraction<'_> {
     /// ```no_run
     /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
     /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
-    /// let outcome = connector.extract().distributed().in_process().workers(3).run().await?;
+    /// let outcome = connector.extract().distributed().workers(3).run().await?;
     /// # let _ = outcome; Ok(()) }
     /// ```
     pub fn workers(mut self, workers: usize) -> Self {
@@ -386,7 +376,7 @@ impl DistributedExtraction<'_> {
     /// ```no_run
     /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
     /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
-    /// let batches = connector.extract().distributed().in_process().collect().await?;
+    /// let batches = connector.extract().distributed().collect().await?;
     /// # let _ = batches; Ok(()) }
     /// ```
     pub async fn collect(self) -> Result<Vec<RecordBatch>, AppError> {
@@ -400,7 +390,7 @@ impl DistributedExtraction<'_> {
     /// ```no_run
     /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
     /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
-    /// let stream = connector.extract().distributed().in_process().stream().await?;
+    /// let stream = connector.extract().distributed().stream().await?;
     /// # let _ = stream; Ok(()) }
     /// ```
     pub async fn stream(self) -> Result<SendableRecordBatchStream, AppError> {
@@ -414,7 +404,7 @@ impl DistributedExtraction<'_> {
     /// ```no_run
     /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
     /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
-    /// let counted = connector.extract().distributed().in_process().run().await?;
+    /// let counted = connector.extract().distributed().run().await?;
     /// # let _ = counted; Ok(()) }
     /// ```
     pub async fn run(self) -> Result<RunOutcome, AppError> {
@@ -434,7 +424,6 @@ impl DistributedExtraction<'_> {
     /// let outcome = connector
     ///     .extract()
     ///     .distributed()
-    ///     .in_process()
     ///     .run_with(|_split, mut stream| async move {
     ///         // Consume batch by batch (bounded memory); hand each to your sink here.
     ///         while let Some(batch) = stream.try_next().await? {
@@ -466,20 +455,18 @@ mod tests {
         let connector =
             PostgresConnector::from_config_file("examples/configs/extract.example.json").unwrap();
         let dist = connector.extract().distributed();
-        assert_eq!(dist.scheduler.as_deref(), Some(DEFAULT_SCHEDULER_URL));
+        assert_eq!(dist.scheduler, DEFAULT_SCHEDULER_URL);
     }
 
     #[test]
-    fn scheduler_and_in_process_override_the_default() {
+    fn scheduler_overrides_the_default() {
         let connector =
             PostgresConnector::from_config_file("examples/configs/extract.example.json").unwrap();
         let dist = connector
             .extract()
             .distributed()
             .scheduler("http://sched:50050");
-        assert_eq!(dist.scheduler.as_deref(), Some("http://sched:50050"));
-        let local = connector.extract().distributed().in_process();
-        assert!(local.scheduler.is_none());
+        assert_eq!(dist.scheduler, "http://sched:50050");
     }
 
     #[test]

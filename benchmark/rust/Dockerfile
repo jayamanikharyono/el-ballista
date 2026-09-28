@@ -73,8 +73,6 @@ ENV BENCH_ROLE=bench \
     BENCH_WORKERS=2 \
     BENCH_CONCURRENT_TASKS= \
     BENCH_OUTPUT=/output/orders.parquet \
-    BENCH_FILTER= \
-    BENCH_COLUMNS= \
     BENCH_SCENARIO=full \
     BENCH_SCHEDULER_URL=
 
@@ -84,5 +82,5 @@ ENTRYPOINT ["sh", "-c", "case \"$BENCH_ROLE\" in \
   worker) args=\"worker --scheduler-url $BENCH_SCHEDULER_URL --bind-host 0.0.0.0 --external-host $(hostname)\"; \
     if [ -n \"$BENCH_CONCURRENT_TASKS\" ]; then args=\"$args --concurrent-tasks $BENCH_CONCURRENT_TASKS\"; fi; \
     exec rel $args;; \
-  *) exec bench \"$BENCH_CONFIG\" \"$BENCH_WORKERS\" \"$BENCH_OUTPUT\" \"$BENCH_FILTER\" \"$BENCH_COLUMNS\" \"$BENCH_SCENARIO\";; \
+  *) exec bench \"$BENCH_CONFIG\" \"$BENCH_WORKERS\" \"$BENCH_OUTPUT\" \"$BENCH_SCENARIO\";; \
 esac"]

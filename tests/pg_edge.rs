@@ -76,6 +76,7 @@ fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
         distributed: DistributedConfig {
             scheduler_url: String::new(),
             workers: 1,
+            ..DistributedConfig::default()
         },
     }
 }

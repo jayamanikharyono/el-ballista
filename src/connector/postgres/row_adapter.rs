@@ -493,7 +493,13 @@ struct ColumnDecoder {
 pub struct RowBatchBuilder {
     schema: Arc<Schema>,
     columns: Vec<ColumnDecoder>,
+    /// Rows reserved in each fresh set of builders: the rows a batch is expected to hold
+    /// before a flush cap is hit (see [`Self::next_capacity`]).
     capacity: usize,
+    /// Row cap of a batch (`batch_size`); `capacity` never exceeds it.
+    max_rows: usize,
+    /// Byte cap of a batch (`max_batch_bytes`), used to size `capacity`.
+    max_batch_bytes: usize,
     row_count: usize,
     /// Sum of [`ColumnBuilder::fixed_width`] over columns: bytes every row adds.
     fixed_row_bytes: usize,
@@ -529,30 +535,54 @@ impl RowBatchBuilder {
         Self::with_capacity(table_metadata, 1024)
     }
 
-    /// Create a builder pre-sized for `capacity` rows. Extraction loops pass their
-    /// `batch_size`.
+    /// Create a builder pre-sized for `capacity` rows, with no byte cap.
     pub(crate) fn with_capacity(
         table_metadata: &TableMetadata,
         capacity: usize,
     ) -> Result<Self, ExtractorError> {
+        Self::for_batches(table_metadata, capacity, usize::MAX)
+    }
+
+    /// Create a builder for batches capped at `batch_size` rows **and** `max_batch_bytes`
+    /// bytes (extraction loops pass both). Builders reserve room only for the rows a batch
+    /// is expected to hold before either cap flushes it — not blindly `batch_size` rows:
+    /// on a wide table the byte cap flushes long before `batch_size`, and capacity reserved
+    /// beyond that stays allocated inside every finished batch (Arrow buffers keep their
+    /// capacity), multiplying memory by `batch_size / rows actually held`.
+    pub(crate) fn for_batches(
+        table_metadata: &TableMetadata,
+        batch_size: usize,
+        max_batch_bytes: usize,
+    ) -> Result<Self, ExtractorError> {
         let schema = PostgresRowAdapter::build_arrow_schema(table_metadata)?;
-        let columns = schema
+        let mut columns = schema
             .fields()
             .iter()
             .map(|field| {
                 Ok(ColumnDecoder {
                     name: field.name().clone(),
                     data_type: field.data_type().clone(),
-                    builder: ColumnBuilder::new(field.data_type(), capacity, 1024)?,
+                    // Placeholder; replaced below once the row width is known.
+                    builder: ColumnBuilder::new(field.data_type(), 0, 0)?,
                     var_bytes: 0,
                 })
             })
             .collect::<Result<Vec<_>, ExtractorError>>()?;
-        let fixed_row_bytes = columns.iter().map(|c| c.builder.fixed_width()).sum();
+        let fixed_row_bytes: usize = columns.iter().map(|c| c.builder.fixed_width()).sum();
+        let max_rows = batch_size.max(1);
+        let max_batch_bytes = max_batch_bytes.max(1);
+        // Before the first batch only the fixed width is known: an upper bound on the rows
+        // that fit (variable-width payload only lowers it); `finish()` refines it.
+        let capacity = Self::rows_within(max_rows, max_batch_bytes, fixed_row_bytes);
+        for col in &mut columns {
+            col.builder = ColumnBuilder::new(&col.data_type, capacity, 1024)?;
+        }
         Ok(Self {
             schema,
             columns,
             capacity,
+            max_rows,
+            max_batch_bytes,
             row_count: 0,
             fixed_row_bytes,
             var_bytes: 0,
@@ -696,15 +726,57 @@ impl RowBatchBuilder {
         Ok(())
     }
 
-    /// Finish the batch in progress and reset for the next one. Builders are re-created
-    /// with `capacity` rows (and the last batch's payload size) reserved.
+    /// Rows that fit under both caps at `bytes_per_row`, plus 1/8 headroom so a batch of
+    /// slightly narrower rows does not trigger a doubling reallocation; never above
+    /// `max_rows`, never 0.
+    fn rows_within(max_rows: usize, max_batch_bytes: usize, bytes_per_row: usize) -> usize {
+        let fit = max_batch_bytes / bytes_per_row.max(1);
+        fit.saturating_add(fit / 8)
+            .saturating_add(1)
+            .min(max_rows)
+            .max(1)
+    }
+
+    /// Capacity for the next batch, from the measured width of the batch just built.
+    /// Width per row does not depend on how many rows the batch held, so a short final or
+    /// window-end batch still gives a good estimate.
+    fn next_capacity(&self) -> usize {
+        if self.row_count == 0 {
+            return self.capacity;
+        }
+        let bytes_per_row = self.estimated_bytes().div_ceil(self.row_count);
+        Self::rows_within(self.max_rows, self.max_batch_bytes, bytes_per_row)
+    }
+
+    /// Rows reserved in each fresh set of column builders.
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Finish the batch in progress and reset for the next one. The finished arrays are
+    /// shrunk to their contents; builders are re-created sized for the rows the next batch
+    /// is expected to hold (see [`Self::for_batches`]), with each column's payload scaled
+    /// to that row count.
     pub(crate) fn finish(&mut self) -> Result<RecordBatch, ExtractorError> {
+        let next = self.next_capacity();
+        let rows = self.row_count.max(1);
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.columns.len());
         for col in &mut self.columns {
-            arrays.push(col.builder.finish());
-            col.builder = ColumnBuilder::new(&col.data_type, self.capacity, col.var_bytes)?;
+            let mut array = col.builder.finish();
+            // Release reserved-but-unused buffer capacity (an in-place realloc, no copy).
+            // Without it a batch that flushed on the byte cap below its reservation — e.g.
+            // the first batch of a scan, sized before any row width was measured — would
+            // carry that unused capacity downstream for as long as it is buffered.
+            if let Some(exclusive) = Arc::get_mut(&mut array) {
+                exclusive.shrink_to_fit();
+            }
+            arrays.push(array);
+            let payload = col.var_bytes.saturating_mul(next) / rows;
+            col.builder = ColumnBuilder::new(&col.data_type, next, payload)?;
             col.var_bytes = 0;
         }
+        self.capacity = next;
 
         // A zero-column projection (e.g. `COUNT(*)`, which only needs row counts)
         // carries its row count explicitly: `try_new` rejects empty column lists.
@@ -790,6 +862,73 @@ mod tests {
         let second = b.finish().unwrap();
         assert_eq!(second.num_rows(), 1);
         assert!(second.column(1).is_null(0));
+    }
+
+    /// Fill one batch the way the extraction loops do: append rows until `should_flush`.
+    fn fill_until_flush(b: &mut RowBatchBuilder, batch_size: usize, cap: usize, payload: &[u8]) {
+        let mut i = 0i64;
+        while !b.should_flush(batch_size, cap) {
+            b.append_copy_field(0, Some(&i.to_be_bytes())).unwrap();
+            b.append_copy_field(1, Some(payload)).unwrap();
+            b.inc_row();
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn test_capacity_follows_the_byte_cap_not_batch_size() {
+        // A wide row (8-byte id + 4-byte offset + 188-byte text = 200 B) under a 1 MiB cap
+        // flushes at ~5,243 rows, far below batch_size = 256,000. Builders must not reserve
+        // 256,000 rows: that capacity would ride along in every finished batch.
+        let meta = table(vec![col("a", "bigint"), col("s", "text")]);
+        let (batch_size, cap) = (256_000, 1 << 20);
+        let payload = [b'x'; 188];
+        let mut b = RowBatchBuilder::for_batches(&meta, batch_size, cap).unwrap();
+        // Before any data only the fixed width (12 B) is known: an upper bound, < batch_size.
+        assert!(b.capacity() < batch_size);
+
+        fill_until_flush(&mut b, batch_size, cap, &payload);
+        let first = b.finish().unwrap();
+        let rows = first.num_rows();
+        assert_eq!(rows, cap.div_ceil(200));
+        // Next batch: sized for what fits (+1/8 headroom), not batch_size.
+        assert!(
+            b.capacity() >= rows && b.capacity() <= rows + rows / 8 + 2,
+            "{}",
+            b.capacity()
+        );
+
+        fill_until_flush(&mut b, batch_size, cap, &payload);
+        let second = b.finish().unwrap();
+        assert_eq!(second.num_rows(), rows);
+        // Allocated memory stays close to the cap (payload + headroom), where reserving
+        // batch_size rows used to add 256,000 x 12 B of fixed-width capacity (~3 MiB).
+        let allocated = second.get_array_memory_size();
+        assert!(
+            allocated < 2 * cap,
+            "second batch holds {allocated} bytes for a {cap}-byte cap"
+        );
+    }
+
+    #[test]
+    fn test_capacity_is_batch_size_when_the_row_cap_binds() {
+        // Narrow rows under a generous byte cap: the row cap flushes first, so the builder
+        // keeps reserving exactly batch_size rows.
+        let meta = table(vec![col("a", "bigint"), col("s", "text")]);
+        let (batch_size, cap) = (4_096, 16 << 20);
+        let mut b = RowBatchBuilder::for_batches(&meta, batch_size, cap).unwrap();
+        assert_eq!(b.capacity(), batch_size);
+        fill_until_flush(&mut b, batch_size, cap, b"xyz");
+        assert_eq!(b.finish().unwrap().num_rows(), batch_size);
+        assert_eq!(b.capacity(), batch_size);
+        // A short final batch does not shrink it: width per row, not row count, decides.
+        for i in 0..10i64 {
+            b.append_copy_field(0, Some(&i.to_be_bytes())).unwrap();
+            b.append_copy_field(1, Some(b"xyz")).unwrap();
+            b.inc_row();
+        }
+        assert_eq!(b.finish().unwrap().num_rows(), 10);
+        assert_eq!(b.capacity(), batch_size);
     }
 
     #[test]

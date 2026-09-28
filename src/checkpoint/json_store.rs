@@ -463,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_different_filter_is_a_plan_mismatch_not_a_skip() {
-        // B2 scenario A: same job, new filter -> typed error, never "already completed".
+        // Scenario A: same job, new filter -> typed error, never "already completed".
         let (store, dir) = test_store();
         let key = job("orders");
         let first = plan("id > 8", &[("split-0", None)]);
@@ -491,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_fingerprint_requires_the_stored_bounds() {
-        // B2 scenario B: bounds recomputed after the table grew must not be accepted in
+        // Scenario B: bounds recomputed after the table grew must not be accepted in
         // place of the stored ones.
         let (store, dir) = test_store();
         let key = job("orders");

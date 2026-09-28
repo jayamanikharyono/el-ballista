@@ -67,6 +67,13 @@ pub enum ExtractorError {
         source: std::sync::Arc<ExtractorError>,
     },
 
+    /// A distributed job stayed hung (a worker died or stopped heartbeating, or the job
+    /// passed `distributed.job_timeout_secs`) through every allowed attempt, or hung after it
+    /// had already delivered rows (which cannot be re-run without duplicating them). Each hung
+    /// attempt was cancelled on the scheduler.
+    #[error("distributed job aborted after {attempts} attempt(s): {reason}")]
+    DistributedJobAborted { attempts: u32, reason: String },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

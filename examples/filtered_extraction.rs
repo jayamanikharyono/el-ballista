@@ -1,8 +1,8 @@
 //! Filtered Extraction Example
 //!
 //! Demonstrates filtered extraction with caller-provided predicates: the
-//! orchestrator decides WHAT range to extract (here a time range plus a status
-//! predicate), and the extraction layer decides HOW to extract it efficiently
+//! orchestrator decides WHAT range to extract (here a one-week `payment_date` window plus a
+//! customer range and an amount predicate), and the extraction layer decides HOW to extract it efficiently
 //! (pushing the predicates to the source through DataFusion pushdown).
 //!
 //! This is how incremental and backfill use cases are expressed without any
@@ -30,14 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("═══════════════════════════════════════════════════════════\n");
 
     // 1. Load the job spec. Its `filters` are the orchestrator-supplied slice —
-    // a selective predicate plus an incremental-style time range, in structured
+    // an incremental-style time window plus two more predicates, in structured
     // form (typed values, no re-parsing):
-    //   { "column": "status", "op": "=", "value": "PAID" }
+    //   { "column": "payment_date", "op": ">=", "value": "2007-04-06T00:00:00Z" }
     // No watermark state, no backfill orchestration — just filters.
     println!("► Step 1: Job spec + caller-provided filters");
     let config = JobConfig::from_file("examples/configs/extract.example.json")?;
     println!("  Table: {}", config.resolved_table());
-    println!("  Filters: {:?}", config.filters);
+    println!("  Filters: {} (decisions below)", config.filters.len());
 
     // 2. Preview pushdown decisions before extracting.
     println!("\n► Step 2: Preview pushdown decisions");

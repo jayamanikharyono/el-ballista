@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn non_utf8_server_downgrades_text_ordering() {
-        // B1: COLLATE "C" orders server-encoded bytes, equal to Arrow's UTF-8 order only on
+        // COLLATE "C" orders server-encoded bytes, equal to Arrow's UTF-8 order only on
         // a UTF8 server; elsewhere only equality may push.
         let table = TableMetadata {
             schema_name: "public".into(),

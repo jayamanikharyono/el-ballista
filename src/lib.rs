@@ -4,6 +4,7 @@ pub mod config;
 pub mod connector;
 pub mod errors;
 pub mod logging;
+pub mod run_report;
 pub mod telemetry;
 pub mod types;
 

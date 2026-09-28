@@ -159,8 +159,8 @@ carries one `(col = 0)` marker per `DATE`/`DATETIME`/`TIMESTAMP` column and a ze
 A real NULL stays NULL. *(Design, not implemented:)* an opt-in policy that maps them to null,
 incrementing `rel_null_coerced_total{reason="zero_date"}`. Legacy
 schemas frequently use `0000-00-00` as a "no value" sentinel, so this counter is often non-zero
-on the first run against an old database — which is exactly the moment you want to know about
-it rather than discover it in a warehouse query six weeks later.
+on the first run against an old database — which is exactly the moment to learn about
+it, rather than discovering it in a warehouse query six weeks later.
 
 **Out-of-range `TIME`.** Values beyond ±24h are legal and are why the mapping is `Duration`
 (implemented).
@@ -175,14 +175,14 @@ case-insensitive, so `WHERE status = 'PAID'` matches `'paid'` in MySQL and not i
 design, every string predicate on a `_ci` or `_ai` column is pushed as **`Inexact`**, never
 `Exact`. *(Pushdown is not implemented for MySQL; `MysqlDialect` currently rates every text or
 float comparison `Inexact` without looking at the collation.)*
-This is covered in full in [pushdown §3.1](../pushdown.md#31-string-collation--the-big-one) and it
+This is covered in full in [pushdown §3.1](../pushdown.md#31-string-collation) and it
 is the single most likely way to get silently wrong results from this connector.
 
 ---
 
 ## 4. Time zones
 
-`DATETIME` stores what you wrote. `TIMESTAMP` is stored as UTC and converted to and from the
+`DATETIME` stores what was written. `TIMESTAMP` is stored as UTC and converted to and from the
 session `time_zone` on every read and write. A pipeline that does not pin the session time zone
 produces different data when the server's default changes, when it reads from a replica configured
 differently, or when DST shifts.
@@ -196,8 +196,6 @@ deliberately `Timestamp(µs, None)` rather than a lie about UTC, and interpretin
 modeling decision for the warehouse, not something the extractor should guess.
 
 ---
-
-> **Scope note:** watermark anchoring is deferred — see [deferred/incremental-extraction.md](../deferred/incremental-extraction.md). Ranges are caller-provided.
 
 ## 5. Consistency notes
 
@@ -373,7 +371,7 @@ connector reduces the partition count to 1 and logs the reason rather than issui
 unbalanced queries.
 
 Combine with §5.1: parallel scanning also costs snapshot consistency on MySQL, so the default is
-serial and parallelism is something you turn on knowingly.
+serial and parallelism is something to turn on knowingly.
 
 ---
 
@@ -390,4 +388,4 @@ from timestamp-based to log-based extraction is a checkpoint conversion rather t
 The operational hazard mirrors Postgres' replication slot problem in a different form: binlog
 retention (`binlog_expire_logs_seconds`) is finite, so a consumer that falls behind past retention
 cannot resume and must re-snapshot. Lag monitoring against retention is a prerequisite, not a
-follow-up. Deferred past Phase 3.
+follow-up.

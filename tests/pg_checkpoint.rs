@@ -20,16 +20,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{TEST_PASSWORD_ENV, TestDb};
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::TryStreamExt;
-use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-use rust_ballista_extraction_layer::checkpoint::{CheckpointError, CheckpointStore, SplitState};
-use rust_ballista_extraction_layer::config::{
+use el_ballista::checkpoint::json_store::JsonCheckpointStore;
+use el_ballista::checkpoint::{CheckpointError, CheckpointStore, SplitState};
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
     ParallelScanConfig, ParallelStrategy, PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::pipeline::SplitInfo;
-use rust_ballista_extraction_layer::errors::{AppError, ConsumerError};
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::pipeline::SplitInfo;
+use el_ballista::errors::{AppError, ConsumerError};
+use futures::TryStreamExt;
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
@@ -440,9 +440,7 @@ async fn b3_undrained_stream_does_not_complete_the_split() -> R {
 /// consumer's failure, the checkpoint's skipped splits, the delivered row counts).
 #[tokio::test]
 async fn run_reports_record_every_attempt() -> R {
-    use rust_ballista_extraction_layer::run_report::{
-        RunKind, RunMode, RunStatus, SplitOutcome, list_reports,
-    };
+    use el_ballista::run_report::{RunKind, RunMode, RunStatus, SplitOutcome, list_reports};
 
     let db = TestDb::connect().await;
     setup_table(&db, 30).await;
@@ -576,7 +574,7 @@ async fn run_reports_record_every_attempt() -> R {
 /// `run_reports: false` turns `run_with` reports off. Oracle: the files on disk.
 #[tokio::test]
 async fn run_report_switches() -> R {
-    use rust_ballista_extraction_layer::run_report::{RunKind, RunStatus, list_reports, runs_dir};
+    use el_ballista::run_report::{RunKind, RunStatus, list_reports, runs_dir};
 
     let db = TestDb::connect().await;
     setup_table(&db, 10).await;

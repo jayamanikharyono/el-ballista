@@ -212,11 +212,11 @@ issues, and adds plan-time variance that confuses the cost model).
 ### Required privileges
 
 ```sql
-CREATE ROLE rel_extract LOGIN PASSWORD '…';
-GRANT CONNECT ON DATABASE app TO rel_extract;
-GRANT USAGE  ON SCHEMA public TO rel_extract;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO rel_extract;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO rel_extract;
+CREATE ROLE el_ballista LOGIN PASSWORD '…';
+GRANT CONNECT ON DATABASE app TO el_ballista;
+GRANT USAGE  ON SCHEMA public TO el_ballista;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO el_ballista;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO el_ballista;
 ```
 
 ---

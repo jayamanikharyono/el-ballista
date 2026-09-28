@@ -22,7 +22,7 @@ impl AccessMethod {
     ///
     /// # Examples
     /// ```
-    /// use rust_ballista_extraction_layer::pushdown::explain::AccessMethod;
+    /// use el_ballista::pushdown::explain::AccessMethod;
     /// assert!(AccessMethod::IndexScan.is_indexed());
     /// assert!(!AccessMethod::SequentialScan.is_indexed());
     /// ```

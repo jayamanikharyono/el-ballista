@@ -44,9 +44,9 @@ impl ExtractContext {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::engine::ExtractContext;
     ///
     /// let ctx = ExtractContext::from_config(JobConfig::from_file("job.json")?).await?;
     /// let batches = ctx.source("postgres", "public.orders").await?.collect().await?;
@@ -69,9 +69,9 @@ impl ExtractContext {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::engine::ExtractContext;
     /// let ctx = ExtractContext::from_config(JobConfig::from_file("job.json")?).await?;
     /// let orders = ctx.source("postgres", "public.orders").await?;
     /// # let _ = orders; Ok(()) }
@@ -128,9 +128,9 @@ impl ExtractContext {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::engine::ExtractContext;
     /// let ctx = ExtractContext::from_config(JobConfig::from_file("job.json")?).await?;
     /// let _ = ctx.source("postgres", "public.orders").await?;
     /// let df = ctx.sql("SELECT status, count(*) FROM \"public.orders\" GROUP BY status").await?;
@@ -158,8 +158,8 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: rust_ballista_extraction_layer::connector::postgres::engine::SourceDataFrame)
-    /// # -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let paid = orders.filter(col("status").eq(lit("PAID")))?;
     /// # let _ = paid; Ok(()) }
@@ -175,8 +175,8 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: rust_ballista_extraction_layer::connector::postgres::engine::SourceDataFrame)
-    /// # -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let slim = orders.select(vec![col("order_id"), col("amount")])?;
     /// # let _ = slim; Ok(()) }
@@ -192,8 +192,8 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: rust_ballista_extraction_layer::connector::postgres::engine::SourceDataFrame)
-    /// # -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let doubled = orders.with_column("amount2", col("amount") * lit(2))?;
     /// # let _ = doubled; Ok(()) }
@@ -212,8 +212,8 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: rust_ballista_extraction_layer::connector::postgres::engine::SourceDataFrame)
-    /// # -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let first_ten = orders.limit(0, Some(10))?;
     /// # let _ = first_ten; Ok(()) }
@@ -230,8 +230,8 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: rust_ballista_extraction_layer::connector::postgres::engine::SourceDataFrame)
-    /// # -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let batches = orders.filter(col("status").eq(lit("PAID")))?.collect().await?;
     /// # let _ = batches; Ok(()) }
@@ -246,8 +246,8 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: rust_ballista_extraction_layer::connector::postgres::engine::SourceDataFrame)
-    /// # -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// use futures::TryStreamExt;
     /// let mut stream = orders.execute_stream().await?;

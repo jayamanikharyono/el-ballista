@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-El Ballista is an experimental Rust **extraction layer**: `Source DB → Arrow RecordBatch stream → DataFusion`, run in one process (plain DataFusion) or on a Ballista cluster. `rel` below is the `rust-ballista-extraction-layer` binary (`cargo run --release --bin rust-ballista-extraction-layer -- …`).
+El Ballista is an experimental Rust **extraction layer**: `Source DB → Arrow RecordBatch stream → DataFusion`, run in one process (plain DataFusion) or on a Ballista cluster. Commands below run the `el-ballista` binary (`cargo run --release --bin el-ballista -- …`).
 
 Focus: database extraction, Arrow as the data contract, bounded-memory streaming, source-aware pushdown, full/filtered extraction, split checkpoints.
 
@@ -53,7 +53,7 @@ A change is **not done** unless it is correct from **all three** at once:
 - **Schema as code:** one `build_arrow_schema` per connector, used by the provider, the execution plan and the extractor. Never write a `Field` list twice. Empty results still carry the full schema.
 - **Row vs batch errors:** a decode error fails the stream (`Stream<Item = Result<RecordBatch>>`). There is no skip-failed-batch policy; never skip silently.
 - **Checkpoint = commit point:** a split is marked complete only after the consumer acknowledges it (`run_with`); `Drop` cleans up resources, it does not roll back checkpoints.
-- **Metrics per batch, not per row:** `src/telemetry.rs` records `rel_extracted_rows`, `rel_extracted_batches`, `rel_batch_bytes`, `rel_splits`, `rel_pushdown_decisions` through the `metrics` facade. Never per row.
+- **Metrics per batch, not per row:** `src/telemetry.rs` records `el_ballista_extracted_rows`, `el_ballista_extracted_batches`, `el_ballista_batch_bytes`, `el_ballista_splits`, `el_ballista_pushdown_decisions` through the `metrics` facade. Never per row.
 - **Config vs code:** `batch_size`, partitions, `pool_max` live in `ExecutionConfig` / `SourceConfig` / `ParallelScanConfig` and are validated (`batch_size > 0`).
 - **Dependencies:** `arrow` + `datafusion` + `tokio` cover the pipeline. Do not add `polars` / `rayon` unless it replaces a hand-written `RecordBatch` loop.
 - **Capability boundaries:** DB-specific semantics (collation, `NULL` ordering, timestamp precision) belong in the connector. No scattered `if postgres {}` in generic code.
@@ -137,21 +137,21 @@ Assume the table mutates during extraction (concurrent writes, deletes, non-mono
 |---|---|---|
 | Engine | DataFusion only — a plain `SessionContext`, no Ballista | DataFusion planned by the client, executed by Ballista |
 | Entry point | `PostgresConnector::…extract().standalone()`, or `connector::postgres::register_table(&ctx, &config)` into your own `SessionContext` | `…extract().distributed()` (`.scheduler(url)`, `.workers(n)`), or `DistributedContext::remote(&config, url, workers)` + `register_source` |
-| Processes | 1 (the caller's) | client + 1 `rel scheduler` + `workers` × `rel worker` |
-| Required components | none beyond the calling process | a running `rel scheduler` (push-based scheduling, the default); exactly `distributed.workers` running `rel worker` processes — **this crate's binary**, since stock Ballista executors cannot decode the Postgres scan plans; network paths client → scheduler, scheduler ↔ workers, client and workers → source database; the `source.password_env` variable set in **every worker's** environment |
-| Optional | — | the scheduler REST API (on in `rel scheduler`): verifies the executor count against the budget (unreachable = warning, more executors than `workers` = error) and feeds the job watchdog (without it only `distributed.job_timeout_secs` can catch a hang) |
+| Processes | 1 (the caller's) | client + 1 `el-ballista scheduler` + `workers` × `el-ballista worker` |
+| Required components | none beyond the calling process | a running `el-ballista scheduler` (push-based scheduling, the default); exactly `distributed.workers` running `el-ballista worker` processes — **this crate's binary**, since stock Ballista executors cannot decode the Postgres scan plans; network paths client → scheduler, scheduler ↔ workers, client and workers → source database; the `source.password_env` variable set in **every worker's** environment |
+| Optional | — | the scheduler REST API (on in `el-ballista scheduler`): verifies the executor count against the budget (unreachable = warning, more executors than `workers` = error) and feeds the job watchdog (without it only `distributed.job_timeout_secs` can catch a hang) |
 | Failure handling | a failed split is recorded; `run_with` re-runs it on the next call | job watchdog: a worker that stops heartbeating (`distributed.executor_timeout_secs`, default 30) or is dropped, or `job_timeout_secs`, marks the job hung; it is cancelled and re-run up to `distributed.max_retries` (default 2), then `DistributedJobAborted`. Workers heartbeat every `--heartbeat-secs` (5); the scheduler drops them after `--executor-timeout-secs` (30) |
 | Source connections | the whole `pool_max` for the one process (planning included) | `pool_max / workers` per executor process, plus the client's planning pool |
-| Parallelism | DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU); at most `execution.concurrent_partitions` (default `pool_max`) query the source at once | executor task slots (`rel worker --concurrent-tasks`, default: visible CPUs); at most `pool_max / workers` scans per worker query the source |
+| Parallelism | DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU); at most `execution.concurrent_partitions` (default `pool_max`) query the source at once | executor task slots (`el-ballista worker --concurrent-tasks`, default: visible CPUs); at most `pool_max / workers` scans per worker query the source |
 | Checkpoint splits (`run_with`) | one per keyset partition | the whole distributed scan is one split |
-| Benchmark label | `rust-datafusion-standalone` | `rust-ballista-remote` |
+| Benchmark label | `el-ballista-standalone` | `el-ballista-distributed` |
 
 Rules:
 - **Never reintroduce in-process Ballista** (`SessionContext::standalone*`, `new_standalone_scheduler*` / `new_standalone_executor*`, an `in_process()` builder) — not in the library, examples, benchmark or tests. It hard-codes pull scheduling (a 50 ms poll per empty task request) and a second Tokio runtime that splits the connection pool.
-- **Ballista stays behind the boundary:** `ballista*` crates are used only in `src/connector/postgres/distributed/` and the CLI's `rel scheduler` / `rel worker`. Standalone code must not construct or import anything from Ballista.
+- **Ballista stays behind the boundary:** `ballista*` crates are used only in `src/connector/postgres/distributed/` and the CLI's `el-ballista scheduler` / `el-ballista worker`. Standalone code must not construct or import anything from Ballista.
 - **No silent fallback:** `.distributed()` with no reachable cluster is an error. Never degrade to standalone, and never let standalone start a cluster.
-- **A distributed job never hangs:** every distributed query runs under `distributed/watchdog.rs`. Ballista 54 never re-offers a lost executor's tasks, so do not rely on Ballista to recover a job, and never add a distributed terminal that bypasses the watchdog. Re-run only before the first delivered batch (a later re-run would duplicate rows); after that, a hang is an error. Keep `rel worker --heartbeat-secs` well below both timeouts. The benchmark turns the client retry off (`max_retries: 0`) and retries whole attempts on a fresh cluster instead, so no number comes from a degraded cluster.
-- **Tests match the mode:** distributed-path tests run on a real cluster (`tests/common/cluster.rs` starts `rel scheduler` + `rel worker` child processes); standalone tests use plain DataFusion. Do not test one mode through the other.
+- **A distributed job never hangs:** every distributed query runs under `distributed/watchdog.rs`. Ballista 54 never re-offers a lost executor's tasks, so do not rely on Ballista to recover a job, and never add a distributed terminal that bypasses the watchdog. Re-run only before the first delivered batch (a later re-run would duplicate rows); after that, a hang is an error. Keep `el-ballista worker --heartbeat-secs` well below both timeouts. The benchmark turns the client retry off (`max_retries: 0`) and retries whole attempts on a fresh cluster instead, so no number comes from a degraded cluster.
+- **Tests match the mode:** distributed-path tests run on a real cluster (`tests/common/cluster.rs` starts `el-ballista scheduler` + `el-ballista worker` child processes); standalone tests use plain DataFusion. Do not test one mode through the other.
 - **Changing either mode** (entry point, budget, parallelism, required components) means updating this table, the README's "Standalone or distributed" section and the benchmark README in the same change.
 
 **Postgres connector modularization (MANDATORY):** all PostgreSQL-specific code lives under `src/connector/postgres/`, so the rest of the crate stays connector-agnostic.

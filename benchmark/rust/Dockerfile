@@ -1,12 +1,12 @@
 # Benchmark image: the extraction layer as bench client, scheduler, and worker.
 # Build from the repo root so the crate sources are in context:
-#   docker build -f benchmark/rust/Dockerfile -t rel-bench-rust:latest .
+#   docker build -f benchmark/rust/Dockerfile -t el-ballista-bench-rust:latest .
 #
 # Multi-arch base (amd64 + arm64) so Apple-Silicon hosts work unmodified.
 # One image, three roles selected by BENCH_ROLE (bench|scheduler|worker):
 #   bench      full/selective scan client (default)
-#   scheduler  rel scheduler (our Ballista scheduler with Postgres codecs)
-#   worker     rel worker (our Ballista executor with Postgres codecs)
+#   scheduler  el-ballista scheduler (our Ballista scheduler with Postgres codecs)
+#   worker     el-ballista worker (our Ballista executor with Postgres codecs)
 # Stock Ballista binaries can never substitute for scheduler/worker: our scan plans
 # only decode with the compiled-in Postgres codecs.
 #
@@ -56,7 +56,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --locked --release --bins --example bench_full_load && \
     cp /app/target/release/examples/bench_full_load /usr/local/bin/bench && \
-    cp /app/target/release/rust-ballista-extraction-layer /usr/local/bin/rel
+    cp /app/target/release/el-ballista /usr/local/bin/el-ballista
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -65,7 +65,7 @@ RUN apt-get update \
 
 # sqlx uses rustls (static) — no libpq/OpenSSL needed at runtime.
 COPY --from=builder /usr/local/bin/bench /usr/local/bin/bench
-COPY --from=builder /usr/local/bin/rel /usr/local/bin/rel
+COPY --from=builder /usr/local/bin/el-ballista /usr/local/bin/el-ballista
 COPY benchmark/rust/bench-config.json /etc/bench/config.json
 
 ENV BENCH_ROLE=bench \
@@ -78,9 +78,9 @@ ENV BENCH_ROLE=bench \
 
 VOLUME /output
 ENTRYPOINT ["sh", "-c", "case \"$BENCH_ROLE\" in \
-  scheduler) exec rel scheduler --scheduler-url \"$BENCH_SCHEDULER_URL\" --bind-host 0.0.0.0;; \
+  scheduler) exec el-ballista scheduler --scheduler-url \"$BENCH_SCHEDULER_URL\" --bind-host 0.0.0.0;; \
   worker) args=\"worker --scheduler-url $BENCH_SCHEDULER_URL --bind-host 0.0.0.0 --external-host $(hostname)\"; \
     if [ -n \"$BENCH_CONCURRENT_TASKS\" ]; then args=\"$args --concurrent-tasks $BENCH_CONCURRENT_TASKS\"; fi; \
-    exec rel $args;; \
+    exec el-ballista $args;; \
   *) exec bench \"$BENCH_CONFIG\" \"$BENCH_WORKERS\" \"$BENCH_OUTPUT\" \"$BENCH_SCENARIO\";; \
 esac"]

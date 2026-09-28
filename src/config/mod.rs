@@ -81,7 +81,7 @@ pub struct CheckpointConfig {
     /// See `run_report`. Default `true`.
     #[serde(default = "default_true")]
     pub run_reports: bool,
-    /// Also write run reports for diagnostic runs (`run()`, `rel run`, `rel distribute`).
+    /// Also write run reports for diagnostic runs (`run()`, `el-ballista run`, `el-ballista distribute`).
     /// Default `false`: diagnostics leave no files behind.
     #[serde(default)]
     pub diagnostic_run_reports: bool,
@@ -154,7 +154,7 @@ fn default_pushdown_policy() -> PushdownPolicy {
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::config::{PushdownPolicy, policy_name};
+/// use el_ballista::config::{PushdownPolicy, policy_name};
 ///
 /// assert_eq!(policy_name(PushdownPolicy::CostBased), "cost_based");
 /// // Round-trips through the parser used for config files.
@@ -477,12 +477,12 @@ impl JobConfig {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::config::JobConfig;
+    /// use el_ballista::config::JobConfig;
     ///
     /// let config: JobConfig = serde_json::from_str(r#"{
     ///     "job_id": "orders", "table": "orders",
     ///     "source": {"host": "localhost", "port": 5432, "user": "etl",
-    ///                "password_env": "REL_DOCS_UNSET_PASSWORD", "database": "shop", "schema": "sales"}
+    ///                "password_env": "EL_BALLISTA_DOCS_UNSET_PASSWORD", "database": "shop", "schema": "sales"}
     /// }"#)?;
     /// assert_eq!(config.resolved_table(), "sales.orders");
     /// # Ok::<(), serde_json::Error>(())
@@ -504,12 +504,12 @@ impl JobConfig {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::config::JobConfig;
+    /// use el_ballista::config::JobConfig;
     ///
     /// let config = JobConfig::from_file("examples/configs/full_extract.example.json")?;
     /// assert_eq!(config.job_id, "payment_full");
     /// assert_eq!(config.resolved_table(), "public.payment");
-    /// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
+    /// # Ok::<(), el_ballista::errors::AppError>(())
     /// ```
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let path = path.as_ref();
@@ -621,12 +621,12 @@ impl JobConfig {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::config::JobConfig;
+    /// use el_ballista::config::JobConfig;
     ///
     /// let config: JobConfig = serde_json::from_str(r#"{
     ///     "job_id": "orders", "table": "orders",
     ///     "source": {"host": "localhost", "port": 5432, "user": "etl",
-    ///                "password_env": "REL_DOCS_UNSET_PASSWORD", "database": "shop", "schema": "sales"}
+    ///                "password_env": "EL_BALLISTA_DOCS_UNSET_PASSWORD", "database": "shop", "schema": "sales"}
     /// }"#)?;
     /// // `source.password_env` names an unset variable: an error, never an empty password.
     /// assert!(config.resolve_password().is_err());
@@ -1101,7 +1101,7 @@ mod tests {
                 host: "localhost".to_string(),
                 port: 5432,
                 user: "postgres".to_string(),
-                password_env: "REL_TEST_ENV_NEVER_SET_7F3A".to_string(),
+                password_env: "EL_BALLISTA_TEST_ENV_NEVER_SET_7F3A".to_string(),
                 database: "db".to_string(),
                 pool_max: 4,
                 statement_timeout_ms: 1000,

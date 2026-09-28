@@ -31,7 +31,7 @@ mod postgres;
 // that don't need every name.
 pub use postgres::*;
 
-// Real-cluster harness (`rel scheduler` + `rel worker` child processes). Only the
+// Real-cluster harness (`el-ballista scheduler` + `el-ballista worker` child processes). Only the
 // distributed suites start one, so the re-export is unused in the others.
 #[path = "cluster.rs"]
 mod cluster;

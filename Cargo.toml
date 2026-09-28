@@ -1,14 +1,21 @@
 [package]
-name = "rust-ballista-extraction-layer"
+name = "el-ballista"
 version = "0.1.0"
 edition = "2024"
+description = "A source-aware PostgreSQL extraction layer on Apache DataFusion and Ballista"
+license = "Apache-2.0"
+repository = "https://github.com/jayamanikharyono/el-ballista"
+readme = "README.md"
+keywords = ["datafusion", "ballista", "postgres", "arrow", "etl"]
+categories = ["database"]
+publish = false
 
 [lib]
-name = "rust_ballista_extraction_layer"
+name = "el_ballista"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rust-ballista-extraction-layer"
+name = "el-ballista"
 path = "src/main.rs"
 
 [dependencies]

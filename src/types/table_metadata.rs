@@ -57,7 +57,7 @@ impl TableMetadata {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::types::{ColumnMetadata, TableMetadata};
+    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
     ///
     /// let col = |n: &str| ColumnMetadata {
     ///     column_name: n.into(),
@@ -116,7 +116,7 @@ impl TableMetadata {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::types::TableMetadata;
+    /// use el_ballista::types::TableMetadata;
     ///
     /// let t = TableMetadata {
     ///     schema_name: "public".into(),

@@ -3,8 +3,8 @@
 //! The scheduler and each worker are separate processes and can't share a live `PgPool`, so
 //! scans travel as serialized plans (see `plan_codec` / `table_codec`) and each executing
 //! process resolves its *budgeted* share of `pool_max` from the process-wide
-//! `SourcePoolRegistry`. `DistributedContext::remote` connects to a running `rel scheduler`
-//! with `rel worker` processes; there is no in-process Ballista (single-process extraction is
+//! `SourcePoolRegistry`. `DistributedContext::remote` connects to a running `el-ballista scheduler`
+//! with `el-ballista worker` processes; there is no in-process Ballista (single-process extraction is
 //! plain DataFusion: `connector::postgres::register_table` / `.standalone()`).
 
 pub mod connection;

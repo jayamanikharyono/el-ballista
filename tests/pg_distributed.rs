@@ -1,5 +1,5 @@
-//! Distributed end-to-end over the hostile fixture, on a real cluster: `rel scheduler` +
-//! `rel worker` child processes (see `common::TestCluster`), so codecs, keyset partitioning
+//! Distributed end-to-end over the hostile fixture, on a real cluster: `el-ballista scheduler` +
+//! `el-ballista worker` child processes (see `common::TestCluster`), so codecs, keyset partitioning
 //! and per-process budgeted pools run exactly as deployed. Also the single-process
 //! (pure DataFusion) connection budget. Run: `cargo test --test pg_distributed` (requires the
 //! compose stack up; `DATABASE_URL` overrides the default endpoint).
@@ -8,12 +8,12 @@
 mod common;
 
 use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
-use rust_ballista_extraction_layer::connector::postgres::register_table;
+use el_ballista::connector::postgres::distributed::DistributedContext;
+use el_ballista::connector::postgres::register_table;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
@@ -106,8 +106,8 @@ async fn cluster_collects_hostile_table() -> Result<(), Box<dyn std::error::Erro
 #[tokio::test]
 async fn distributed_run_with_checkpoints_one_split_and_skips_on_retry()
 -> Result<(), Box<dyn std::error::Error>> {
+    use el_ballista::connector::postgres::PostgresConnector;
     use futures::TryStreamExt;
-    use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let db = live!();
@@ -228,7 +228,7 @@ const FAST_FAILOVER: common::Failover = common::Failover {
 /// that is left. Bounded by an outer timeout, so a regression fails instead of hanging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_killed_mid_job_does_not_hang_it() -> Result<(), Box<dyn std::error::Error>> {
-    use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    use el_ballista::connector::postgres::PostgresConnector;
     use std::time::{Duration, Instant};
 
     const ROWS: i64 = 3_000_000;
@@ -243,7 +243,7 @@ async fn a_worker_killed_mid_job_does_not_hang_it() -> Result<(), Box<dyn std::e
         .await?;
     let mut config = failover_config(&db, "failover", 2, 2);
     config.table = "big".to_string();
-    let job_prefix = format!("rel-{}-", config.job_id);
+    let job_prefix = format!("el-ballista-{}-", config.job_id);
     let mut cluster = TestCluster::start_with(2, 2, FAST_FAILOVER).await;
     let connector = PostgresConnector::from_config(config)?;
     let url = cluster.url.clone();
@@ -289,7 +289,7 @@ async fn a_worker_killed_mid_job_does_not_hang_it() -> Result<(), Box<dyn std::e
 /// With no worker left, the job aborts with the typed error instead of hanging.
 #[tokio::test]
 async fn a_job_with_no_worker_left_aborts() -> Result<(), Box<dyn std::error::Error>> {
-    use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    use el_ballista::connector::postgres::PostgresConnector;
 
     let db = live!();
     let mut cluster = TestCluster::start_with(1, 2, FAST_FAILOVER).await;

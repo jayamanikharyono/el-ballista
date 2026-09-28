@@ -5,8 +5,8 @@ job from API call to split-checkpoint commit, the data model, execution and memo
 configuration, and observability. The core is a source-aware extraction layer on
 DataFusion/Ballista that outputs native Arrow.
 
-`rel` below is the `rust-ballista-extraction-layer` binary, e.g.
-`cargo run --release --bin rust-ballista-extraction-layer --`.
+`el-ballista` below is the built binary; from a checkout, use
+`cargo run --release --bin el-ballista --`.
 
 For the reasoning behind the design, start with the [README](../README.md). For the parts that get
 their own documents, see [pushdown](pushdown.md)
@@ -62,12 +62,12 @@ is by module, chosen so a future extraction into crates (or a Python wrapper bin
 one obvious surface) stays mechanical.
 
 ```
-rust-ballista-extraction-layer/
+el-ballista/
 ├── Cargo.toml                  # single crate; exact pins, see §1 version policy
 ├── src/
 │   ├── lib.rs                  # pub mod checkpoint, config, connector, errors, logging, pushdown,
 │   │                           # telemetry, types
-│   ├── main.rs                 # `rel` binary: bin-only `cli/` + `demo.rs`, everything else from the lib
+│   ├── main.rs                 # `el-ballista` binary: bin-only `cli/` + `demo.rs`, everything else from the lib
 │   ├── config/                 # strict JSON job spec (deny_unknown_fields), JobConfig + blocks
 │   ├── types/                  # TableMetadata / ColumnMetadata, JobId newtype, ParallelStrategy
 │   ├── checkpoint/             # CheckpointStore trait, JsonCheckpointStore (json_store), plan
@@ -95,7 +95,7 @@ rust-ballista-extraction-layer/
 │   │                           # row_adapter, extractor, query_builder
 │   ├── cli/                    # (bin) run, distribute, plan, checkpoint show|reset, scheduler,
 │   │                           # worker, demo
-│   ├── demo.rs                 # (bin) `rel demo` walkthrough
+│   ├── demo.rs                 # (bin) `el-ballista demo` walkthrough
 │   ├── telemetry.rs            # metric names + recording helpers (`metrics` facade, see §7)
 │   ├── logging.rs              # `log` + fern setup (stderr + optional file)
 │   └── errors.rs               # AppError (typed variants, #[source] kept)
@@ -106,7 +106,7 @@ rust-ballista-extraction-layer/
 ```
 
 There are no crate-root re-exports of the Postgres modules: import
-`rust_ballista_extraction_layer::connector::postgres::{PostgresConnector, pipeline, engine,
+`el_ballista::connector::postgres::{PostgresConnector, pipeline, engine,
 distributed, …}` directly.
 
 The Source SPI contract lives in `src/connector/mod.rs`: every backend answers four questions
@@ -125,7 +125,7 @@ analogous registry over its own pool type following the same pattern.
 Push/keep decisions are made in `PostgresTableProvider::supports_filters_pushdown`, which
 decides the whole filter set at once (`decide_all`): each filter is judged with the others as
 siblings, so the two sides of a range window share one estimate. `explain_decisions` returns
-the same decisions with their reasons (what `rel plan` prints). Pushed filters are rendered with
+the same decisions with their reasons (what `el-ballista plan` prints). Pushed filters are rendered with
 `COLLATE "C"` for text and bound parameters for every literal (see [pushdown](pushdown.md)).
 
 ---
@@ -174,7 +174,7 @@ extraction failure never advances the checkpoint and a retry re-runs exactly the
 splits with their **stored** bounds (not bounds recomputed from a table that has since changed).
 Delivery is at-least-once per split — a split whose consumer failed or whose process died
 mid-stream is re-delivered in full — so consumers should write per `split_id` idempotently.
-`rel checkpoint reset` deletes a job's checkpoint (needed after changing its plan). The
+`el-ballista checkpoint reset` deletes a job's checkpoint (needed after changing its plan). The
 distributed path treats the whole cluster query as one split. Nothing here is exactly-once.
 
 The checkpoint and the run report are different records. The checkpoint is mutable state, one
@@ -215,7 +215,7 @@ against the demo database (dvdrental `public.payment`, 14,596 rows; see
 "pushdown": { "policy": "cost_based", "deny": ["rental_id"], "push": [] }
 ```
 
-`rel plan --config examples/configs/pushdown_showcase.json` prints each filter's decision with
+`el-ballista plan --config examples/configs/pushdown_showcase.json` prints each filter's decision with
 its reason:
 
 ```
@@ -329,8 +329,8 @@ batches beyond `batch_size` accumulation. Both are known gaps, not design decisi
 
 ### Distributed execution
 
-Ballista distributes DataFusion across a scheduler and long-running workers (`rel scheduler` /
-`rel worker`), using Arrow IPC for shuffle exchange. Distributed always means a running
+Ballista distributes DataFusion across a scheduler and long-running workers (`el-ballista scheduler` /
+`el-ballista worker`), using Arrow IPC for shuffle exchange. Distributed always means a running
 cluster; there is no in-process Ballista. Single-process extraction is plain DataFusion
 (`register_table` into a `SessionContext`, or the connector's `.standalone()`): one Tokio
 runtime with one thread per visible CPU and the whole `pool_max` for the one process.
@@ -431,13 +431,13 @@ Points that shape the design:
 ## 7. Observability
 
 Logging is the `log` crate (a `fern` backend in the binary writing to stderr plus an
-optional file, level from `--log-level`/`RUST_LOG`, file from `--log-file`/`REL_LOG_FILE`) —
+optional file, level from `--log-level`/`RUST_LOG`, file from `--log-file`/`EL_BALLISTA_LOG_FILE`) —
 one line per job, split, partition scan, and checkpoint commit, with every generated SQL query
 and one line per Arrow batch (`split=`, `rows=`, `batch_bytes=`) at `debug` level. There is no
 `tracing` and no spans.
 
 **Run reports** (`<checkpoint.dir>/runs/<job>/<run_id>.json`, see §3) give a durable,
-per-run record that a scheduler or a person can read after the fact (`rel runs list|show`).
+per-run record that a scheduler or a person can read after the fact (`el-ballista runs list|show`).
 
 **Metrics** go through the [`metrics`](https://docs.rs/metrics) facade
 (`src/telemetry.rs`): a no-op until the host process installs a recorder/exporter. Recorded per
@@ -445,20 +445,20 @@ batch, per split and per pushdown decision — never per row:
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `rel_extracted_rows` | counter | `job` |
-| `rel_extracted_batches` | counter | `job` |
-| `rel_batch_bytes` | histogram | `job` |
-| `rel_splits` | counter | `job`, `outcome` = `completed` / `failed` / `skipped` |
-| `rel_pushdown_decisions` | counter | `outcome` = `exact` / `inexact` / `kept` |
+| `el_ballista_extracted_rows` | counter | `job` |
+| `el_ballista_extracted_batches` | counter | `job` |
+| `el_ballista_batch_bytes` | histogram | `job` |
+| `el_ballista_splits` | counter | `job`, `outcome` = `completed` / `failed` / `skipped` |
+| `el_ballista_pushdown_decisions` | counter | `outcome` = `exact` / `inexact` / `kept` |
 
 The table below is further instrumentation that does not exist yet; each row is deferred work,
 with the code hook it would attach to in parentheses where one is clear:
 
 | Metric | Type | Why it matters |
 | --- | --- | --- |
-| `rel_bytes_from_source_total{source,table}` | counter | Directly measures pushdown effectiveness |
-| `rel_source_query_duration_seconds` | histogram | Detects a pushdown that made the DB slow (hook: `build_query` execution) |
-| `rel_pushdown_decision_total{operator,decision}` | counter | Per-operator breakdown of `rel_pushdown_decisions` (hook: `decide_all`, called by `supports_filters_pushdown`) |
-| `rel_checkpoint_commit_total{status}` | counter | A failed checkpoint write means duplicate work on the next run (hook: `CheckpointStore::mark_completed`) |
+| `el_ballista_bytes_from_source_total{source,table}` | counter | Directly measures pushdown effectiveness |
+| `el_ballista_source_query_duration_seconds` | histogram | Detects a pushdown that made the DB slow (hook: `build_query` execution) |
+| `el_ballista_pushdown_decision_total{operator,decision}` | counter | Per-operator breakdown of `el_ballista_pushdown_decisions` (hook: `decide_all`, called by `supports_filters_pushdown`) |
+| `el_ballista_checkpoint_commit_total{status}` | counter | A failed checkpoint write means duplicate work on the next run (hook: `CheckpointStore::mark_completed`) |
 
-Failed splits are visible as `rel_splits{outcome="failed"}`.
+Failed splits are visible as `el_ballista_splits{outcome="failed"}`.

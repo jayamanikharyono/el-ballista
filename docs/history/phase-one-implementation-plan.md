@@ -47,7 +47,7 @@ src/
 ├── checkpoint/       # CheckpointStore trait + Postgres impl          (new, §4)
 ├── incremental/       # watermark resolution, window construction     (new, §5)
 ├── sink/             # Parquet writer + object store                 (new, §7)
-├── cli/               # `rel run|plan|checkpoint`                     (new, §8)
+├── cli/               # `el-ballista run|plan|checkpoint`                     (new, §8)
 └── main.rs
 ```
 
@@ -110,7 +110,7 @@ Implements `../incremental-extraction.md` §6.
 - [ ] `checkpoint/store.rs`: `CheckpointStore` trait (`acquire`, `commit`, `abandon`, `history`) —
       exact signatures from the doc.
 - [ ] `checkpoint/postgres_store.rs`: Postgres-backed implementation against the
-      `rel_checkpoint` / `rel_run_history` schema in the doc. Reuse the same `PgPool` machinery
+      `el_ballista_checkpoint` / `el_ballista_run_history` schema in the doc. Reuse the same `PgPool` machinery
       from §2/§3 — this is a second logical database role (metadata store) even if it's physically
       the same server in dev.
 - [ ] Lease semantics: `acquire` does a compare-and-swap on `(run_id, lease_expires_at)`; a run
@@ -120,7 +120,7 @@ Implements `../incremental-extraction.md` §6.
 - [ ] `watermark_value` stored as typed JSON (`{"ts": "..."}`), not a bare string — this is called
       out explicitly in the doc as a correctness requirement, not a style preference.
 
-**Acceptance:** two concurrent `rel run` invocations against the same job — one loses the lease
+**Acceptance:** two concurrent `el-ballista run` invocations against the same job — one loses the lease
 and exits cleanly; killing a run mid-extraction leaves `state = RUNNING` with an expired lease that
 the next invocation can reclaim.
 
@@ -213,17 +213,17 @@ mid-run" exit criterion).
 
 ## 8. Minimal CLI
 
-Roadmap lists `rel run`, `rel plan`, `rel checkpoint`. Phase 1 needs enough to run on a schedule
-unattended — doesn't need `rel plan --explain`'s reasoning output (that's meaningfully Phase 2,
+Roadmap lists `el-ballista run`, `el-ballista plan`, `el-ballista checkpoint`. Phase 1 needs enough to run on a schedule
+unattended — doesn't need `el-ballista plan --explain`'s reasoning output (that's meaningfully Phase 2,
 once there's a real policy engine to explain).
 
-- [ ] `cli/mod.rs` with `clap`: `rel run --job <name>` (resolve config → acquire checkpoint lease →
-      extract → sink → commit), `rel checkpoint show --job <name>` (read current state via
-      `CheckpointStore::history`), `rel checkpoint reset --job <name>` (operator escape hatch).
+- [ ] `cli/mod.rs` with `clap`: `el-ballista run --job <name>` (resolve config → acquire checkpoint lease →
+      extract → sink → commit), `el-ballista checkpoint show --job <name>` (read current state via
+      `CheckpointStore::history`), `el-ballista checkpoint reset --job <name>` (operator escape hatch).
 - [ ] `main.rs` becomes the CLI entry point; today's ad hoc demo code in `main.rs` gets deleted
-      once `rel run` covers the same path end-to-end.
+      once `el-ballista run` covers the same path end-to-end.
 
-**Acceptance:** `rel run --job orders_incremental` run from cron/systemd-timer on a real table
+**Acceptance:** `el-ballista run --job orders_incremental` run from cron/systemd-timer on a real table
 with no manual intervention.
 
 ---
@@ -231,20 +231,20 @@ with no manual intervention.
 ## 9. Observability
 
 `../architecture.md` §7's metric list, scoped to what Phase 1 actually produces (drop
-`rel_pushdown_decision_total` — no pushdown decisions exist yet):
+`el_ballista_pushdown_decision_total` — no pushdown decisions exist yet):
 
 - [ ] `tracing` spans: one per job run, one per partition scan (single partition in Phase 1, but
       keep the span so Phase 2's parallel scan doesn't need new instrumentation), one per sink
       flush.
 - [ ] Metrics via a Prometheus exporter (`metrics` + `metrics-exporter-prometheus`):
-      `rel_rows_extracted_total`, `rel_bytes_from_source_total`,
-      `rel_source_query_duration_seconds`, `rel_watermark_lag_seconds`,
-      `rel_null_coerced_total`, `rel_checkpoint_commit_total`.
-- [ ] `rel_watermark_lag_seconds` specifically — the doc calls this the one metric worth a standing
+      `el_ballista_rows_extracted_total`, `el_ballista_bytes_from_source_total`,
+      `el_ballista_source_query_duration_seconds`, `el_ballista_watermark_lag_seconds`,
+      `el_ballista_null_coerced_total`, `el_ballista_checkpoint_commit_total`.
+- [ ] `el_ballista_watermark_lag_seconds` specifically — the doc calls this the one metric worth a standing
       alert; make sure it's derived from the checkpoint store's committed watermark vs. wall clock,
       not from anything in-memory that resets on restart.
 
-**Acceptance:** `rel_watermark_lag_seconds` visibly increases if the scheduler stops triggering the
+**Acceptance:** `el_ballista_watermark_lag_seconds` visibly increases if the scheduler stops triggering the
 job, and drops back down once it resumes.
 
 ---
@@ -298,6 +298,6 @@ exist. §10 should be written incrementally alongside §5–§6 rather than save
 ## Explicitly not in this plan
 
 Aggregate/join pushdown, the cost model and `EXPLAIN`-based estimation, parallel scan (`ctid`
-ranges, exported snapshots), MySQL, BigQuery load orchestration, and `rel plan --explain` — all
+ranges, exported snapshots), MySQL, BigQuery load orchestration, and `el-ballista plan --explain` — all
 Phase 2/3 per the roadmap. Building any of these now is the scope-creep failure mode the roadmap
 warns about explicitly.

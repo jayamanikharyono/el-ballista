@@ -7,7 +7,7 @@
 //! Rendered shape (single line, sqlcommenter-adjacent but hand-rolled — no new dependency):
 //!
 //! ```text
-//! /* rust-extract query_id=q_1a2b3c4d pipeline=orders_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
+//! /* el-ballista query_id=q_1a2b3c4d pipeline=orders_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
 //! ```
 //!
 //! `query_id` is fresh per query (one [`QueryTag`] per statement); `pipeline` and `run_id`
@@ -59,7 +59,7 @@ impl QuerySession {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::connector::query_tag::QuerySession;
+    /// use el_ballista::connector::query_tag::QuerySession;
     ///
     /// fn label(session: &QuerySession) -> &str {
     ///     session.pipeline()
@@ -108,7 +108,7 @@ impl QueryTag {
     /// `application_name` containing `*/`) can never break out of the comment early.
     pub(crate) fn render(&self) -> String {
         let mut out = format!(
-            "/* rust-extract query_id={} pipeline={} run_id={} strategy={}",
+            "/* el-ballista query_id={} pipeline={} run_id={} strategy={}",
             sanitize(&self.query_id),
             sanitize(&self.pipeline),
             sanitize(&self.run_id),
@@ -149,7 +149,7 @@ mod tests {
         let session = QuerySession::from_parts("orders_extract", "r_9f8e7d6c");
         let tag = session.tag("full");
         let rendered = tag.render();
-        assert!(rendered.starts_with("/* rust-extract query_id=q_"));
+        assert!(rendered.starts_with("/* el-ballista query_id=q_"));
         assert!(rendered.contains("pipeline=orders_extract"));
         assert!(rendered.contains("run_id=r_9f8e7d6c"));
         assert!(rendered.contains("strategy=full"));

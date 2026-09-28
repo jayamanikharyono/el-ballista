@@ -43,7 +43,7 @@ impl PostgresPhysicalCodec {
     /// ```
     /// use std::sync::Arc;
     /// use datafusion_proto::physical_plan::PhysicalExtensionCodec;
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::PostgresPhysicalCodec;
+    /// use el_ballista::connector::postgres::distributed::PostgresPhysicalCodec;
     ///
     /// // Handed to Ballista (scheduler/executor config) in place of its default codec.
     /// let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(PostgresPhysicalCodec::new());

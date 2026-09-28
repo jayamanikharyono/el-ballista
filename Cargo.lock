@@ -1694,6 +1694,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "el-ballista"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "ballista",
+ "ballista-core",
+ "ballista-executor",
+ "ballista-scheduler",
+ "bigdecimal",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "datafusion-proto",
+ "fern",
+ "futures",
+ "log",
+ "metrics",
+ "once_cell",
+ "parquet",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3170,37 +3201,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rust-ballista-extraction-layer"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-stream",
- "async-trait",
- "ballista",
- "ballista-core",
- "ballista-executor",
- "ballista-scheduler",
- "bigdecimal",
- "bytes",
- "chrono",
- "datafusion",
- "datafusion-proto",
- "fern",
- "futures",
- "log",
- "metrics",
- "once_cell",
- "parquet",
- "proptest",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "tokio",
- "uuid",
 ]
 
 [[package]]

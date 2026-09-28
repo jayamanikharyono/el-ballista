@@ -38,7 +38,7 @@ impl ParallelStrategy {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::types::ParallelStrategy;
+    /// use el_ballista::types::ParallelStrategy;
     ///
     /// assert_eq!(ParallelStrategy::parse("Keyset").unwrap(), ParallelStrategy::Keyset);
     /// assert!(ParallelStrategy::parse("keyst").is_err());

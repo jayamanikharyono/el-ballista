@@ -2,7 +2,7 @@
 //! predicates, schema-aware coercion, and the pushdown preview.
 //!
 //! Every path (`collect` / `stream` / `run` / `run_with`, standalone or distributed,
-//! `rel plan`) funnels through [`Pipeline::filter_exprs_with_schema`], so the config, the
+//! `el-ballista plan`) funnels through [`Pipeline::filter_exprs_with_schema`], so the config, the
 //! CLI, the preview and the provider can never disagree about what a filter means.
 
 use arrow::datatypes::{DataType, Schema, TimeUnit};
@@ -18,7 +18,7 @@ use crate::errors::AppError;
 /// What the extraction layer will do with one caller-provided filter: the parsed
 /// predicate plus the decision whether it executes in the source database.
 /// Returned by [`Pipeline::explain_filters`] — the programmatic form of what
-/// `rel plan` prints.
+/// `el-ballista plan` prints.
 #[derive(Debug, Clone)]
 pub struct FilterDecision {
     /// Canonical display of the filter (`status = 'PAID'`), regardless of whether
@@ -31,7 +31,7 @@ pub struct FilterDecision {
     /// True when the filter executes in the source database (`Exact` or `Inexact`).
     /// `Inexact` still re-checks in Arrow; `Unsupported` stays in Arrow entirely.
     pub pushed_to_source: bool,
-    /// Human-readable reason (same text `rel plan` prints).
+    /// Human-readable reason (same text `el-ballista plan` prints).
     pub reason: String,
 }
 
@@ -44,8 +44,8 @@ impl Pipeline {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::pipeline::Pipeline;
     ///
     /// let config: JobConfig = serde_json::from_str(r#"{
     ///     "job_id": "orders", "table": "orders",
@@ -95,8 +95,8 @@ impl Pipeline {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::pipeline::Pipeline;
     ///
     /// let config: JobConfig = serde_json::from_str(r#"{
     ///     "job_id": "orders", "table": "orders",
@@ -158,8 +158,8 @@ impl Pipeline {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// use el_ballista::connector::postgres::PostgresConnector;
     ///
     /// let connector = PostgresConnector::from_config_file("job.json")?;
     /// for d in connector.pipeline().explain_filters().await? {
@@ -248,13 +248,13 @@ pub(super) fn describe_group(group: &[FilterSpec]) -> String {
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::pipeline::parse_filter_shorthand;
+/// use el_ballista::connector::postgres::pipeline::parse_filter_shorthand;
 ///
 /// let spec = parse_filter_shorthand("amount>=100")?;
 /// assert_eq!(spec.column, "amount");
 /// assert_eq!(spec.value, serde_json::json!(100));
 /// assert!(parse_filter_shorthand("no operator").is_err());
-/// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
+/// # Ok::<(), el_ballista::errors::AppError>(())
 /// ```
 pub fn parse_filter_shorthand(raw: &str) -> Result<FilterSpec, AppError> {
     const OPS: [(&str, usize, FilterOp); 6] = [
@@ -294,11 +294,11 @@ pub fn parse_filter_shorthand(raw: &str) -> Result<FilterSpec, AppError> {
 ///
 /// ```
 /// use datafusion::prelude::{ident, lit};
-/// use rust_ballista_extraction_layer::connector::postgres::pipeline::parse_filter_expr;
+/// use el_ballista::connector::postgres::pipeline::parse_filter_expr;
 ///
 /// let expr = parse_filter_expr("status='PAID'")?;
 /// assert_eq!(expr, ident("status").eq(lit("PAID")));
-/// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
+/// # Ok::<(), el_ballista::errors::AppError>(())
 /// ```
 pub fn parse_filter_expr(raw: &str) -> Result<Expr, AppError> {
     parse_filter_shorthand(raw)?.to_expr()
@@ -337,7 +337,7 @@ fn shorthand_value(raw: &str) -> serde_json::Value {
 }
 
 impl FilterSpec {
-    /// Canonical display (`status = 'PAID'`) for logs, `rel plan`, and previews.
+    /// Canonical display (`status = 'PAID'`) for logs, `el-ballista plan`, and previews.
     pub(crate) fn describe(&self) -> String {
         match self.op {
             FilterOp::IsNull => format!("{} is null", self.column.trim()),

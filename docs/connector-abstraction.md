@@ -18,7 +18,7 @@ steps, each driven by the MySQL connector growing a capability.
   `dialect`, `param_sink`, `inline_sql`, the `stats` collector, the `explain` executor,
   `distributed`, `engine`, `pipeline` and the `PostgresConnector` builder API (`api.rs`). There
   are no crate-root re-exports: callers use
-  `rust_ballista_extraction_layer::connector::postgres::*`. The push/keep decision is made in
+  `el_ballista::connector::postgres::*`. The push/keep decision is made in
   `PostgresTableProvider::supports_filters_pushdown`; there is no custom optimizer rule.
 - **MySQL:** the prototype (`src/connector/mysql/`) is a walking skeleton: `MysqlDialect`, a
   type mapper, an `information_schema` reader, and a full-table extractor that selects raw

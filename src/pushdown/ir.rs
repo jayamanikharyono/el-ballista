@@ -27,7 +27,7 @@ impl CmpOp {
     ///
     /// # Examples
     /// ```
-    /// use rust_ballista_extraction_layer::pushdown::CmpOp;
+    /// use el_ballista::pushdown::CmpOp;
     /// assert_eq!(CmpOp::NotEq.as_sql(), "<>");
     /// ```
     pub fn as_sql(self) -> &'static str {
@@ -45,7 +45,7 @@ impl CmpOp {
     ///
     /// # Examples
     /// ```
-    /// use rust_ballista_extraction_layer::pushdown::CmpOp;
+    /// use el_ballista::pushdown::CmpOp;
     /// assert!(CmpOp::Eq.is_equality() && !CmpOp::Lt.is_equality());
     /// ```
     pub fn is_equality(self) -> bool {

@@ -3,7 +3,7 @@
 //! Docs/roadmap.md Phase 4: runs an extraction job through a Ballista scheduler + workers.
 //!
 //! Distributed always means a running cluster: [`DistributedContext::remote`] connects to a
-//! `rel scheduler`, and the workers are separate `rel worker` processes. (Single-process
+//! `el-ballista scheduler`, and the workers are separate `el-ballista worker` processes. (Single-process
 //! extraction is plain DataFusion — [`crate::connector::postgres::register_table`] or the
 //! connector's `.standalone()` — with no Ballista involved.)
 //!
@@ -41,7 +41,7 @@ pub struct DistributedContext {
     pub partition_column: Option<String>,
     /// The scheduler this session submits to.
     pub scheduler_url: String,
-    /// Unique `ballista.job.name` of every job this session submits (`rel-<job_id>-<id>`), so
+    /// Unique `ballista.job.name` of every job this session submits (`el-ballista-<job_id>-<id>`), so
     /// the job watchdog can find and cancel this extraction's jobs on the scheduler.
     pub job_name: String,
 }
@@ -57,10 +57,10 @@ impl DistributedContext {
             .with_ballista_job_name(job_name)
     }
 
-    /// A job name unique to this session: `rel-<job_id>-<8 hex chars>`.
+    /// A job name unique to this session: `el-ballista-<job_id>-<8 hex chars>`.
     fn unique_job_name(config: &JobConfig) -> String {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        format!("rel-{}-{}", config.job_id, &id[..8])
+        format!("el-ballista-{}-{}", config.job_id, &id[..8])
     }
 
     fn session_state(config: &SessionConfig) -> SessionState {
@@ -71,7 +71,7 @@ impl DistributedContext {
         SessionContext::new_with_config(config).state()
     }
 
-    /// Connect to an already-running `rel scheduler` (workers are separate `rel worker`
+    /// Connect to an already-running `el-ballista scheduler` (workers are separate `el-ballista worker`
     /// processes). The connection budget is `pool_max / workers`, applied independently in
     /// each process, so a three-machine deployment adds machines without adding source load.
     ///
@@ -79,8 +79,8 @@ impl DistributedContext {
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::distributed::DistributedContext;
     ///
     /// let config = JobConfig::from_file("job.json")?;
     /// let dist = &config.distributed;
@@ -132,8 +132,8 @@ impl DistributedContext {
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::distributed::DistributedContext;
     ///
     /// let config = JobConfig::from_file("job.json")?;
     /// let ctx = DistributedContext::remote(&config, "http://localhost:50050", 4).await?;
@@ -200,7 +200,7 @@ mod tests {
             execution: ExecutionConfig::default(),
             distributed: DistributedConfig::default(),
         };
-        let c = DistributedContext::session_config_for(&config, 4, "rel-ctx-0000");
+        let c = DistributedContext::session_config_for(&config, 4, "el-ballista-ctx-0000");
         assert_eq!(c.target_partitions(), 4);
         assert_eq!(
             c.options()
@@ -209,10 +209,10 @@ mod tests {
                 .find(|e| e.key == "ballista.job.name")
                 .and_then(|e| e.value.clone())
                 .as_deref(),
-            Some("rel-ctx-0000")
+            Some("el-ballista-ctx-0000")
         );
         let name = DistributedContext::unique_job_name(&config);
-        assert!(name.starts_with("rel-ctx-") && name.len() == "rel-ctx-".len() + 8);
+        assert!(name.starts_with("el-ballista-ctx-") && name.len() == "el-ballista-ctx-".len() + 8);
         assert_eq!(c.batch_size(), config.execution.batch_size);
         // Each of 4 executor processes gets pool_max / 4 = 2 source connections.
         assert_eq!(

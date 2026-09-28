@@ -9,24 +9,24 @@
 //! file renamed into place, so a split's file is either complete or absent). A split is
 //! recorded completed only after its file is in place, so re-running the same job after a
 //! failure rewrites only the unfinished splits. Every run also leaves a run report in
-//! `<checkpoint.dir>/runs/<job_id>/<run_id>.json` (`rel runs show --config <config>`).
+//! `<checkpoint.dir>/runs/<job_id>/<run_id>.json` (`el-ballista runs show --config <config>`).
 //!
 //! The layer itself never writes data: this example is the consumer, which is the caller's job.
 
 use std::fs::File;
 use std::path::PathBuf;
 
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::pipeline::SplitInfo;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::pipeline::SplitInfo;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
+    el_ballista::logging::init_from_env_and_args();
 
     let mut args = std::env::args().skip(1);
     let config_path = args

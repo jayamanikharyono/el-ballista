@@ -71,8 +71,8 @@ in both; the table lists what each mode needs besides it.
 |---|---|---|
 | What runs | DataFusion only, inside your process | Your process plans; a Ballista cluster executes |
 | API | `connector.extract().standalone()` or `register_table(&ctx, &config)` | `connector.extract().distributed()` (`.scheduler(url)`, `.workers(n)`) |
-| CLI | `rel run` | `rel distribute` (+ `rel scheduler`, `rel worker`) |
-| Components to run | nothing extra: the library runs inside your process | a running `rel scheduler` + `distributed.workers` running `rel worker` processes |
+| CLI | `el-ballista run` | `el-ballista distribute` (+ `el-ballista scheduler`, `el-ballista worker`) |
+| Components to run | nothing extra: the library runs inside your process | a running `el-ballista scheduler` + `distributed.workers` running `el-ballista worker` processes |
 | Connections to Postgres | up to `pool_max` | `pool_max / workers` per worker (the total stays `pool_max`), plus the client's planning connections |
 | Parallelism | all visible CPUs; up to `execution.concurrent_partitions` (default `pool_max`) partitions scanning at once | each worker's task slots (`--concurrent-tasks`, default: its CPUs) |
 | Checkpointed `run_with` | one split per keyset partition | the whole scan is one split |
@@ -82,7 +82,7 @@ whole connection budget, and no scheduling overhead.
 
 ```rust
 use datafusion::prelude::SessionContext;
-use rust_ballista_extraction_layer::connector::postgres::{PostgresConnector, register_table};
+use el_ballista::connector::postgres::{PostgresConnector, register_table};
 
 // Library: the connector...
 let connector = PostgresConnector::from_config(config.clone())?;
@@ -94,24 +94,24 @@ let df = ctx.sql("SELECT staff_id, count(*) FROM payment GROUP BY staff_id").awa
 ```
 
 **Distributed** needs a cluster that is already running. All the pieces are this crate's binary
-(`rel` below stands for `cargo run --release --bin rust-ballista-extraction-layer --`, or the built
+(`el-ballista` below stands for `cargo run --release --bin el-ballista --`, or the built
 binary):
 
 | Component | Command | Notes |
 |---|---|---|
-| Scheduler | `rel scheduler --scheduler-url http://host:50050 [--bind-host 0.0.0.0] [--executor-timeout-secs 30]` | one per cluster; push-based scheduling; serves the REST API used for the executor check and the job watchdog; drops a worker whose heartbeat is older than the timeout |
-| Worker | `rel worker --scheduler-url http://host:50050 [--bind-host 0.0.0.0 --external-host <name>] [--concurrent-tasks N] [--port 50051 --grpc-port 50052] [--heartbeat-secs 5]` | exactly `distributed.workers` of them; stock Ballista executors cannot decode the Postgres scan plans; give each worker on one host its own ports |
+| Scheduler | `el-ballista scheduler --scheduler-url http://host:50050 [--bind-host 0.0.0.0] [--executor-timeout-secs 30]` | one per cluster; push-based scheduling; serves the REST API used for the executor check and the job watchdog; drops a worker whose heartbeat is older than the timeout |
+| Worker | `el-ballista worker --scheduler-url http://host:50050 [--bind-host 0.0.0.0 --external-host <name>] [--concurrent-tasks N] [--port 50051 --grpc-port 50052] [--heartbeat-secs 5]` | exactly `distributed.workers` of them; stock Ballista executors cannot decode the Postgres scan plans; give each worker on one host its own ports |
 | Source password | `export <source.password_env>=…` | in **every worker's** environment, since each worker opens its own connections |
 | Network | client → scheduler, scheduler ↔ workers, client and workers → source database | containers must set `--bind-host 0.0.0.0` and `--external-host` |
 
 ```bash
-rel scheduler &
-rel worker --scheduler-url http://localhost:50050 &
-rel worker --scheduler-url http://localhost:50050 --port 50061 --grpc-port 50062 &
-rel distribute --config my-job.json --workers 2
+el-ballista scheduler &
+el-ballista worker --scheduler-url http://localhost:50050 &
+el-ballista worker --scheduler-url http://localhost:50050 --port 50061 --grpc-port 50062 &
+el-ballista distribute --config my-job.json --workers 2
 ```
 
-If the scheduler is unreachable, `.distributed()` / `rel distribute` fails with an error. More
+If the scheduler is unreachable, `.distributed()` / `el-ballista distribute` fails with an error. More
 registered executors than `workers` is an error too, because the source would see more than `pool_max`
 connections; fewer is a warning. Choose distributed when one machine's CPUs are the bottleneck.
 It adds source connections only through the configured budget, never beyond it.
@@ -131,14 +131,14 @@ polls the scheduler's REST API:
 - Only a job that has not delivered rows yet is re-run. Ballista delivers results after the job
   finishes, so that covers the whole execution; a hang while results are being fetched is an
   error, because re-running would deliver rows twice.
-- Detection needs the scheduler REST API (on in `rel scheduler`). The worker heartbeat
+- Detection needs the scheduler REST API (on in `el-ballista scheduler`). The worker heartbeat
   (`--heartbeat-secs`, default 5) must stay well below both timeouts.
 
 ---
 
 ## CLI, filters and job spec rules
 
-`rel run` and `rel distribute` are **diagnostic**:
+`el-ballista run` and `el-ballista distribute` are **diagnostic**:
 
 - They scan the job, count the rows and discard them. They deliver no data and read or write
   no checkpoint: this project is not a sink. The operational, checkpointed job is the
@@ -150,11 +150,11 @@ polls the scheduler's REST API:
   `full+pushdown`, plus one line per Arrow batch (`split=`, `rows=`, `batch_bytes=`).
 - `execution.batch_size` sets the source fetch size.
 - `parallel_scan` with `strategy: "keyset"` and `partitions > 1` splits the table into
-  non-overlapping `partition_column` ranges. `rel run` scans up to
+  non-overlapping `partition_column` ranges. `el-ballista run` scans up to
   `execution.concurrent_partitions` of them at a time (capped at `source.pool_max`);
-  `rel distribute` spreads them across Ballista workers.
+  `el-ballista distribute` spreads them across Ballista workers.
 
-`rel plan` prints each filter's pushdown decision, using the same schema-coerced filters as a
+`el-ballista plan` prints each filter's pushdown decision, using the same schema-coerced filters as a
 run, and previews at most `--limit` rows (default 20).
 
 Filters come in two forms that lower to the same predicate — structured objects
@@ -182,9 +182,9 @@ Programmatically, `connector.pipeline()` exposes `filter_exprs()` (parsed predic
 `explain_filters()` (per-filter pushdown preview — the same decision `scan()` uses). A
 shorthand value in quotes
 stays a string (`zip='007'` compares against the text `007`, not the integer 7).
-Split progress of `run_with` jobs is inspectable via `rel checkpoint show --config <path>`
-and resettable via `rel checkpoint reset --config <path>`. Run reports are listed with
-`rel runs list --config <path>` and printed with `rel runs show --config <path> [--run <run_id>]`
+Split progress of `run_with` jobs is inspectable via `el-ballista checkpoint show --config <path>`
+and resettable via `el-ballista checkpoint reset --config <path>`. Run reports are listed with
+`el-ballista runs list --config <path>` and printed with `el-ballista runs show --config <path> [--run <run_id>]`
 (default: the latest run).
 
 The job spec is strict: unknown fields anywhere (including a leftover `"sink"` or
@@ -227,7 +227,7 @@ What `run_with` guarantees:
 - **Checkpoints belong to one plan.** The checkpoint is bound to a fingerprint of the plan
   (table, schema, projection, resolved filters, strategy, partitions, partition column).
   Re-running a job id with a different plan (e.g. a new filter) is a typed `PlanMismatch`
-  error: use a new `job_id` or `rel checkpoint reset`.
+  error: use a new `job_id` or `el-ballista checkpoint reset`.
 - **Stable splits.** Each split's key range is stored and reused on retry.
 - **Failures are isolated.** Pending splits run concurrently; a failed split is recorded
   without stopping the others, and the run then fails with the list of failed split ids.
@@ -244,7 +244,7 @@ What `run_with` guarantees:
   the failed run. A report that cannot be written is logged and never fails the run; nothing
   deletes old reports.
   `checkpoint.run_reports: false` turns them off; `checkpoint.diagnostic_run_reports: true`
-  also records `run()` / `rel run` / `rel distribute`. A run refused by the job lock writes no
+  also records `run()` / `el-ballista run` / `el-ballista distribute`. A run refused by the job lock writes no
   report. Summing `rows_delivered` across reports can count a re-delivered split twice.
 
 How the two modes run it:
@@ -254,7 +254,7 @@ How the two modes run it:
   `pool_max`). There is no in-process Ballista.
 - `.distributed()` treats the whole scan as one split. It uses the standard scheduler URL
   (`http://localhost:50050`) unless the config or `.scheduler(url)` sets one, and needs a
-  running cluster (`rel scheduler` + `rel worker`s).
+  running cluster (`el-ballista scheduler` + `el-ballista worker`s).
 - Against a remote scheduler, each worker process must run with the same
   `distributed.workers` and at most `pool_max / workers` concurrent tasks. This is not
   verified; a mismatch is logged as a warning.
@@ -265,12 +265,12 @@ See [`examples/pipeline_extraction.rs`](../examples/pipeline_extraction.rs).
 
 ## Logging
 
-The crate logs through the standard [`log`](https://docs.rs/log) facade. The `rust-ballista-extraction-layer` binary and every example install a `fern` backend at startup (`logging::init_from_env_and_args`) that writes to **stderr** and, optionally, to a **file**. Configuration is read from the command line and the environment (never the job JSON):
+The crate logs through the standard [`log`](https://docs.rs/log) facade. The `el-ballista` binary and every example install a `fern` backend at startup (`logging::init_from_env_and_args`) that writes to **stderr** and, optionally, to a **file**. Configuration is read from the command line and the environment (never the job JSON):
 
 | Setting | CLI flag | Env var | Default |
 | ------- | -------- | ------- | ------- |
 | Level   | `--log-level <off\|error\|warn\|info\|debug\|trace>` | `RUST_LOG` | `info` |
-| File    | `--log-file <path>` | `REL_LOG_FILE` | none (stderr only) |
+| File    | `--log-file <path>` | `EL_BALLISTA_LOG_FILE` | none (stderr only) |
 
 CLI flags take precedence over environment variables. When a file is given, its parent directories are created and logs are **appended**.
 
@@ -278,19 +278,19 @@ At **`debug`** level, every generated SQL query is logged as it is produced — 
 
 ```bash
 # Every generated query goes to logs/run.log (place flags after the subcommand)
-cargo run --bin rust-ballista-extraction-layer -- run \
+cargo run --bin el-ballista -- run \
   --config examples/configs/extract.example.json \
   --log-level debug --log-file logs/run.log
 
 # Equivalent via environment
-RUST_LOG=debug REL_LOG_FILE=logs/run.log \
-  cargo run --bin rust-ballista-extraction-layer -- demo
+RUST_LOG=debug EL_BALLISTA_LOG_FILE=logs/run.log \
+  cargo run --bin el-ballista -- demo
 ```
 
 A debug line looks like:
 
 ```
-  2026-09-16T08:12:04.531Z [DEBUG] rust_ballista_extraction_layer::connector::postgres::extractor: generated query [full]: /* rust-extract query_id=q_… pipeline=payment_full run_id=r_… strategy=full */ COPY (SELECT "payment_id", ... FROM "public"."payment") TO STDOUT (FORMAT BINARY)
+  2026-09-16T08:12:04.531Z [DEBUG] el_ballista::connector::postgres::extractor: generated query [full]: /* el-ballista query_id=q_… pipeline=payment_full run_id=r_… strategy=full */ COPY (SELECT "payment_id", ... FROM "public"."payment") TO STDOUT (FORMAT BINARY)
 ```
 
-> Note: `rel` with no arguments prints usage; the demo pipeline runs only as `rel demo` (it reads the database password from `PGPASSWORD`). Global flags go after the subcommand (a leading `--log-file` would be treated as a subcommand).
+> Note: `el-ballista` with no arguments prints usage; the demo pipeline runs only as `el-ballista demo` (it reads the database password from `PGPASSWORD`). Global flags go after the subcommand (a leading `--log-file` would be treated as a subcommand).

@@ -659,7 +659,7 @@ mod tests {
 
         let sql = plan.build_query(0).sql();
         let sql = sql.as_str();
-        assert!(sql.starts_with("/* rust-extract query_id=q_"), "got: {sql}");
+        assert!(sql.starts_with("/* el-ballista query_id=q_"), "got: {sql}");
         assert!(
             sql.contains("pipeline=unknown"),
             "no descriptor -> pipeline defaults to unknown, got: {sql}"

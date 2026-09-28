@@ -27,10 +27,10 @@ impl StatisticsCollector {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(ex: &rust_ballista_extraction_layer::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), rust_ballista_extraction_layer::connector::errors::ExtractorError> {
+    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
+    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
     /// use std::sync::Arc;
-    /// use rust_ballista_extraction_layer::connector::postgres::stats::StatisticsCollector;
+    /// use el_ballista::connector::postgres::stats::StatisticsCollector;
     ///
     /// let collector = StatisticsCollector::new(Arc::new(ex.pool().clone()), 900);
     /// let stats = collector.get_statistics("public", "orders").await?; // cached for 15 min
@@ -51,10 +51,10 @@ impl StatisticsCollector {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(ex: &rust_ballista_extraction_layer::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), rust_ballista_extraction_layer::connector::errors::ExtractorError> {
+    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
+    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
     /// use std::sync::Arc;
-    /// use rust_ballista_extraction_layer::connector::postgres::stats::StatisticsCollector;
+    /// use el_ballista::connector::postgres::stats::StatisticsCollector;
     ///
     /// let collector = StatisticsCollector::new(Arc::new(ex.pool().clone()), 900);
     /// let stats = collector.get_statistics("public", "orders").await?; // cached for 15 min

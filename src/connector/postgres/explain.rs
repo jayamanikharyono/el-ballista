@@ -16,8 +16,8 @@ use crate::pushdown::explain::{AccessMethod, ExplainEstimate};
 ///
 /// # Examples
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::explain::access_method_from_node_type;
-/// use rust_ballista_extraction_layer::pushdown::explain::AccessMethod;
+/// use el_ballista::connector::postgres::explain::access_method_from_node_type;
+/// use el_ballista::pushdown::explain::AccessMethod;
 /// assert_eq!(access_method_from_node_type("Index Scan"), AccessMethod::IndexScan);
 /// ```
 pub fn access_method_from_node_type(node_type: &str) -> AccessMethod {
@@ -44,10 +44,10 @@ impl ExplainEstimator {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(ex: &rust_ballista_extraction_layer::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), rust_ballista_extraction_layer::connector::errors::ExtractorError> {
+    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
+    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
     /// use std::sync::Arc;
-    /// use rust_ballista_extraction_layer::connector::postgres::explain::ExplainEstimator;
+    /// use el_ballista::connector::postgres::explain::ExplainEstimator;
     ///
     /// let estimator = ExplainEstimator::new(Arc::new(ex.pool().clone()), 300);
     /// let estimate = estimator.estimate_cost("orders", "public", "status = 'PAID'").await?;
@@ -73,10 +73,10 @@ impl ExplainEstimator {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(ex: &rust_ballista_extraction_layer::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), rust_ballista_extraction_layer::connector::errors::ExtractorError> {
+    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
+    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
     /// use std::sync::Arc;
-    /// use rust_ballista_extraction_layer::connector::postgres::explain::ExplainEstimator;
+    /// use el_ballista::connector::postgres::explain::ExplainEstimator;
     ///
     /// let estimator = ExplainEstimator::new(Arc::new(ex.pool().clone()), 300);
     /// let predicate = "created_at >= '2026-01-01'";
@@ -119,10 +119,10 @@ impl ExplainEstimator {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(ex: &rust_ballista_extraction_layer::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), rust_ballista_extraction_layer::connector::errors::ExtractorError> {
+    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
+    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
     /// use std::sync::Arc;
-    /// use rust_ballista_extraction_layer::connector::postgres::explain::ExplainEstimator;
+    /// use el_ballista::connector::postgres::explain::ExplainEstimator;
     ///
     /// let estimator = ExplainEstimator::new(Arc::new(ex.pool().clone()), 300);
     /// let pred = "id = 7";

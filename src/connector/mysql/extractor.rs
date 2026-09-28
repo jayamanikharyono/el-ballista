@@ -47,7 +47,7 @@ impl MysqlExtractor {
     ///
     /// ```no_run
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
+    /// use el_ballista::connector::mysql::MysqlExtractor;
     ///
     /// let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", "p@ss/w#rd", "test", 4).await?;
     /// let batch = ex.extract_full_table("actor", Some(vec!["actor_id"])).await?;
@@ -90,7 +90,7 @@ impl MysqlExtractor {
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
+    /// use el_ballista::connector::mysql::MysqlExtractor;
     ///
     /// let password = std::env::var("MYSQL_PASSWORD")?;
     /// let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "sakila", 4).await?;
@@ -146,7 +146,7 @@ impl MysqlExtractor {
     ///
     /// ```no_run
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
+    /// use el_ballista::connector::mysql::MysqlExtractor;
     ///
     /// let password = std::env::var("MYSQL_PASSWORD")?;
     /// let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "test", 4).await?;
@@ -200,7 +200,7 @@ impl MysqlExtractor {
     ///
     /// ```no_run
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
+    /// use el_ballista::connector::mysql::MysqlExtractor;
     ///
     /// let password = std::env::var("MYSQL_PASSWORD")?;
     /// let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "test", 4).await?;

@@ -12,12 +12,12 @@ mod common;
 
 use chrono::{NaiveDate, TimeZone, Utc};
 use common::{TEST_PASSWORD_ENV, TestDb};
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
@@ -42,7 +42,7 @@ async fn extractor(db: &TestDb) -> Result<PostgresExtractor, sqlx::Error> {
 }
 
 fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
-    use rust_ballista_extraction_layer::config::{FilterEntry, FilterInput};
+    use el_ballista::config::{FilterEntry, FilterInput};
     let filters = filters
         .into_iter()
         .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))
@@ -212,10 +212,10 @@ async fn bytea_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
 async fn empty_filter_returns_empty_stream_with_schema() -> Result<(), Box<dyn std::error::Error>> {
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionContext, col, lit};
+    use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
+    use el_ballista::connector::postgres::table_provider::PostgresTableProvider;
+    use el_ballista::pushdown::cost_model::CostParams;
     use futures::StreamExt;
-    use rust_ballista_extraction_layer::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
-    use rust_ballista_extraction_layer::connector::postgres::table_provider::PostgresTableProvider;
-    use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
     use std::sync::Arc;
 
     let db = live!();

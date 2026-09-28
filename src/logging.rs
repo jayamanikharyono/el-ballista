@@ -8,7 +8,7 @@
 //!
 //! Configuration comes from the environment and the command line, never the job JSON:
 //!   * level: `--log-level <off|error|warn|info|debug|trace>`, else `RUST_LOG`, else `info`.
-//!   * file:  `--log-file <path>`, else `REL_LOG_FILE`, else none (stderr only).
+//!   * file:  `--log-file <path>`, else `EL_BALLISTA_LOG_FILE`, else none (stderr only).
 //!
 //! At `debug` (or a more verbose level) every generated SQL query is emitted: the query
 //! builders and the execution plan log the final SQL text through `log::debug!`, so a
@@ -57,7 +57,7 @@ impl LogOptions {
             .unwrap_or(LevelFilter::Info);
 
         let file = flag_value(args, "--log-file")
-            .or_else(|| env("REL_LOG_FILE"))
+            .or_else(|| env("EL_BALLISTA_LOG_FILE"))
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
@@ -107,10 +107,10 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// # Examples
 ///
 /// ```no_run
-/// use rust_ballista_extraction_layer::logging;
+/// use el_ballista::logging;
 ///
 /// fn main() {
-///     // Honors RUST_LOG / --log-level and REL_LOG_FILE / --log-file.
+///     // Honors RUST_LOG / --log-level and EL_BALLISTA_LOG_FILE / --log-file.
 ///     logging::init_from_env_and_args();
 ///     log::info!("extraction starting");
 /// }
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn defaults_to_info_stderr() {
-        let o = LogOptions::resolve(&args(&["rel", "run"]), no_env);
+        let o = LogOptions::resolve(&args(&["el-ballista", "run"]), no_env);
         assert_eq!(o.level, LevelFilter::Info);
         assert!(o.file.is_none());
     }
@@ -177,12 +177,12 @@ mod tests {
     fn cli_flags_win_over_env() {
         let env = |k: &str| match k {
             "RUST_LOG" => Some("warn".to_string()),
-            "REL_LOG_FILE" => Some("/from/env.log".to_string()),
+            "EL_BALLISTA_LOG_FILE" => Some("/from/env.log".to_string()),
             _ => None,
         };
         let o = LogOptions::resolve(
             &args(&[
-                "rel",
+                "el-ballista",
                 "run",
                 "--log-level",
                 "debug",
@@ -199,10 +199,10 @@ mod tests {
     fn env_used_when_no_flag() {
         let env = |k: &str| match k {
             "RUST_LOG" => Some("trace".to_string()),
-            "REL_LOG_FILE" => Some("/e.log".to_string()),
+            "EL_BALLISTA_LOG_FILE" => Some("/e.log".to_string()),
             _ => None,
         };
-        let o = LogOptions::resolve(&args(&["rel"]), env);
+        let o = LogOptions::resolve(&args(&["el-ballista"]), env);
         assert_eq!(o.level, LevelFilter::Trace);
         assert_eq!(o.file, Some(PathBuf::from("/e.log")));
     }
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn eq_form_and_numeric_level() {
         let o = LogOptions::resolve(
-            &args(&["rel", "--log-level=4", "--log-file=/a.log"]),
+            &args(&["el-ballista", "--log-level=4", "--log-file=/a.log"]),
             no_env,
         );
         assert_eq!(o.level, LevelFilter::Debug);
@@ -219,8 +219,8 @@ mod tests {
 
     #[test]
     fn empty_file_is_none() {
-        let env = |k: &str| (k == "REL_LOG_FILE").then(String::new);
-        let o = LogOptions::resolve(&args(&["rel"]), env);
+        let env = |k: &str| (k == "EL_BALLISTA_LOG_FILE").then(String::new);
+        let o = LogOptions::resolve(&args(&["el-ballista"]), env);
         assert!(o.file.is_none());
     }
 }

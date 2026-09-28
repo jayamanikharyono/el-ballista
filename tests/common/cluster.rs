@@ -1,4 +1,4 @@
-//! A real Ballista cluster for distributed-path tests: one `rel scheduler` and N `rel worker`
+//! A real Ballista cluster for distributed-path tests: one `el-ballista scheduler` and N `el-ballista worker`
 //! **child processes** of this crate's own binary, on free localhost ports. There is no
 //! in-process Ballista any more, so this is the only way tests exercise plan shipping
 //! (codecs, keyset distribution, per-process budgets) — the same deployment shape as
@@ -6,7 +6,7 @@
 //!
 //! Children inherit the environment (the source password variable included), so start the
 //! cluster *after* `TestDb::connect()`. They are killed and reaped on `Drop` (also on test
-//! panic). Each child's output goes to `$TMPDIR/rel-test-cluster-<pid>-<n>-<role>.log`, kept
+//! panic). Each child's output goes to `$TMPDIR/el-ballista-test-cluster-<pid>-<n>-<role>.log`, kept
 //! only when the test fails, so a failure can be diagnosed.
 
 use std::fs::File;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const BIN: &str = env!("CARGO_BIN_EXE_rust-ballista-extraction-layer");
+const BIN: &str = env!("CARGO_BIN_EXE_el-ballista");
 static CLUSTERS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct TestCluster {
@@ -38,7 +38,7 @@ fn free_port() -> u16 {
 
 fn log_path(n: usize, role: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "rel-test-cluster-{}-{n}-{role}.log",
+        "el-ballista-test-cluster-{}-{n}-{role}.log",
         std::process::id()
     ))
 }
@@ -57,8 +57,8 @@ fn spawn(n: usize, role: &str, args: &[String]) -> Child {
         .unwrap_or_else(|e| panic!("spawn {BIN} {role}: {e}"))
 }
 
-/// Failure-detection timings of a test cluster (`rel scheduler --executor-timeout-secs`,
-/// `rel worker --heartbeat-secs`). `None` keeps the CLI defaults (30 s / 5 s).
+/// Failure-detection timings of a test cluster (`el-ballista scheduler --executor-timeout-secs`,
+/// `el-ballista worker --heartbeat-secs`). `None` keeps the CLI defaults (30 s / 5 s).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Failover {
     pub executor_timeout_secs: Option<u64>,
@@ -189,7 +189,7 @@ where
         assert!(
             Instant::now() < deadline,
             "cluster at {url} did not reach {want} registered executor(s) within 60 s (see \
-             $TMPDIR/rel-test-cluster-{}-*.log)",
+             $TMPDIR/el-ballista-test-cluster-{}-*.log)",
             std::process::id()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;

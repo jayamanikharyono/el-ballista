@@ -95,9 +95,9 @@ ROOT="$(dirname "$BENCH_DIR")"
 RESULTS="$BENCH_DIR/results"
 OUTPUT="$BENCH_DIR/output"
 
-IMG_RUST="${BENCH_RUST_IMAGE:-rel-bench-rust:latest}"
-IMG_SPARK="${BENCH_SPARK_IMAGE:-rel-bench-spark:latest}"
-NET="rel-bench-net"
+IMG_RUST="${BENCH_RUST_IMAGE:-el-ballista-bench-rust:latest}"
+IMG_SPARK="${BENCH_SPARK_IMAGE:-el-ballista-bench-spark:latest}"
+NET="el-ballista-bench-net"
 PG="bench-pg"
 PGDATA="bench-pgdata"
 PG_PORT="${PG_PORT:-5433}"
@@ -127,8 +127,8 @@ RUST_PARTITIONS=""
 # BATCH_SIZE empty = auto: batch_size is omitted from the Rust config (code default
 # 8192 applies) and Spark's JDBC fetchsize is set to the same 8192 (SPARK_AUTO_FETCHSIZE).
 # Spark's own default (fetchsize 0) makes the Postgres driver hold each partition's whole
-# result in the heap: 12.5M rows per task at 50M rows / 4 partitions, which runs out of
-# memory at every budget. Streaming in the same chunk size as Rust is the equal setting.
+# result in the heap: 12.5M rows per task at 50M rows / 4 partitions. Streaming in the same
+# chunk size as Rust is the equal setting.
 # Set via --batch-size to force the same rows-per-batch on both engines.
 BATCH_SIZE=""
 SPARK_AUTO_FETCHSIZE=8192
@@ -1248,7 +1248,7 @@ cat > "$BENCH_DIR/bench-config-$1.json" <<EOF
     "database": "app",
     "pool_max": $POOL_MAX,
     "statement_timeout_ms": 300000,
-    "application_name": "rel-bench-rust",
+    "application_name": "el-ballista-bench-rust",
     "schema": "public"
   },
   "checkpoint": {

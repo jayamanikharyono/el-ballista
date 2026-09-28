@@ -52,9 +52,9 @@ impl SqlDialect for PostgresDialect {
 ///
 /// # Examples
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::dialect::column_kind;
-/// use rust_ballista_extraction_layer::pushdown::ColumnKind;
-/// use rust_ballista_extraction_layer::types::ColumnMetadata;
+/// use el_ballista::connector::postgres::dialect::column_kind;
+/// use el_ballista::pushdown::ColumnKind;
+/// use el_ballista::types::ColumnMetadata;
 /// let uuid = ColumnMetadata {
 ///     column_name: "u".into(), data_type: "uuid".into(), is_nullable: true,
 ///     numeric_precision: None, numeric_scale: None, udt_name: Some("uuid".into()),
@@ -89,8 +89,8 @@ pub fn column_kind(column: &ColumnMetadata, is_enum: bool) -> ColumnKind {
 /// # Examples
 /// ```
 /// use std::collections::HashSet;
-/// use rust_ballista_extraction_layer::connector::postgres::dialect::column_kinds;
-/// use rust_ballista_extraction_layer::types::TableMetadata;
+/// use el_ballista::connector::postgres::dialect::column_kinds;
+/// use el_ballista::types::TableMetadata;
 /// let table = TableMetadata { schema_name: "public".into(), table_name: "t".into(), columns: vec![] };
 /// assert!(column_kinds(&table, &HashSet::new(), true).is_empty());
 /// ```

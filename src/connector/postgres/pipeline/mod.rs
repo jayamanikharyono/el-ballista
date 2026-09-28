@@ -62,13 +62,13 @@ impl Pipeline {
     /// # Examples
     ///
     /// ```no_run
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::pipeline::Pipeline;
     ///
     /// let config = JobConfig::from_file("job.json")?;
     /// let pipeline = Pipeline::from_config(config)?;
     /// println!("{:?}", pipeline.filter_exprs()?);
-    /// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
+    /// # Ok::<(), el_ballista::errors::AppError>(())
     /// ```
     pub fn from_config(config: JobConfig) -> Result<Self, AppError> {
         config.validate()?;
@@ -120,15 +120,15 @@ impl Pipeline {
     }
 
     /// A DataFrame over the job's table with the job's filters (the same schema-coerced
-    /// predicates every run uses), its column projection and `LIMIT limit` — what `rel plan`
+    /// predicates every run uses), its column projection and `LIMIT limit` — what `el-ballista plan`
     /// shows. Unsplit and checkpoint-free; the limit pushes to the source when the pushdown
     /// rules allow it.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// use el_ballista::connector::postgres::PostgresConnector;
     ///
     /// let connector = PostgresConnector::from_config_file("job.json")?;
     /// connector.pipeline().preview(20).await?.show().await?;

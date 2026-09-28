@@ -3,7 +3,7 @@
 //! [`PredicateInlineSql::render_inline`] renders a [`Predicate`] with literals inlined as
 //! **Postgres** SQL text. It goes through the same [`Predicate::render_to`] as execution (so
 //! parenthesization and casts are identical) with a sink that writes literals instead of binding
-//! them. Used only for `EXPLAIN (FORMAT JSON)` cost estimation, cache keys, and `rel plan`
+//! them. Used only for `EXPLAIN (FORMAT JSON)` cost estimation, cache keys, and `el-ballista plan`
 //! output — never for a query that returns rows.
 
 use crate::connector::postgres::dialect::PostgresDialect;
@@ -16,8 +16,8 @@ pub trait PredicateInlineSql {
     /// # Examples
     /// ```
     /// use datafusion::prelude::{col, lit};
-    /// use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
-    /// use rust_ballista_extraction_layer::pushdown::translate;
+    /// use el_ballista::connector::postgres::inline_sql::PredicateInlineSql;
+    /// use el_ballista::pushdown::translate;
     /// let (_, p) = translate(&col("id").eq(lit(7i64))).unwrap();
     /// assert_eq!(p.render_inline(), r#"("id" = 7)"#);
     /// ```

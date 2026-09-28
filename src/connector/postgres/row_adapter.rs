@@ -44,8 +44,8 @@ impl PostgresRowAdapter {
     ///
     /// ```
     /// use arrow::datatypes::DataType;
-    /// use rust_ballista_extraction_layer::connector::postgres::row_adapter::PostgresRowAdapter;
-    /// use rust_ballista_extraction_layer::types::{ColumnMetadata, TableMetadata};
+    /// use el_ballista::connector::postgres::row_adapter::PostgresRowAdapter;
+    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
     ///
     /// let col = |name: &str, data_type: &str, is_nullable| ColumnMetadata {
     ///     column_name: name.into(), data_type: data_type.into(), is_nullable,
@@ -59,7 +59,7 @@ impl PostgresRowAdapter {
     /// let schema = PostgresRowAdapter::build_arrow_schema(&meta)?;
     /// assert_eq!(schema.field(0).data_type(), &DataType::Int64);
     /// assert!(!schema.field(0).is_nullable() && schema.field(1).is_nullable());
-    /// # Ok::<(), rust_ballista_extraction_layer::connector::errors::ExtractorError>(())
+    /// # Ok::<(), el_ballista::connector::errors::ExtractorError>(())
     /// ```
     pub fn build_arrow_schema(
         table_metadata: &TableMetadata,
@@ -323,7 +323,7 @@ fn unsupported(column: &str, arrow_type: &str, reason: &str) -> ExtractorError {
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::row_adapter::pg_timestamp_to_arrow;
+/// use el_ballista::connector::postgres::row_adapter::pg_timestamp_to_arrow;
 ///
 /// assert_eq!(pg_timestamp_to_arrow(0, "ts").unwrap(), 946_684_800_000_000);
 /// assert!(pg_timestamp_to_arrow(i64::MAX, "ts").is_err());
@@ -346,7 +346,7 @@ pub fn pg_timestamp_to_arrow(pg_micros: i64, column: &str) -> Result<i64, Extrac
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::row_adapter::pg_date_to_arrow;
+/// use el_ballista::connector::postgres::row_adapter::pg_date_to_arrow;
 ///
 /// assert_eq!(pg_date_to_arrow(0, "d").unwrap(), 10_957);
 /// assert!(pg_date_to_arrow(i32::MAX, "d").is_err());
@@ -515,8 +515,8 @@ impl RowBatchBuilder {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::connector::postgres::row_adapter::RowBatchBuilder;
-    /// use rust_ballista_extraction_layer::types::{ColumnMetadata, TableMetadata};
+    /// use el_ballista::connector::postgres::row_adapter::RowBatchBuilder;
+    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
     ///
     /// let col = |name: &str, data_type: &str, is_nullable| ColumnMetadata {
     ///     column_name: name.into(), data_type: data_type.into(), is_nullable,
@@ -529,7 +529,7 @@ impl RowBatchBuilder {
     /// };
     /// let builder = RowBatchBuilder::new(&meta)?;
     /// assert_eq!(builder.row_count(), 0);
-    /// # Ok::<(), rust_ballista_extraction_layer::connector::errors::ExtractorError>(())
+    /// # Ok::<(), el_ballista::connector::errors::ExtractorError>(())
     /// ```
     pub fn new(table_metadata: &TableMetadata) -> Result<Self, ExtractorError> {
         Self::with_capacity(table_metadata, 1024)
@@ -684,8 +684,8 @@ impl RowBatchBuilder {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::connector::postgres::row_adapter::RowBatchBuilder;
-    /// use rust_ballista_extraction_layer::types::{ColumnMetadata, TableMetadata};
+    /// use el_ballista::connector::postgres::row_adapter::RowBatchBuilder;
+    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
     ///
     /// let col = |name: &str, data_type: &str, is_nullable| ColumnMetadata {
     ///     column_name: name.into(), data_type: data_type.into(), is_nullable,
@@ -698,7 +698,7 @@ impl RowBatchBuilder {
     /// };
     /// let builder = RowBatchBuilder::new(&meta)?;
     /// assert_eq!(builder.row_count(), 0);
-    /// # Ok::<(), rust_ballista_extraction_layer::connector::errors::ExtractorError>(())
+    /// # Ok::<(), el_ballista::connector::errors::ExtractorError>(())
     /// ```
     pub fn row_count(&self) -> usize {
         self.row_count

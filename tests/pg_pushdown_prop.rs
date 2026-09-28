@@ -18,17 +18,17 @@ use std::sync::Arc;
 
 use common::{TEST_PASSWORD_ENV, TestDb};
 use datafusion::prelude::SessionContext;
-use proptest::prelude::*;
-use proptest::strategy::ValueTree;
-use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
-use rust_ballista_extraction_layer::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
-use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
-use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
+use el_ballista::connector::postgres::PostgresTableProvider;
+use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
+use el_ballista::pushdown::PushdownPolicy;
+use el_ballista::pushdown::cost_model::CostParams;
+use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

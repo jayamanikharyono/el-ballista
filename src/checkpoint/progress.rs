@@ -322,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn reporter_never_blocks_and_shutdown_returns_snapshot() {
         let dir = std::env::temp_dir().join(format!(
-            "rel_progress_test_{}_{}",
+            "el_ballista_progress_test_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
@@ -345,7 +345,7 @@ mod tests {
     #[tokio::test]
     async fn try_report_under_load_does_not_panic() {
         let dir = std::env::temp_dir().join(format!(
-            "rel_progress_load_{}_{}",
+            "el_ballista_progress_load_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));

@@ -14,15 +14,15 @@
 //! cargo run --example filtered_extraction
 //! ```
 
+use el_ballista::config::JobConfig;
+use el_ballista::connector::postgres::PostgresConnector;
 use futures::TryStreamExt;
-use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Filtered Extraction Example");

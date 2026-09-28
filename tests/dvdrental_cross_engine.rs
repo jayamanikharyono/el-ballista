@@ -12,8 +12,8 @@
 //! failure to connect is a hard failure, with a message pointing at the stack.
 
 use arrow::array::{Array, BinaryArray, StringArray};
-use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
-use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+use el_ballista::connector::mysql::MysqlExtractor;
+use el_ballista::connector::postgres::PostgresExtractor;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool, Row};

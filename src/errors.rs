@@ -123,7 +123,7 @@ impl AppError {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::errors::AppError;
+    /// use el_ballista::errors::AppError;
     ///
     /// let err = AppError::Config("bad value".into());
     /// assert!(matches!(err.underlying(), AppError::Config(_)));
@@ -174,7 +174,7 @@ impl SplitFailure {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::errors::{AppError, SplitFailure};
+    /// use el_ballista::errors::{AppError, SplitFailure};
     ///
     /// let failure = SplitFailure {
     ///     split_id: "split-1".into(),
@@ -203,7 +203,7 @@ fn describe_failures(failures: &[SplitFailure]) -> String {
 ///
 /// ```
 /// use std::path::PathBuf;
-/// use rust_ballista_extraction_layer::errors::{AppError, error_chain};
+/// use el_ballista::errors::{AppError, error_chain};
 ///
 /// let err = AppError::ConfigRead {
 ///     path: PathBuf::from("/etc/job.json"),

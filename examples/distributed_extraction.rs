@@ -10,24 +10,24 @@
 //! streams the cluster's result straight into one local Parquet file (memory stays O(batch)).
 //! Materializing output is the caller's job — this project is not a sink.
 //!
-//! Needs a running cluster: `rel scheduler` plus `[workers]` `rel worker` processes, at the
+//! Needs a running cluster: `el-ballista scheduler` plus `[workers]` `el-ballista worker` processes, at the
 //! config's `distributed.scheduler_url` (default `http://localhost:50050`), e.g.
 //!
-//!   rel scheduler &
-//!   rel worker --scheduler-url http://localhost:50050 &
-//!   rel worker --scheduler-url http://localhost:50050 --port 50061 --grpc-port 50062 &
+//!   el-ballista scheduler &
+//!   el-ballista worker --scheduler-url http://localhost:50050 &
+//!   el-ballista worker --scheduler-url http://localhost:50050 --port 50061 --grpc-port 50062 &
 
 use std::fs::{self, File};
 
+use el_ballista::connector::postgres::PostgresConnector;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     let config_path = std::env::args()
         .nth(1)

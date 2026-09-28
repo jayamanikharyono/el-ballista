@@ -20,7 +20,7 @@ pub const MAX_JOB_ID_LEN: usize = 128;
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::types::JobId;
+/// use el_ballista::types::JobId;
 ///
 /// let id = JobId::new("orders.v1").unwrap();
 /// assert_eq!(id.as_str(), "orders.v1");
@@ -47,7 +47,7 @@ impl JobId {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::types::JobId;
     /// assert!(JobId::new("nightly/orders").is_ok());
     /// assert!(JobId::new("bad\nid").is_err());
     /// ```
@@ -75,11 +75,11 @@ impl JobId {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::types::JobId;
     ///
     /// let id = JobId::new("orders.v1")?;
     /// assert_eq!(id.as_str(), "orders.v1");
-    /// # Ok::<(), rust_ballista_extraction_layer::types::InvalidJobId>(())
+    /// # Ok::<(), el_ballista::types::InvalidJobId>(())
     /// ```
     pub fn as_str(&self) -> &str {
         &self.0

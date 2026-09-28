@@ -33,7 +33,7 @@ parallelism had no execution path. All fixed:
   statistics at registration so the sync planning path decides without touching the source.
 - `SourceAwarePushdownRule` is a real `OptimizerRule` (split conjuncts into `TableScan.filters`,
   keep `Inexact` predicates above the scan for Arrow re-checking), registered in the engine
-  session and `rel plan`.
+  session and `el-ballista plan`.
 - `ExtractContext`/`SourceDataFrame` delegate to DataFusion's own `DataFrame` (`filter`,
   `select`, `with_column`, `limit`, `collect`), plus a working `incremental()` window and
   `sql()` entry point; see `../../examples/dataframe_extraction.rs`.
@@ -513,7 +513,7 @@ pub struct ParallelScanConfig {
 
 ```
 $ cargo build
-   Compiling rust-ballista-extraction-layer v0.1.0
+   Compiling el-ballista v0.1.0
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.90s
 
 Errors: 0

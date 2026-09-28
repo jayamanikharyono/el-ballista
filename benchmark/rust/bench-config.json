@@ -9,7 +9,7 @@
     "database": "app",
     "pool_max": 256,
     "statement_timeout_ms": 300000,
-    "application_name": "rel-bench-rust",
+    "application_name": "el-ballista-bench-rust",
     "schema": "public"
   },
   "checkpoint": {

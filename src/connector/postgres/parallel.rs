@@ -55,10 +55,10 @@ pub struct ScanPartition {
 /// # Examples
 ///
 /// ```no_run
-/// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-/// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+/// # use el_ballista::connector::errors::ExtractorError;
+/// # use el_ballista::connector::postgres::PostgresExtractor;
 /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-/// use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
+/// use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
 ///
 /// let parts = compute_keyset_partitions(ex.pool(), "public", "orders", "id", 4).await?;
 /// for p in &parts {
@@ -211,7 +211,7 @@ fn keyset_predicate(col: &str, partition_id: usize, lo: i64, hi: Option<i64>) ->
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::parallel::keyset_partition;
+/// use el_ballista::connector::postgres::parallel::keyset_partition;
 ///
 /// let p = keyset_partition("id", 1, Some(10), None).unwrap();
 /// assert_eq!(p.predicate.as_deref(), Some(r#""id" >= 10"#));

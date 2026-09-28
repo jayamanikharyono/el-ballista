@@ -143,7 +143,7 @@ and that the encoded buffer carries the magic.
 
 `../../src/distributed/table_codec.rs`
 
-The `rel distribute` client and scheduler exchange a *logical* plan too. Ballista's default logical
+The `el-ballista distribute` client and scheduler exchange a *logical* plan too. Ballista's default logical
 codec rejects provider nodes it doesn't recognize, so `PostgresLogicalCodec` serializes our table
 provider as JSON (same magic prefix) and rebuilds it on the scheduler **without opening a single
 connection** — the descriptor is carried, the pool is deferred. `try_encode_table_provider` /
@@ -232,7 +232,7 @@ Both paths build the Client session with our codecs registered via
   plan-shipping path (codecs, partition distribution, budgeted pools), which is what the exit
   criterion needs validated before adding machines.
 - **`remote(config, url, workers)`** — `SessionContext::remote_with_state(url, ...)` connects to an
-  already-running `rel scheduler`; workers are separate `rel worker` processes.
+  already-running `el-ballista scheduler`; workers are separate `el-ballista worker` processes.
 - **`register_source(&config)`** — opens the budgeted pool (via the registry), discovers the
   schema, registers a `PostgresTableProvider` split into `workers` keyset partitions when a
   partition column is configured.
@@ -241,26 +241,26 @@ Both paths build the Client session with our codecs registered via
 process) and the keyset partition count — a three-machine deployment adds machines without adding
 source connections.
 
-### ✓ Task 9: CLI — `rel distribute` / `rel scheduler` / `rel worker`
+### ✓ Task 9: CLI — `el-ballista distribute` / `el-ballista scheduler` / `el-ballista worker`
 
 `../../src/cli/mod.rs`
 
 ```
-rel distribute --config <path> [--workers N] [--scheduler-url http://host:port]
-rel scheduler [--scheduler-url http://host:port]
-rel worker --scheduler-url http://host:port
+el-ballista distribute --config <path> [--workers N] [--scheduler-url http://host:port]
+el-ballista scheduler [--scheduler-url http://host:port]
+el-ballista worker --scheduler-url http://host:port
 ```
 
-- `rel scheduler` — long-running Ballista scheduler on its own process (so it stays up across
+- `el-ballista scheduler` — long-running Ballista scheduler on its own process (so it stays up across
   worker restarts). Builds `SchedulerConfig` with `override_logical_codec` /
   `override_physical_codec` set to our codecs, a `BallistaCluster::new_memory` cluster, and calls
   `start_server(cluster, addr, config)`. The overridden codecs let the scheduler decode the
   provider and rebuild the scan plan when it plans tasks — without opening any source connection.
-- `rel worker` — one long-running Ballista executor via `start_executor_process`, connected to the
+- `el-ballista worker` — one long-running Ballista executor via `start_executor_process`, connected to the
   scheduler URL, with our codecs in `ExecutorProcessConfig.override_*`. Each worker resolves source
   descriptors in encoded tasks and opens only its `pool_max / workers` share (through
   `SourcePoolRegistry`).
-- `rel distribute` — the job driver, mirroring `rel run` semantics (§5 commit protocol):
+- `el-ballista distribute` — the job driver, mirroring `el-ballista run` semantics (§5 commit protocol):
   1. `DistributedContext` in the chosen mode (`remote` if `--scheduler-url`, else `standalone`);
   2. `register_source`;
   3. acquire the checkpoint lease;
@@ -271,13 +271,13 @@ rel worker --scheduler-url http://host:port
   6. commit `clamp_to_observed(window.hi, max_observed)` so the watermark never advances past what
      was actually observed (docs/incremental-extraction.md §3.1 Mitigation 3).
 
-`rel plan` was also switched from the raw extractor to the descriptor-based
+`el-ballista plan` was also switched from the raw extractor to the descriptor-based
 `PostgresTableProvider::new(...)` path, so planning and executing share one code path.
 
 ### ✓ Task 10: Example + wiring
 
 - `../../examples/distributed_extraction.rs` — `DistributedContext::standalone(config, workers)` against
-  the same job-spec JSON as `rel run`, `register_source`, then `df.limit(0, Some(100)).show()`.
+  the same job-spec JSON as `el-ballista run`, `register_source`, then `df.limit(0, Some(100)).show()`.
 - `../../src/lib.rs` and `../../src/main.rs` — new `pub mod distributed`.
 - `../../Cargo.toml` — added `ballista-core`, `ballista-scheduler`, `ballista-executor`,
   `ballista-executor`'s `arrow-ipc-optimizations` feature, and `datafusion-proto`, all `54.1.0`,
@@ -295,7 +295,7 @@ Postgres ──► PostgresExecutionPlan ──► streaming RecordBatch ──�
 
 ### After (Phase 4 — distributed)
 ```
-                          rel distribute (client)
+                          el-ballista distribute (client)
                      DistributedContext: client session
                      with codecs; registers provider; reads
                      checkpoint; plans window as a pushed filter
@@ -316,7 +316,7 @@ Postgres ──► PostgresExecutionPlan ──► streaming RecordBatch ──�
 
 ### Plan-shipping flow
 ```
-rel distribute                                   scheduler / workers
+el-ballista distribute                                   scheduler / workers
   Provider ──PostgresLogicalCodec──► JSON {descriptor, metadata, ...} + PGSC01 magic
   Scan plan ──PostgresPhysicalCodec──► JSON {descriptor, partitions, pushed_*, window}
                                          │
@@ -384,7 +384,7 @@ remain from earlier phases; none originate in Phase 4 code
 ⏳ Not verifiable in this environment (needs a live cluster + Postgres):
 - three-machine wall-clock scaling vs. single machine;
 - confirming the source connection count stays flat at `pool_max` across 1 → 3 workers;
-- an end-to-end `rel scheduler` + two `rel worker` + `rel distribute` run against a real table.
+- an end-to-end `el-ballista scheduler` + two `el-ballista worker` + `el-ballista distribute` run against a real table.
 
 ---
 
@@ -411,7 +411,7 @@ remain from earlier phases; none originate in Phase 4 code
 | `../../src/pushdown/cost_model.rs` | test fixtures adapted to `op: String` |
 | `../../src/types/table_metadata.rs`, `../../src/types/column_metadata.rs` | serde derives |
 | `../../src/config/mod.rs` | `SourceConfig` Serialize; `DistributedConfig`; `JobConfig.distributed` |
-| `../../src/cli/mod.rs` | `rel distribute` / `rel scheduler` / `rel worker`; descriptor-based `rel plan` |
+| `../../src/cli/mod.rs` | `el-ballista distribute` / `el-ballista scheduler` / `el-ballista worker`; descriptor-based `el-ballista plan` |
 | `../../src/lib.rs`, `../../src/main.rs` | `pub mod distributed` |
 | `../../src/demo.rs` | `JobConfig` initializer gains `distributed` |
 | `examples/*` | config instantiation updated where needed |
@@ -428,9 +428,9 @@ remain from earlier phases; none originate in Phase 4 code
       `budgeted_max_connections = max(1, pool_max / max(1, workers))`.
 - [x] Scheduler plans without opening any source connection (lazy/deferred pools).
 - [x] Passwords never cross a process boundary (env-var name only).
-- [x] Both deployment modes implemented (`standalone`, `rel scheduler` + `rel worker` + `remote`).
-- [x] Existing Phase 1–3 behavior intact: `rel run` / `rel plan` / `rel backfill` unchanged except
-      `rel plan` now goes through the same descriptor-based provider path.
+- [x] Both deployment modes implemented (`standalone`, `el-ballista scheduler` + `el-ballista worker` + `remote`).
+- [x] Existing Phase 1–3 behavior intact: `el-ballista run` / `el-ballista plan` / `el-ballista backfill` unchanged except
+      `el-ballista plan` now goes through the same descriptor-based provider path.
 - [x] Unit tests for the new surface pass; `cargo test` 52/52; build 0 errors.
 
 ---

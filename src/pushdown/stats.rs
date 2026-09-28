@@ -40,8 +40,8 @@ pub struct ColumnStats {
 /// # Examples
 /// ```
 /// use chrono::NaiveDate;
-/// use rust_ballista_extraction_layer::pushdown::Literal;
-/// use rust_ballista_extraction_layer::pushdown::stats::ordinal;
+/// use el_ballista::pushdown::Literal;
+/// use el_ballista::pushdown::stats::ordinal;
 /// assert_eq!(ordinal(&Literal::Int(7)), Some(7.0));
 /// let d = NaiveDate::from_ymd_opt(1970, 1, 11).unwrap();
 /// assert_eq!(ordinal(&Literal::Date(d)), Some(10.0));
@@ -94,7 +94,7 @@ impl SourceStatistics {
     ///
     /// # Examples
     /// ```
-    /// use rust_ballista_extraction_layer::pushdown::stats::SourceStatistics;
+    /// use el_ballista::pushdown::stats::SourceStatistics;
     /// let stats = SourceStatistics::empty("orders");
     /// assert!(stats.columns.is_empty());
     /// ```

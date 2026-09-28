@@ -1,6 +1,6 @@
 //! Logical-plan extension codec for Ballista.
 //! distributed/table_codec.rs
-//! The `rel distribute` client registers a `PostgresTableProvider` and runs
+//! The `el-ballista distribute` client registers a `PostgresTableProvider` and runs
 //! `DataFrame::create_physical_plan` locally — the physical plan is what gets shipped. But the
 //! *logical* plan also travels (client → scheduler → planner), and Ballista's default logical
 //! codec rejects provider nodes it doesn't recognize. This codec serializes our provider as JSON
@@ -43,7 +43,7 @@ impl PostgresLogicalCodec {
     /// ```
     /// use std::sync::Arc;
     /// use datafusion_proto::logical_plan::LogicalExtensionCodec;
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::PostgresLogicalCodec;
+    /// use el_ballista::connector::postgres::distributed::PostgresLogicalCodec;
     ///
     /// // Handed to Ballista (scheduler/executor config) in place of its default codec.
     /// let codec: Arc<dyn LogicalExtensionCodec> = Arc::new(PostgresLogicalCodec::new());

@@ -1,6 +1,6 @@
 //! Process-wide sharing of budgeted source pools.
 //! distributed/pool_registry.rs
-//! The client (scheduler or the `rel distribute` process) and every Ballista executor in the
+//! The client (scheduler or the `el-ballista distribute` process) and every Ballista executor in the
 //! same process must not each open their own `pool_max` connections to the source — with N
 //! executors that would be N × `pool_max`, exactly the failure mode docs/roadmap.md Phase 4
 //! names. A single process-wide registry keys one pool per source; executors that materialize a
@@ -37,7 +37,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+/// use el_ballista::connector::postgres::distributed::pool_registry::registry;
 ///
 /// // One registry per process: every caller shares the same budgeted pools.
 /// assert!(std::ptr::eq(registry(), registry()));
@@ -173,7 +173,7 @@ impl SourcePoolRegistry {
     /// ```
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() {
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+    /// use el_ballista::connector::postgres::distributed::pool_registry::registry;
     ///
     /// // At shutdown: close pooled source connections gracefully.
     /// registry().close_all().await;
@@ -195,7 +195,7 @@ impl SourcePoolRegistry {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+    /// use el_ballista::connector::postgres::distributed::pool_registry::registry;
     ///
     /// // Pools open lazily, on the first scan of a source.
     /// println!("{} open source pool(s)", registry().len());
@@ -211,7 +211,7 @@ impl SourcePoolRegistry {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::pool_registry::registry;
+    /// use el_ballista::connector::postgres::distributed::pool_registry::registry;
     ///
     /// if registry().is_empty() {
     ///     println!("no source connections held by this process");

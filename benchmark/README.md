@@ -21,11 +21,11 @@ cores 4-7 with 2g, best of 3 ([full spec and the 2g / 8g tables](#results)):
 
 | engine | scenario | elapsed_ms | cpu_seconds | peak_mem_mib |
 |---|---|---|---|---|
-| rust-datafusion-standalone | full | 33702 | 52.17 | 190 |
-| rust-ballista-remote | full | 66904 | 105.17 | 288 |
+| el-ballista-standalone | full | 33702 | 52.17 | 190 |
+| el-ballista-distributed | full | 66904 | 105.17 | 288 |
 | pyspark-3.5.4 | full | 150437 | 212.2 | 3768 |
-| rust-datafusion-standalone | selective | 8326 | 16.61 | 31 |
-| rust-ballista-remote | selective | 9088 | 17.13 | 70 |
+| el-ballista-standalone | selective | 8326 | 16.61 | 31 |
+| el-ballista-distributed | selective | 9088 | 17.13 | 70 |
 | pyspark-3.5.4 | selective | 19501 | 13.04 | 541 |
 
 These runs used `--skip-correctness`: the gate checked row counts, not row multisets (see
@@ -72,7 +72,7 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 
 | Mode | How the scan runs |
 |---|---|
-| `standalone` | Plain DataFusion in one container — no Ballista scheduler or executor. The provider is registered in a `SessionContext` (`connector::postgres::register_table`); DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU), and the process uses the whole `pool_max`. Engine label `rust-datafusion-standalone`. |
+| `standalone` | Plain DataFusion in one container — no Ballista scheduler or executor. The provider is registered in a `SessionContext` (`connector::postgres::register_table`); DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU), and the process uses the whole `pool_max`. Engine label `el-ballista-standalone`. |
 | `distributed` | Real `bench-scheduler` + `bench-worker-N` containers (our scheduler/worker with Postgres codecs — stock Ballista binaries cannot decode our plans), remote client container. The engine cores are **split**, not shared: the first core runs the scheduler + client, each of the 3 workers (default) gets its own core from the rest (0 / 1 / 2 / 3 on the default pin). Each worker gets as many task slots as source connections (`pool_max / workers` = 4). A **fresh cluster is started for every attempt**, like every other engine container. Workers advertise container names so the scheduler dials them back; every process resolves the source password independently. |
 
 | | Rust | Spark |
@@ -86,7 +86,7 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 | Timed | **End to end:** program entry point (before the config is read) to the last Parquet byte written — config load, schema discovery, split planning, scan, encode (`scan_ms` + `write_ms` split in JSON) | **End to end:** program entry point (before the SparkSession / JVM starts) to the last Parquet byte written — session start-up and the partition-bounds query included; the row-count read-back runs after the timer |
 | Other settings | Tool defaults | Tool defaults (no shuffle or other tuning); only the driver heap is set, solved from the container budget |
 
-Batch size (`--batch-size`) is optional and applies to **both** engines: Spark's JDBC `fetchsize` and the Rust job spec's `execution.batch_size` (rows per Arrow batch and per cursor `FETCH`; `run.sh` writes it into the generated `bench-config-<scenario>.json`). **Auto run** (flag absent): Rust uses its code default of 8192 rows per batch, and Spark's JDBC `fetchsize` is set to the same 8192. Spark's own default (`fetchsize` 0) makes the Postgres driver hold each partition's whole result in the heap; at 50M rows over 4 partitions that is 12.5M rows per task, and the full load ran out of memory at every budget. **Manual run** (`--batch-size 64000`): both engines use that many rows per batch. The batch size never changes the partition count (engine cores by default), so a batch experiment changes one thing. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
+Batch size (`--batch-size`) is optional and applies to **both** engines: Spark's JDBC `fetchsize` and the Rust job spec's `execution.batch_size` (rows per Arrow batch and per cursor `FETCH`; `run.sh` writes it into the generated `bench-config-<scenario>.json`). **Auto run** (flag absent): Rust uses its code default of 8192 rows per batch, and Spark's JDBC `fetchsize` is set to the same 8192. With Spark's own default (`fetchsize` 0) the Postgres JDBC driver buffers each partition's whole result in the heap, 12.5M rows per task at 50M rows over 4 partitions, so the published runs always set a fetch size (see *Why Spark gets a fetch size* under Results). **Manual run** (`--batch-size 64000`): both engines use that many rows per batch. The batch size never changes the partition count (engine cores by default), so a batch experiment changes one thing. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
 
 CPU/MEM for distributed runs aggregates the whole cluster (scheduler + workers + client
 summed per tick), comparable to single-container runs. bench-pg is profiled on the same
@@ -190,7 +190,7 @@ The Rust release build is the slow part (Ballista + DataFusion, ~400 crates):
   minutes, not a full rebuild.
 - `--no-build` reuses images already present locally.
 - `--pull` pulls the images named by `BENCH_RUST_IMAGE` / `BENCH_SPARK_IMAGE` (defaults
-  `rel-bench-rust:latest` / `rel-bench-spark:latest`) instead of building. The repository
+  `el-ballista-bench-rust:latest` / `el-ballista-bench-spark:latest`) instead of building. The repository
   publishes no images, so point these at a registry where the images were pushed after a
   build elsewhere.
 
@@ -320,9 +320,9 @@ Spec (all three tables):
 - **Timing:** end to end, from the program entry point to the last byte written. Spark's session start-up is included; its read-back count is not.
 - **Pinning:** engine containers on cores 0-3; bench-pg on cores 4-7 with 2g.
 - **Rust modes:**
-  - standalone: plain DataFusion (`rust-datafusion-standalone`);
-  - distributed: scheduler + client on core 0, 3 workers on cores 1, 2 and 3 with 4 task slots each, a fresh cluster per attempt (`rust-ballista-remote`).
-- **Batch / fetch size:** 8192 rows on both sides (Rust's default batch; Spark's JDBC `fetchsize` set to match, since Spark's own default runs out of memory, see below).
+  - standalone: plain DataFusion (`el-ballista-standalone`);
+  - distributed: scheduler + client on core 0, 3 workers on cores 1, 2 and 3 with 4 task slots each, a fresh cluster per attempt (`el-ballista-distributed`).
+- **Batch / fetch size:** 8192 rows on both sides (Rust's default batch; Spark's JDBC `fetchsize` set to match, because the driver default buffers a whole partition in the heap, see below).
 - **Runs:** sequential, best of 3, with `--skip-correctness`: the gate checked row counts, not row multisets. Each run's `results/summary.md` holds its spec card.
 - **What varies:** only the engine memory budget, which the distributed deployment splits across its containers:
 
@@ -346,11 +346,11 @@ Process memory (`peak_rss_mib`) and the per-container breakdown, bench-pg includ
 
 | engine                     | scenario  | elapsed_ms | cpu_seconds | peak_mem_mib | mem_peak_exact_mib |
 |----------------------------|-----------|------------|-------------|--------------|--------------------|
-| rust-ballista-remote       | full      | 65696      | 104.76      | 357          | 5172               |
-| rust-datafusion-standalone | full      | 35143      | 50.97       | 183          | 2398               |
+| el-ballista-distributed    | full      | 65696      | 104.76      | 357          | 5172               |
+| el-ballista-standalone     | full      | 35143      | 50.97       | 183          | 2398               |
 | pyspark-3.5.4              | full      | 154468     | 230.02      | 4912         | 8192               |
-| rust-ballista-remote       | selective | 9573       | 17.72       | 69           | 113                |
-| rust-datafusion-standalone | selective | 8394       | 17.55       | 32           | 39                 |
+| el-ballista-distributed | selective | 9573       | 17.72       | 69           | 113                |
+| el-ballista-standalone | selective | 8394       | 17.55       | 32           | 39                 |
 | pyspark-3.5.4              | selective | 19958      | 13.62       | 651          | 676                |
 
 One Spark full attempt at 8g was discarded and re-run: a `bench-spark` container left over from an earlier, interrupted run blocked it. `run.sh` removes leftover containers before every run.
@@ -359,25 +359,25 @@ One Spark full attempt at 8g was discarded and re-run: a `bench-spark` container
 
 | engine                     | scenario  | elapsed_ms | cpu_seconds | peak_mem_mib | mem_peak_exact_mib |
 |----------------------------|-----------|------------|-------------|--------------|--------------------|
-| rust-ballista-remote       | full      | 66904      | 105.17      | 288          | 3599               |
-| rust-datafusion-standalone | full      | 33702      | 52.17       | 190          | 2435               |
+| el-ballista-distributed    | full      | 66904      | 105.17      | 288          | 3599               |
+| el-ballista-standalone     | full      | 33702      | 52.17       | 190          | 2435               |
 | pyspark-3.5.4              | full      | 150437     | 212.2       | 3768         | 4099               |
-| rust-ballista-remote       | selective | 9088       | 17.13       | 70           | 114                |
-| rust-datafusion-standalone | selective | 8326       | 16.61       | 31           | 38                 |
+| el-ballista-distributed | selective | 9088       | 17.13       | 70           | 114                |
+| el-ballista-standalone | selective | 8326       | 16.61       | 31           | 38                 |
 | pyspark-3.5.4              | selective | 19501      | 13.04       | 541          | 559                |
 
 ### Engine budget 2g
 
 | engine                     | scenario  | elapsed_ms | cpu_seconds | peak_mem_mib | mem_peak_exact_mib |
 |----------------------------|-----------|------------|-------------|--------------|--------------------|
-| rust-ballista-remote       | full      | 65785      | 103.41      | 250          | 1550               |
-| rust-datafusion-standalone | full      | 34455      | 52.74       | 180          | 2049               |
+| el-ballista-distributed    | full      | 65785      | 103.41      | 250          | 1550               |
+| el-ballista-standalone     | full      | 34455      | 52.74       | 180          | 2049               |
 | pyspark-3.5.4              | full      | 137234     | 193.62      | 1844         | 2052               |
-| rust-ballista-remote       | selective | 9120       | 16.89       | 70           | 116                |
-| rust-datafusion-standalone | selective | 8103       | 16.84       | 34           | 39                 |
+| el-ballista-distributed | selective | 9120       | 16.89       | 70           | 116                |
+| el-ballista-standalone | selective | 8103       | 16.84       | 34           | 39                 |
 | pyspark-3.5.4              | selective | 19317      | 12.94       | 532          | 552                |
 
-**Why Spark gets a fetch size.** With Spark's default JDBC `fetchsize` (none), the Postgres driver holds each partition's entire result in the heap: 12.5M rows × 12 columns per task at 4 partitions. The full load then failed at every budget with `java.lang.OutOfMemoryError: Java heap space` inside the read tasks. With `fetchsize` 8192, the same chunk size Rust reads in, it completes at every budget, 2g included.
+**Why Spark gets a fetch size.** Spark's JDBC reader leaves `fetchsize` unset by default, and the Postgres driver then buffers each partition's entire result in the heap: 12.5M rows × 12 columns per task at 4 partitions. The published runs therefore set `fetchsize` 8192, the same chunk size Rust reads in, and with it Spark completed the full load at all three budgets: 137 s at 2g, 150 s at 4g and 154 s at 8g, peaking at 1,844 / 3,768 / 4,912 MiB. Runs with the driver default are not part of these results.
 
 ### Takeaways (50M rows, equal spec, the three budgets above)
 
@@ -393,7 +393,7 @@ One Spark full attempt at 8g was discarded and re-run: a `bench-spark` container
 - **Rust memory is small and flat across budgets.**
   - Standalone: 180–190 MiB for the full load, 31–34 MiB selective.
   - Distributed: 250–357 MiB full and 69–70 MiB selective, summed over its 5 containers.
-  - PySpark takes what the budget offers: 1.8 / 3.8 / 4.9 GiB for the full load at 2g / 4g / 8g, and 0.5–0.65 GiB selective.
+  - PySpark takes what the budget offers: 1.8 / 3.7 / 4.8 GiB for the full load at 2g / 4g / 8g, and 0.52–0.64 GiB selective.
 - **Budget doesn't move Rust times.** From 2g to 8g every Rust case stays within ~5%, with no trend by budget. PySpark's full load is fastest at 2g (137 s vs 150–154 s): more heap is not faster for it here.
 - **Why distributed is slower on one host:**
   - 4 partitions over 3 workers split 2:1:1 (round-robin placement). The worker with two partitions does ~32–33 CPU-seconds on its one core, vs ~20 for each of the others.
@@ -506,7 +506,7 @@ different bytes, always:
   incompletely-scaled table (re-run without `--skip-scale`).
 - Output files may be root-owned (both images run as root for bind-mount simplicity);
   `chown` them if your umask complains.
-- Two `rel worker`s on one host need their own ports: the defaults are 50051 / 50052, so
+- Two `el-ballista worker`s on one host need their own ports: the defaults are 50051 / 50052, so
   give each extra worker `--port` / `--grpc-port`. This only affects manual multi-worker
   setups; the benchmark runs each worker in its own container.
 - A root `.dockerignore` keeps `target/` (tens of GB) out of the build context — do not

@@ -191,7 +191,7 @@ impl PostgresExtractor {
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// use el_ballista::connector::postgres::PostgresExtractor;
     ///
     /// let password = std::env::var("PGPASSWORD")?;
     /// let ex = PostgresExtractor::connect(
@@ -261,8 +261,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM orders").fetch_one(ex.pool()).await?;
     /// println!("{n} rows");
@@ -376,8 +376,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// let total = ex.extract_full_table_for_each_batch("orders", None, 8192, 16 << 20,
     ///     &mut |batch| {
@@ -419,8 +419,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// let total = ex.extract_full_table_via_copy_for_each_batch("orders", None, 8192, 16 << 20,
     ///     &mut |batch| {
@@ -461,8 +461,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// // Rows with 0 <= id < 100_000.
     /// let total = ex.extract_keyset_partition_for_each_batch("orders", None, "id", 0, 100_000,
@@ -517,8 +517,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// // Rows with 0 <= id < 100_000, over binary COPY.
     /// let total = ex.extract_keyset_partition_via_copy_for_each_batch("orders", None, "id",
@@ -578,10 +578,10 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
+    /// use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
     ///
     /// for part in compute_keyset_partitions(ex.pool(), "public", "orders", "id", 4).await? {
     ///     let rows = ex.extract_partition_for_each_batch("orders", None, Some(&part), true,
@@ -672,10 +672,10 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
+    /// use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
     ///
     /// let parts = compute_keyset_partitions(ex.pool(), "public", "orders", "id", 4).await?;
     /// let batch = ex.extract_partition("orders", None, &parts[0]).await?; // small tables only
@@ -707,8 +707,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// let batches = ex.extract_keyset_partition_via_cursor("orders", None, "id", 0, 1_000, 256).await?;
     /// let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -775,8 +775,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// let batches = ex
     ///     .extract_keyset_partition_via_copy_with_limits("orders", None, "id", 0, 1_000, 256, 1 << 20)
@@ -821,8 +821,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// let batch = ex.extract_full_table("orders", Some(vec!["id", "status"])).await?;
     /// assert_eq!(batch.num_columns(), 2);
@@ -896,8 +896,8 @@ impl PostgresExtractor {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
     /// // Rows with 1_000 <= id < 2_000, as one batch.
     /// let batch = ex.extract_keyset_partition("orders", None, "id", 1_000, 2_000).await?;

@@ -100,8 +100,8 @@ Pure logic, in `#[cfg(test)] mod tests` next to the code. Per module:
 - **MySQL — `tests/common/mysql.rs` (`MySqlTestDb`).** Same rules; a private database per test
   with its own 8-row hostile table.
 - **Cluster — `tests/common/cluster.rs` (`TestCluster`).** Distributed tests start a real
-  `rel scheduler` + `rel worker` cluster as child processes (`rel` = the
-  `rust-ballista-extraction-layer` binary) and can kill a worker mid-job.
+  `el-ballista scheduler` + `el-ballista worker` cluster as child processes and can kill a worker
+  mid-job.
 - **dvdrental.** Both compose engines are seeded from the same `.dat` files
   (`tests/data/dvdrental`; MySQL through `tests/data/dvdrental_mysql.sql`), so the matrix and
   cross-engine suites compare real, identical data.
@@ -150,7 +150,7 @@ Runs on pull requests and on pushes to `master`, `ubuntu-latest`, 75-minute job 
 `connector::query_tag::QuerySession` prepends a comment such as
 
 ```
-/* rust-extract query_id=q_1a2b3c4d pipeline=payment_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
+/* el-ballista query_id=q_1a2b3c4d pipeline=payment_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
 ```
 
 to every data-scan query from `PostgresExecutionPlan` and `PostgresExtractor`, so a statement is
@@ -161,7 +161,7 @@ cancel-on-drop path finds its backend (covered by `pg_decode.rs`
 ## 7. Notes and open items
 
 - `main.rs` does not re-declare the library's modules (it `use`s
-  `rust_ballista_extraction_layer::…`), so unit tests compile and run once, under the lib target;
+  `el_ballista::…`), so unit tests compile and run once, under the lib target;
   the bin target has none.
 - Open: a live check that `PushdownPolicy::Strict` returns the same rows as `always`
   (`pg_pushdown.rs` and `pg_pushdown_prop.rs` compare `always` vs `never` only).

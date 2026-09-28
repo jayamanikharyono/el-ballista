@@ -10,8 +10,8 @@ data (sinks), watermark / incremental state and CDC are not part of the layer: t
 owns them and expresses a range as filters in the job spec.
 
 The original phase plans, written before the work, are kept in [`history/`](history/README.md).
-(`rel` below is the `rust-ballista-extraction-layer` binary, e.g.
-`cargo run --release --bin rust-ballista-extraction-layer --`.)
+(`el-ballista` below is the built binary; from a checkout, use
+`cargo run --release --bin el-ballista --`.)
 
 | Phase | Status | Exit criteria |
 | --- | --- | --- |
@@ -40,13 +40,13 @@ What exists today:
   `Completed` / `Failed`; a retry skips completed splits. The checkpoint is bound to a plan
   fingerprint and the stored split bounds (`PlanMismatch` on change), and a lock file with a
   heartbeat (`checkpoint.lock_ttl_secs`) allows one run per job.
-- A run report per run (`<checkpoint.dir>/runs/<job>/<run_id>.json`, `rel runs list|show`):
+- A run report per run (`<checkpoint.dir>/runs/<job>/<run_id>.json`, `el-ballista runs list|show`):
   plan fingerprint, pushdown decisions, per-split outcome / rows / time / error and totals,
   kept after later runs; its `run_id` matches the SQL comment tag of every source query.
 - `run_with(consumer)` as the checkpointed API: a split is recorded as completed only after the
   consumer returns `Ok`. Delivery is at-least-once per split.
-- CLI: `rel run` (diagnostic: counts rows, writes no checkpoint), `rel plan`,
-  `rel checkpoint show|reset`, `rel demo`.
+- CLI: `el-ballista run` (diagnostic: counts rows, writes no checkpoint), `el-ballista plan`,
+  `el-ballista checkpoint show|reset`, `el-ballista demo`.
 - Logging through the `log` crate with key=value fields per batch and split.
 
 Exit criteria:
@@ -87,7 +87,7 @@ What exists today:
   integer, date and timestamp columns comes from the `pg_stats` histogram and most-common
   values, and range filters on one column are estimated together as a window. See
   [`pushdown.md`](pushdown.md) (range selectivity and windows).
-- `rel plan` prints each filter's decision and its reason.
+- `el-ballista plan` prints each filter's decision and its reason.
 - Parallel scans: `keyset` and `ctid` partitioning. Snapshot-consistent parallel reads through
   exported snapshots are not implemented.
 
@@ -132,20 +132,21 @@ Exit criteria:
 ## Phase 4 — Distributed execution
 
 ```
-       client process (plans)
-                 │
-          rel scheduler
-      ┌──────────┼──────────┐
-      ▼          ▼          ▼
-  rel worker  rel worker  rel worker
-      └──────────┼──────────┘
-                 ▼
+        client process (plans)
+                  │
+        el-ballista scheduler
+     ┌────────────┼────────────┐
+     ▼            ▼            ▼
+el-ballista  el-ballista  el-ballista
+  worker       worker       worker
+     └────────────┼────────────┘
+                  ▼
      Arrow stream to the consumer
 ```
 
 What exists today (`connector::postgres::distributed`):
 
-- Real `rel scheduler` and `rel worker` processes; stock Ballista executors cannot decode the
+- Real `el-ballista scheduler` and `el-ballista worker` processes; stock Ballista executors cannot decode the
   Postgres scan plans, so the crate ships its own binaries with plan codecs. Standalone runs are
   plain DataFusion and never touch Ballista.
 - Connection budget: each worker gets `pool_max / workers`, so the total stays `pool_max`.
@@ -206,7 +207,7 @@ later removed to keep the contract to "Arrow batches out, at-least-once per spli
 
 - **Phase 1** shipped a Parquet sink and watermark-based incremental extraction. The sink was
   removed: writing belongs to the caller, and two examples show writing Parquet from the stream.
-- **Watermark / incremental state and `rel backfill`** were removed. Incremental and backfill
+- **Watermark / incremental state and `el-ballista backfill`** were removed. Incremental and backfill
   runs are filtered extractions over a caller-supplied range; the design is kept in
   [`deferred/incremental-extraction.md`](deferred/incremental-extraction.md).
 - **Phase 2** planned a DataFusion optimizer rule, `SourceAwarePushdownRule`. It was deleted:

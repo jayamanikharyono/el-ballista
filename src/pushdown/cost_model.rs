@@ -329,7 +329,7 @@ pub(crate) fn source_cost_for(selectivity: f64, stats: &SourceStatistics) -> u64
 /// do not cover, when the source has no histogram (the long-standing range default).
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.33;
 
-/// A selectivity estimate and what it was based on (for `rel plan` reasons).
+/// A selectivity estimate and what it was based on (for `el-ballista plan` reasons).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SelectivityEstimate {
     pub value: f64,
@@ -388,7 +388,7 @@ impl SelectivityEstimate {
 /// Source cost for a decision: the `EXPLAIN` estimate of the predicate when one is cached,
 /// except for a window estimate (see [`SelectivityEstimate::is_window`]), which — like a
 /// predicate without `EXPLAIN` — uses the table-size heuristic over its selectivity. That keeps
-/// both sides of a window on one cost, and `rel plan` (which warms `EXPLAIN`) in agreement with
+/// both sides of a window on one cost, and `el-ballista plan` (which warms `EXPLAIN`) in agreement with
 /// a first run (which has not).
 pub(crate) fn decision_cost(estimate: &SelectivityEstimate, inputs: &CostInputs<'_>) -> u64 {
     let heuristic = || source_cost_for(estimate.value, inputs.stats);

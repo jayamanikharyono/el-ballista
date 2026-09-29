@@ -41,8 +41,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::DateTime;
-use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
-use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+use el_ballista::connector::mysql::MysqlExtractor;
+use el_ballista::connector::postgres::PostgresExtractor;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool, Row};
@@ -242,7 +242,7 @@ async fn my_pool() -> MySqlPool {
 }
 async fn pg_extractor() -> PostgresExtractor {
     let (h, p, u, pw, db) = parse(&pg_url(), 5432);
-    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "rbel-matrix")
+    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "el-ballista-matrix")
         .await
         .unwrap_or_else(|e| panic!("PostgresExtractor::connect: {e}"))
 }
@@ -541,11 +541,11 @@ async fn full_extraction_matches_direct_sql_on_both_engines_and_cross_engine() {
 #[tokio::test]
 async fn pg_filtered_extraction_matches_direct_sql() {
     let env_var = matrix_password_env();
-    use rust_ballista_extraction_layer::config::{
+    use el_ballista::config::{
         CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
         ParallelScanConfig, PushdownConfig, SourceConfig,
     };
-    use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    use el_ballista::connector::postgres::PostgresConnector;
 
     // Differential oracle: a caller-provided id-range predicate pushed to the source
     // must return exactly what the same predicate returns over direct SQL.
@@ -566,7 +566,7 @@ async fn pg_filtered_extraction_matches_direct_sql() {
             database: db,
             pool_max: 4,
             statement_timeout_ms: 30_000,
-            application_name: "rbel-matrix".to_string(),
+            application_name: "el-ballista-matrix".to_string(),
             schema: "public".to_string(),
         },
         checkpoint: CheckpointConfig::default(),

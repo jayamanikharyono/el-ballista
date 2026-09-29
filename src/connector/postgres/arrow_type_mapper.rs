@@ -74,7 +74,7 @@ impl std::fmt::Display for NumericDecodeError {
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::postgres::arrow_type_mapper::numeric_bytes_to_unscaled;
+/// use el_ballista::connector::postgres::arrow_type_mapper::numeric_bytes_to_unscaled;
 ///
 /// // 123.45: ndigits=2, weight=0, sign=+, dscale=2, digits [123, 4500].
 /// let raw = [0, 2, 0, 0, 0, 0, 0, 2, 0, 123, 0x11, 0x94];

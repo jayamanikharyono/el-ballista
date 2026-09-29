@@ -10,12 +10,12 @@
 mod common;
 
 use common::{TEST_PASSWORD_ENV, TestDb};
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
@@ -26,7 +26,7 @@ macro_rules! live {
 }
 
 fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
-    use rust_ballista_extraction_layer::config::{FilterEntry, FilterInput};
+    use el_ballista::config::{FilterEntry, FilterInput};
     let filters = filters
         .into_iter()
         .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))

@@ -17,14 +17,14 @@
 //! PGPASSWORD=... cargo run --example parallel_extraction
 //! ```
 
-use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
-use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
+use el_ballista::connector::postgres::PostgresExtractor;
+use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     // Never hard-code credentials: the password comes from the environment.
     let password = std::env::var("PGPASSWORD")

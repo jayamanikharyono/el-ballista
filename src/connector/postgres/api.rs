@@ -11,10 +11,10 @@
 //! | `run()` | [`RunOutcome`] (row counts) | no — **diagnostic only** | bounded |
 //!
 //! ```no_run
-//! # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
+//! # async fn demo() -> Result<(), el_ballista::errors::AppError> {
 //! use futures::TryStreamExt;
-//! use rust_ballista_extraction_layer::config::JobConfig;
-//! use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+//! use el_ballista::config::JobConfig;
+//! use el_ballista::connector::postgres::PostgresConnector;
 //!
 //! let connector = PostgresConnector::from_config(JobConfig::from_file("job.json")?)?;
 //!
@@ -32,7 +32,7 @@
 //!     .await?;
 //! println!("{} rows, {} splits skipped", outcome.rows_delivered, outcome.splits_skipped);
 //!
-//! // Distributed over a running Ballista cluster (`rel scheduler` + `rel worker`s); the
+//! // Distributed over a running Ballista cluster (`el-ballista scheduler` + `el-ballista worker`s); the
 //! // endpoint defaults to the configured / standard scheduler URL.
 //! let rows = connector.extract().distributed().workers(4).collect().await?;
 //! # let _ = rows; Ok(()) }
@@ -64,12 +64,12 @@ impl PostgresConnector {
     /// # Examples
     ///
     /// ```no_run
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::PostgresConnector;
     ///
     /// let connector = PostgresConnector::from_config(JobConfig::from_file("job.json")?)?;
     /// # let _ = connector;
-    /// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
+    /// # Ok::<(), el_ballista::errors::AppError>(())
     /// ```
     pub fn from_config(config: JobConfig) -> Result<Self, AppError> {
         Ok(Self {
@@ -82,10 +82,10 @@ impl PostgresConnector {
     /// # Examples
     ///
     /// ```no_run
-    /// use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
+    /// use el_ballista::connector::postgres::PostgresConnector;
     /// let connector = PostgresConnector::from_config_file("job.json")?;
     /// # let _ = connector;
-    /// # Ok::<(), rust_ballista_extraction_layer::errors::AppError>(())
+    /// # Ok::<(), el_ballista::errors::AppError>(())
     /// ```
     pub fn from_config_file(path: impl AsRef<std::path::Path>) -> Result<Self, AppError> {
         Ok(Self {
@@ -98,8 +98,8 @@ impl PostgresConnector {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// println!("job {} reads {}", connector.config().job_id, connector.config().table);
     /// # Ok(()) }
     /// ```
@@ -114,8 +114,8 @@ impl PostgresConnector {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// for decision in connector.pipeline().explain_filters().await? {
     ///     println!("{} -> pushed={}", decision.filter, decision.pushed_to_source);
     /// }
@@ -131,8 +131,8 @@ impl PostgresConnector {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let batches = connector.extract().standalone().collect().await?;
     /// # let _ = batches; Ok(()) }
     /// ```
@@ -155,8 +155,8 @@ impl<'a> ExtractBuilder<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let stream = connector.extract().standalone().stream().await?;
     /// # let _ = stream; Ok(()) }
     /// ```
@@ -168,15 +168,15 @@ impl<'a> ExtractBuilder<'a> {
 
     /// Distributed extraction over Ballista. The scheduler endpoint defaults to the config's
     /// `distributed.scheduler_url`, or [`DEFAULT_SCHEDULER_URL`] when that is empty; override with
-    /// [`DistributedExtraction::scheduler`]. A running cluster (`rel scheduler` + `rel worker`
+    /// [`DistributedExtraction::scheduler`]. A running cluster (`el-ballista scheduler` + `el-ballista worker`
     /// processes) is required; single-process extraction is [`Self::standalone`] (plain
     /// DataFusion, no Ballista).
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let batches = connector
     ///     .extract()
     ///     .distributed()
@@ -217,8 +217,8 @@ impl StandaloneExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let batches = connector.extract().standalone().collect().await?;
     /// let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     /// # let _ = rows; Ok(()) }
@@ -234,8 +234,8 @@ impl StandaloneExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// use futures::TryStreamExt;
     /// let mut stream = connector.extract().standalone().stream().await?;
     /// while let Some(batch) = stream.try_next().await? {
@@ -254,8 +254,8 @@ impl StandaloneExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let counted = connector.extract().standalone().run().await?;
     /// println!("{} rows in {} splits", counted.rows_extracted, counted.splits_total);
     /// # Ok(()) }
@@ -285,8 +285,8 @@ impl StandaloneExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// use futures::TryStreamExt;
     /// let outcome = connector
     ///     .extract()
@@ -329,8 +329,8 @@ impl DistributedExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let outcome = connector
     ///     .extract()
     ///     .distributed()
@@ -351,8 +351,8 @@ impl DistributedExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let outcome = connector.extract().distributed().workers(3).run().await?;
     /// # let _ = outcome; Ok(()) }
     /// ```
@@ -374,8 +374,8 @@ impl DistributedExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let batches = connector.extract().distributed().collect().await?;
     /// # let _ = batches; Ok(()) }
     /// ```
@@ -388,8 +388,8 @@ impl DistributedExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let stream = connector.extract().distributed().stream().await?;
     /// # let _ = stream; Ok(()) }
     /// ```
@@ -402,8 +402,8 @@ impl DistributedExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// let counted = connector.extract().distributed().run().await?;
     /// # let _ = counted; Ok(()) }
     /// ```
@@ -418,8 +418,8 @@ impl DistributedExtraction<'_> {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo() -> Result<(), rust_ballista_extraction_layer::errors::AppError> {
-    /// # let connector = rust_ballista_extraction_layer::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
     /// use futures::TryStreamExt;
     /// let outcome = connector
     ///     .extract()

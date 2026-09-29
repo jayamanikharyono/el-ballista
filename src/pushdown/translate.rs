@@ -79,7 +79,7 @@ enum Schema<'a> {
 /// # Examples
 /// ```
 /// use datafusion::prelude::{col, lit};
-/// use rust_ballista_extraction_layer::pushdown::{Fidelity, translate};
+/// use el_ballista::pushdown::{Fidelity, translate};
 /// let (fidelity, _) = translate(&col("id").eq(lit(1i64))).unwrap();
 /// assert_eq!(fidelity, Fidelity::Exact);
 /// assert!(translate(&(col("a") + col("b"))).is_none());
@@ -95,7 +95,7 @@ pub fn translate(expr: &Expr) -> Option<(Fidelity, Predicate)> {
 /// # Examples
 /// ```
 /// use datafusion::prelude::{col, lit};
-/// use rust_ballista_extraction_layer::pushdown::{ColumnKind, ColumnKinds, translate_with};
+/// use el_ballista::pushdown::{ColumnKind, ColumnKinds, translate_with};
 /// let kinds = ColumnKinds::from([("x".to_string(), ColumnKind::Float)]);
 /// assert!(translate_with(&col("x").lt(lit(0.0f64)), &kinds).is_none());
 /// ```

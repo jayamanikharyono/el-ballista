@@ -6,25 +6,25 @@
 //!
 //! | name | kind | labels | meaning |
 //! |---|---|---|---|
-//! | `rel_extracted_rows` | counter | `job` | rows delivered in run batches |
-//! | `rel_extracted_batches` | counter | `job` | batches delivered |
-//! | `rel_batch_bytes` | histogram | `job` | Arrow memory size of each delivered batch |
-//! | `rel_splits` | counter | `job`, `outcome` = `completed`/`failed`/`skipped` | split outcomes of `run_with` |
-//! | `rel_pushdown_decisions` | counter | `outcome` = `exact`/`inexact`/`kept` | planner decisions per filter |
+//! | `el_ballista_extracted_rows` | counter | `job` | rows delivered in run batches |
+//! | `el_ballista_extracted_batches` | counter | `job` | batches delivered |
+//! | `el_ballista_batch_bytes` | histogram | `job` | Arrow memory size of each delivered batch |
+//! | `el_ballista_splits` | counter | `job`, `outcome` = `completed`/`failed`/`skipped` | split outcomes of `run_with` |
+//! | `el_ballista_pushdown_decisions` | counter | `outcome` = `exact`/`inexact`/`kept` | planner decisions per filter |
 //!
 //! There is no `checkpoint_lag_seconds`: this layer has no watermark (incremental state lives
 //! in the orchestrator).
 
 /// Rows delivered in run batches.
-pub const EXTRACTED_ROWS: &str = "rel_extracted_rows";
+pub const EXTRACTED_ROWS: &str = "el_ballista_extracted_rows";
 /// Batches delivered.
-pub const EXTRACTED_BATCHES: &str = "rel_extracted_batches";
+pub const EXTRACTED_BATCHES: &str = "el_ballista_extracted_batches";
 /// Arrow memory size of each delivered batch.
-pub const BATCH_BYTES: &str = "rel_batch_bytes";
+pub const BATCH_BYTES: &str = "el_ballista_batch_bytes";
 /// Split outcomes of a checkpointed run.
-pub const SPLITS: &str = "rel_splits";
+pub const SPLITS: &str = "el_ballista_splits";
 /// Pushdown planner decisions, one per filter.
-pub const PUSHDOWN_DECISIONS: &str = "rel_pushdown_decisions";
+pub const PUSHDOWN_DECISIONS: &str = "el_ballista_pushdown_decisions";
 
 /// Record one delivered batch of `job`.
 pub(crate) fn record_batch(job: &str, rows: u64, bytes: u64) {

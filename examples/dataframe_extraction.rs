@@ -1,4 +1,4 @@
-//! DataFrame front end: the same job spec `rel run` uses, driven through
+//! DataFrame front end: the same job spec `el-ballista run` uses, driven through
 //! `ExtractContext` instead of the CLI.
 //!
 //!   cargo run --example dataframe_extraction -- <config.json>
@@ -8,14 +8,14 @@
 //! Filtering is caller-provided — full extraction or explicit predicates, never watermarks.
 
 use datafusion::prelude::{col, lit};
-use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::connector::postgres::engine::ExtractContext;
+use el_ballista::config::JobConfig;
+use el_ballista::connector::postgres::engine::ExtractContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     let config_path = std::env::args()
         .nth(1)

@@ -13,7 +13,7 @@
 # Data is on tmpfs — ephemeral, re-seeded fresh on every `up`. Note: the .dat files must be
 # readable by the container's db user; a normal git checkout (mode 644) and Docker Desktop file
 # sharing both satisfy this.
-name: rbel-test
+name: el-ballista-test
 services:
   postgres:
     image: postgres:17

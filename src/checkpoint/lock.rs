@@ -323,10 +323,10 @@ impl JobLock {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::time::Duration;
-    /// use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::checkpoint::json_store::JsonCheckpointStore;
+    /// use el_ballista::types::JobId;
     ///
-    /// let dir = std::env::temp_dir().join(format!("rel-doc-lock-path-{}", std::process::id()));
+    /// let dir = std::env::temp_dir().join(format!("el-ballista-doc-lock-path-{}", std::process::id()));
     /// let store = JsonCheckpointStore::new(&dir)?;
     /// let lock = store.lock(&JobId::new("orders")?, Duration::from_secs(60)).await?;
     /// assert!(lock.path().starts_with(&dir) && lock.path().extension() == Some("lock".as_ref()));
@@ -356,10 +356,10 @@ impl JobLock {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::time::Duration;
-    /// use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::checkpoint::json_store::JsonCheckpointStore;
+    /// use el_ballista::types::JobId;
     ///
-    /// let dir = std::env::temp_dir().join(format!("rel-doc-lock-release-{}", std::process::id()));
+    /// let dir = std::env::temp_dir().join(format!("el-ballista-doc-lock-release-{}", std::process::id()));
     /// let store = JsonCheckpointStore::new(&dir)?;
     /// let lock = store.lock(&JobId::new("orders")?, Duration::from_secs(60)).await?;
     /// let path = lock.path().to_path_buf();
@@ -421,7 +421,7 @@ mod tests {
 
     fn dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "rel_lock_test_{}_{}",
+            "el_ballista_lock_test_{}_{}",
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));

@@ -10,7 +10,7 @@
 //! ```
 //!
 //! The `run_id` is the same one every source query of the run carries in its SQL comment tag
-//! (`/* rust-extract … run_id=r_… */`), so a report lines up with Postgres logs and
+//! (`/* el-ballista … run_id=r_… */`), so a report lines up with Postgres logs and
 //! `pg_stat_activity`.
 //!
 //! Lifecycle: a `running` stub is written when the run starts and atomically replaced
@@ -57,7 +57,7 @@ pub enum RunStatus {
 pub enum RunKind {
     /// `run_with(consumer)`: rows delivered to a consumer, splits checkpointed.
     Checkpointed,
-    /// `run()` / `rel run` / `rel distribute`: rows counted and discarded, no checkpoint.
+    /// `run()` / `el-ballista run` / `el-ballista distribute`: rows counted and discarded, no checkpoint.
     Diagnostic,
 }
 
@@ -68,7 +68,7 @@ pub enum RunKind {
 pub enum RunMode {
     /// Plain DataFusion in this process.
     Standalone,
-    /// A Ballista cluster (`rel scheduler` + `rel worker`s).
+    /// A Ballista cluster (`el-ballista scheduler` + `el-ballista worker`s).
     Distributed,
 }
 
@@ -98,7 +98,7 @@ pub struct PushdownEntry {
     pub filter: String,
     /// Whether the source evaluates it (`Exact` or `Inexact`).
     pub pushed: bool,
-    /// The decision with its reason, as `rel plan` prints it.
+    /// The decision with its reason, as `el-ballista plan` prints it.
     pub decision: String,
 }
 
@@ -176,8 +176,8 @@ impl RunReport {
     ///
     /// # Examples
     /// ```
-    /// use rust_ballista_extraction_layer::run_report::*;
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::run_report::*;
+    /// use el_ballista::types::JobId;
     ///
     /// let plan = PlanSummary {
     ///     fingerprint: None,
@@ -262,8 +262,8 @@ impl RunReport {
 /// # Examples
 /// ```
 /// use std::path::Path;
-/// use rust_ballista_extraction_layer::run_report::runs_dir;
-/// use rust_ballista_extraction_layer::types::JobId;
+/// use el_ballista::run_report::runs_dir;
+/// use el_ballista::types::JobId;
 ///
 /// let dir = runs_dir(Path::new(".checkpoints"), &JobId::new("payment_extract").unwrap());
 /// assert_eq!(dir, Path::new(".checkpoints/runs/payment_extract"));

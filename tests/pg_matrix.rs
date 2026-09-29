@@ -22,18 +22,18 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
 use datafusion::prelude::{SessionContext, col, lit};
-use futures::TryStreamExt;
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
-use rust_ballista_extraction_layer::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
-use rust_ballista_extraction_layer::connector::postgres::row_adapter::PostgresRowAdapter;
-use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
-use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
-use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::PostgresTableProvider;
+use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
+use el_ballista::connector::postgres::row_adapter::PostgresRowAdapter;
+use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
+use el_ballista::pushdown::PushdownPolicy;
+use el_ballista::pushdown::cost_model::CostParams;
+use futures::TryStreamExt;
 
 type R = Result<(), Box<dyn std::error::Error>>;
 
@@ -385,8 +385,8 @@ async fn empty_result_schema_equals_the_table_schema() -> R {
 
     // The connector's streaming terminal with a filter that matches nothing.
     let mut config = job(&db, "hostile", 1, 8192);
-    config.filters = vec![rust_ballista_extraction_layer::config::FilterEntry::Single(
-        rust_ballista_extraction_layer::config::FilterInput::Shorthand("id>1000000".to_string()),
+    config.filters = vec![el_ballista::config::FilterEntry::Single(
+        el_ballista::config::FilterInput::Shorthand("id>1000000".to_string()),
     )];
     let stream = PostgresConnector::from_config(config)?
         .extract()
@@ -426,7 +426,7 @@ async fn copy_statement_timeout_is_scoped_to_the_copy() -> R {
         .collect()
         .await
         .expect_err("a 1 ms COPY timeout must fail the scan, not return partial rows");
-    let msg = rust_ballista_extraction_layer::errors::error_chain(&err).join(": ");
+    let msg = el_ballista::errors::error_chain(&err).join(": ");
     assert!(msg.contains("statement timeout"), "{msg}");
 
     let mut relaxed = job(&db, "slow", 1, 8192);

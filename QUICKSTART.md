@@ -12,8 +12,8 @@ Two datasets, kept apart on purpose:
   `benchmark/run.sh` and scaled to millions of rows. It is not a demo database; see
   [`benchmark/README.md`](benchmark/README.md).
 
-`rel` below is the `rust-ballista-extraction-layer` binary, e.g.
-`cargo run --release --bin rust-ballista-extraction-layer --`.
+`el-ballista` below is the built binary; from a checkout, use
+`cargo run --release --bin el-ballista --`.
 
 ---
 
@@ -32,13 +32,13 @@ docker compose -f tests/docker/compose.yaml up -d --wait
 export PGPASSWORD=postgres
 ```
 
-Every demo config, every example and `rel demo` read the password from `$PGPASSWORD`; no
+Every demo config, every example and `el-ballista demo` read the password from `$PGPASSWORD`; no
 example hard-codes one. The integration tests and CI use the same stack.
 
 Check it end to end with a diagnostic run (counts rows, delivers nothing, writes no checkpoint):
 
 ```bash
-cargo run --bin rust-ballista-extraction-layer -- run --config examples/configs/extract.example.json
+cargo run --bin el-ballista -- run --config examples/configs/extract.example.json
 # job 'payment_extract' (filtered, diagnostic): counted 422 row(s) in 1 split(s); nothing delivered, no checkpoint written
 ```
 
@@ -50,7 +50,7 @@ All of them read `public.payment` on `localhost:5432/test`:
 |---|---|
 | `examples/configs/extract.example.json` | Job `payment_extract`: a one-week `payment_date` window, `customer_id >= 300`, `amount > 5` (422 rows) |
 | `examples/configs/full_extract.example.json` | Job `payment_full`: no filters (14,596 rows) |
-| `examples/configs/pushdown_showcase.json` | One filter per pushdown outcome, for `rel plan` |
+| `examples/configs/pushdown_showcase.json` | One filter per pushdown outcome, for `el-ballista plan` |
 | `examples/configs/*.dvd_rental.json` | Extra full / selective / date-range examples |
 
 `full_extraction` and `parallel_extraction` take no config: they connect to
@@ -62,6 +62,10 @@ All of them read `public.payment` on `localhost:5432/test`:
 
 Suggested path: `full` → `filtered` → `pipeline` → `parquet_export` → `dataframe` → `parallel` →
 `distributed`. `bench_full_load` is the benchmark harness, not a demo.
+
+To run all of them in one go and check each one's output, use `scripts/examples.sh`. It starts
+the demo Postgres and, for the distributed examples, a local scheduler with two workers, and
+prints a PASS/FAIL summary (`--no-db` to use a Postgres you already run, `--help` for the rest).
 
 ### 1. `full_extraction`: the basic contract, DB → Arrow
 
@@ -88,7 +92,7 @@ cargo run --example pipeline_extraction -- [config.json]   # default: full_extra
 ```
 
 - **Inside:** `PostgresConnector::from_config_file` → `extract().standalone().collect()` → `extract().standalone().run_with(consumer)` → `extract().distributed().run()` (diagnostic count on a running cluster; skipped with a note when none is reachable).
-- **Showcases:** the fluent entry point that the CLI (`rel run` / `rel distribute`) also goes through, and its four terminals: `collect()` / `stream()` (data, no checkpoint), `run_with(consumer)` (operational, checkpointed), `run()` (diagnostic count, no checkpoint). To learn the API from one example, read this one.
+- **Showcases:** the fluent entry point that the CLI (`el-ballista run` / `el-ballista distribute`) also goes through, and its four terminals: `collect()` / `stream()` (data, no checkpoint), `run_with(consumer)` (operational, checkpointed), `run()` (diagnostic count, no checkpoint). To learn the API from one example, read this one.
 
 ### 3b. `parquet_export`: a real checkpointed job, with a run report
 
@@ -101,9 +105,9 @@ cargo run --release --example parquet_export -- [config.json] [output_dir]
   stream to `<output_dir>/<job_id>/<split_id>.parquet` (temp file, then rename).
 - **Showcases:** the operational path end to end. A split is recorded completed only after its
   file is in place, and the run leaves a report in `<checkpoint.dir>/runs/<job_id>/<run_id>.json`
-  (`rel runs list` / `rel runs show`). Run it twice: the second run skips the completed split
+  (`el-ballista runs list` / `el-ballista runs show`). Run it twice: the second run skips the completed split
   and its report shows it as `skipped`. For a fresh export use a new `job_id` or
-  `rel checkpoint reset`. `bench_full_load` also writes Parquet but through `stream()`, which
+  `el-ballista checkpoint reset`. `bench_full_load` also writes Parquet but through `stream()`, which
   has no checkpoint and no run report.
 
 ### 4. `dataframe_extraction`: DataFusion-native querying over the source
@@ -130,9 +134,9 @@ cargo run --example parallel_extraction
 cargo run --example distributed_extraction -- [config.json] [workers] [output.parquet]  # defaults: extract.example.json, 2
 ```
 
-- **Needs:** a running cluster: `rel scheduler` plus `workers` `rel worker` processes (give each worker on one host its own `--port` / `--grpc-port`).
+- **Needs:** a running cluster: `el-ballista scheduler` plus `workers` `el-ballista worker` processes (give each worker on one host its own `--port` / `--grpc-port`).
 - **Inside:** `PostgresConnector::from_config_file` → `extract().distributed().workers(n).stream()` (the config's filters, coerced to the table schema exactly as in standalone, plus the column projection) → streams into one Parquet file (default `output/distributed_extraction.parquet`).
-- **Showcases:** scaling out without scaling source load (each worker process opens only `pool_max / workers` connections), and that distributed extraction applies the same filter semantics as standalone. `rel plan` on the same config shows which predicates run in Postgres; the rest are filtered in Ballista.
+- **Showcases:** scaling out without scaling source load (each worker process opens only `pool_max / workers` connections), and that distributed extraction applies the same filter semantics as standalone. `el-ballista plan` on the same config shows which predicates run in Postgres; the rest are filtered in Ballista.
 
 ### 7. `bench_full_load`: the benchmark harness (not a demo)
 
@@ -190,26 +194,26 @@ spec with every block is in [`docs/running.md`](docs/running.md#job-spec-full-ex
 ```bash
 # DIAGNOSTIC single-node run: scans (full, or config filters ANDed with --filter flags),
 # counts rows, discards them. Delivers no data, writes no checkpoint.
-cargo run --bin rust-ballista-extraction-layer -- run --config my-job.json [--filter "customer_id>=300"]
+cargo run --bin el-ballista -- run --config my-job.json [--filter "customer_id>=300"]
 
 # What will push to the source under a policy, plus a preview of at most --limit rows (default 20)
-cargo run --bin rust-ballista-extraction-layer -- plan --config examples/configs/pushdown_showcase.json --policy cost_based
+cargo run --bin el-ballista -- plan --config examples/configs/pushdown_showcase.json --policy cost_based
 
 # DIAGNOSTIC distributed run on a running cluster (--scheduler-url, else the config's, else localhost:50050)
-cargo run --bin rust-ballista-extraction-layer -- distribute --config my-job.json --workers 4
+cargo run --bin el-ballista -- distribute --config my-job.json --workers 4
 
 # Split checkpoints of `run_with` jobs (execution progress only, never watermarks)
-cargo run --bin rust-ballista-extraction-layer -- checkpoint show --config my-job.json
-cargo run --bin rust-ballista-extraction-layer -- checkpoint reset --config my-job.json
+cargo run --bin el-ballista -- checkpoint show --config my-job.json
+cargo run --bin el-ballista -- checkpoint reset --config my-job.json
 
 # Run reports: one JSON record per `run_with` run under <checkpoint.dir>/runs/<job>/
-cargo run --bin rust-ballista-extraction-layer -- runs list --config my-job.json
-cargo run --bin rust-ballista-extraction-layer -- runs show --config my-job.json [--run r_1a2b3c4d]
+cargo run --bin el-ballista -- runs list --config my-job.json
+cargo run --bin el-ballista -- runs show --config my-job.json [--run r_1a2b3c4d]
 ```
 
 The operational, checkpointed job is the library call
 `PostgresConnector::from_config(cfg)?.extract().standalone().run_with(consumer)` (see
-`examples/pipeline_extraction.rs`). `rel` with no arguments prints usage, and `rel demo`
+`examples/pipeline_extraction.rs`). `el-ballista` with no arguments prints usage, and `el-ballista demo`
 runs the demo pipeline.
 
 ---
@@ -221,6 +225,7 @@ cargo test --lib                                           # unit tests, no data
 docker compose -f tests/docker/compose.yaml up -d --wait   # the same stack as the demo
 cargo test --tests -- --test-threads=1                     # every integration file
 cargo test --test pg_pushdown -- --test-threads=1          # or one file
+scripts/examples.sh                                        # every example, checked, PASS/FAIL summary
 cd benchmark && ./run.sh --skip-scale --repeat 1           # smoke benchmark (needs a >= 8-core Docker host)
 ```
 
@@ -237,7 +242,7 @@ in [`docs/testing-plan.md`](docs/testing-plan.md) and
 | `password_env` / `PGPASSWORD` not set | `export PGPASSWORD=postgres` |
 | `batch_size` validation error | Must be ≥ 1 in config |
 | `unknown field \`sink\`` (or another field) | Remove it: the job spec is strict and has no sink block |
-| `the stored checkpoint belongs to a different extraction plan` | The job's filters/table/partitioning changed: use a new `job_id` or `rel checkpoint reset --config …` |
+| `the stored checkpoint belongs to a different extraction plan` | The job's filters/table/partitioning changed: use a new `job_id` or `el-ballista checkpoint reset --config …` |
 | `job '…' is already running` | Another `run_with` of the same job holds its lock; a crashed run's lock is taken over after `checkpoint.lock_ttl_secs` |
 | `connection refused` on 5432 | Start the demo stack: `docker compose -f tests/docker/compose.yaml up -d --wait` |
 | Linker `__eh_frame` warning on macOS | Toolchain noise, harmless |

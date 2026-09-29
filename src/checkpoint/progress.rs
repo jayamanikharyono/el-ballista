@@ -7,7 +7,10 @@
 //! from its own single-node partition loops) and reports it here.
 //!
 //! Design: the extraction loop holds a [`ProgressReporter`] and calls `ProgressReporter::try_report`
-//! per finished partition (or per N rows on merged Ballista streams). `try_report` is
+//! with a split's **cumulative** row count as its batches arrive (`PartitionStatus::running`)
+//! and once more when the split finishes (`completed` / `failed`). Each report replaces the
+//! split's previous state, so a split's rows are counted once however many reports it sends,
+//! and the snapshot's `rows_extracted` is the sum over splits. `try_report` is
 //! lock-free and never awaits — a full channel degrades to a dropped counter, never to
 //! backpressure on the scan. A background [`ProgressFlusher`] task aggregates reports and
 //! persists a debounced JSON snapshot (`<job>.progress.json`) at most every
@@ -45,6 +48,17 @@ pub struct PartitionStatus {
 }
 
 impl PartitionStatus {
+    /// A partition still scanning, with the rows it has delivered so far (cumulative).
+    pub(crate) fn running(partition_id: usize, split_id: impl Into<String>, rows: u64) -> Self {
+        Self {
+            partition_id,
+            split_id: split_id.into(),
+            rows,
+            done: false,
+            error: None,
+        }
+    }
+
     /// Convenience for a finished partition.
     pub(crate) fn completed(partition_id: usize, split_id: impl Into<String>, rows: u64) -> Self {
         Self {
@@ -101,11 +115,6 @@ pub struct ProgressSnapshot {
 
 enum ProgressMsg {
     Partition(PartitionStatus),
-    /// Aggregate rows from a merged stream (e.g. Ballista `execute_stream`) where the
-    /// driver cannot attribute batches to partitions.
-    Aggregate {
-        rows: u64,
-    },
 }
 
 /// Non-blocking reporter handle. Clone it into every driver-side scan task; workers never
@@ -126,20 +135,41 @@ impl ProgressReporter {
         }
     }
 
-    /// Add aggregate rows (merged-stream path). Same non-blocking guarantee.
-    pub(crate) fn try_add_rows(&self, rows: u64) {
-        if rows == 0 {
-            return;
-        }
-        if self.tx.try_send(ProgressMsg::Aggregate { rows }).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// How many reports were dropped due to a full channel.
     pub(crate) fn dropped_reports(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+}
+
+/// Fold one report into the per-split states. A report *replaces* its split's state (its
+/// `rows` are cumulative for that split), so a split is counted once however many reports it
+/// sends; `rows_since_flush` grows only by rows not seen before. A late "still running" report
+/// never downgrades a split that already finished. Returns whether anything changed.
+fn apply_status(
+    states: &mut HashMap<String, PartitionState>,
+    status: PartitionStatus,
+    rows_since_flush: &mut u64,
+) -> bool {
+    let previous = states.get(&status.split_id);
+    if let Some(prev) = previous
+        && (prev.done || prev.error.is_some())
+        && !status.done
+        && status.error.is_none()
+    {
+        return false;
+    }
+    let previous_rows = previous.map_or(0, |p| p.rows);
+    *rows_since_flush += status.rows.saturating_sub(previous_rows);
+    states.insert(
+        status.split_id,
+        PartitionState {
+            rows: status.rows,
+            done: status.done,
+            error: status.error,
+            updated_at: Utc::now(),
+        },
+    );
+    true
 }
 
 /// Background progress writer owned by the driver. Exactly one per run.
@@ -174,20 +204,21 @@ impl ProgressFlusher {
         let handle = tokio::spawn(async move {
             let mut rx = rx;
             let mut states: HashMap<String, PartitionState> = HashMap::new();
-            let mut aggregate_rows: u64 = 0;
+            // Rows newly observed since the last write (the `flush_rows` trigger), and whether
+            // anything changed since then (the periodic trigger).
             let mut rows_since_flush: u64 = 0;
+            let mut dirty = false;
             let mut ticker = tokio::time::interval(flush_interval);
             // First tick fires immediately; skip it so we don't write an empty snapshot.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
 
-            let snapshot = |states: &HashMap<String, PartitionState>, aggregate_rows: u64| {
+            let snapshot = |states: &HashMap<String, PartitionState>| {
                 let partitions_done = states.values().filter(|s| s.done).count();
-                let partition_rows: u64 = states.values().map(|s| s.rows).sum();
                 ProgressSnapshot {
                     job_id: job_id.clone(),
                     updated_at: Utc::now(),
-                    rows_extracted: partition_rows + aggregate_rows,
+                    rows_extracted: states.values().map(|s| s.rows).sum(),
                     partitions_total,
                     partitions_done,
                     partitions: states.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -222,25 +253,13 @@ impl ProgressFlusher {
                     msg = rx.recv() => {
                         match msg {
                             Some(ProgressMsg::Partition(status)) => {
-                                rows_since_flush += status.rows;
-                                states.insert(status.split_id.clone(), PartitionState {
-                                    rows: status.rows,
-                                    done: status.done,
-                                    error: status.error,
-                                    updated_at: Utc::now(),
-                                });
-                                if rows_since_flush >= flush_rows {
-                                    rows_since_flush = 0;
-                                    let snap = snapshot(&states, aggregate_rows);
-                                    write_snapshot(&snap).await;
+                                if apply_status(&mut states, status, &mut rows_since_flush) {
+                                    dirty = true;
                                 }
-                            }
-                            Some(ProgressMsg::Aggregate { rows }) => {
-                                aggregate_rows += rows;
-                                rows_since_flush += rows;
                                 if rows_since_flush >= flush_rows {
                                     rows_since_flush = 0;
-                                    let snap = snapshot(&states, aggregate_rows);
+                                    dirty = false;
+                                    let snap = snapshot(&states);
                                     write_snapshot(&snap).await;
                                 }
                             }
@@ -248,15 +267,16 @@ impl ProgressFlusher {
                         }
                     }
                     _ = ticker.tick() => {
-                        // Periodic flush only if something changed since last write.
-                        if rows_since_flush > 0 || aggregate_rows > 0 || !states.is_empty() {
+                        // Periodic flush only if something changed since the last write.
+                        if dirty {
                             rows_since_flush = 0;
-                            let snap = snapshot(&states, aggregate_rows);
+                            dirty = false;
+                            let snap = snapshot(&states);
                             write_snapshot(&snap).await;
                         }
                     }
                     reply = &mut shutdown_rx => {
-                        let snap = snapshot(&states, aggregate_rows);
+                        let snap = snapshot(&states);
                         write_snapshot(&snap).await;
                         if let Ok(reply) = reply {
                             let _ = reply.send(snap.clone());
@@ -265,7 +285,7 @@ impl ProgressFlusher {
                     }
                 }
             }
-            snapshot(&states, aggregate_rows)
+            snapshot(&states)
         });
 
         Self {
@@ -322,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn reporter_never_blocks_and_shutdown_returns_snapshot() {
         let dir = std::env::temp_dir().join(format!(
-            "rel_progress_test_{}_{}",
+            "el_ballista_progress_test_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
@@ -335,17 +355,91 @@ mod tests {
         );
         let reporter = flusher.reporter();
         reporter.try_report(PartitionStatus::completed(0, "split-0", 10));
-        reporter.try_add_rows(5);
+        reporter.try_report(PartitionStatus::running(1, "split-1", 5));
         let snap = flusher.shutdown().await;
         assert_eq!(snap.rows_extracted, 15);
         assert_eq!(snap.partitions_done, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: a split reports its running total per batch and then its final count;
+    /// the snapshot must count its rows once, not once per report.
+    #[tokio::test]
+    async fn running_then_completed_counts_each_split_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "el_ballista_progress_once_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let flusher = ProgressFlusher::start(
+            &dir,
+            &JobId::new("job-once").unwrap(),
+            2,
+            Duration::from_secs(60),
+            u64::MAX,
+        );
+        let reporter = flusher.reporter();
+        // split-0: two batches (8192 + 6404), then completed with the total.
+        reporter.try_report(PartitionStatus::running(0, "split-0", 8192));
+        reporter.try_report(PartitionStatus::running(0, "split-0", 14_596));
+        reporter.try_report(PartitionStatus::completed(0, "split-0", 14_596));
+        // split-1: one batch, then failed (a failed split delivered nothing).
+        reporter.try_report(PartitionStatus::running(1, "split-1", 100));
+        reporter.try_report(PartitionStatus::failed(1, "split-1", 0, "boom"));
+        let snap = flusher.shutdown().await;
+        assert_eq!(snap.rows_extracted, 14_596);
+        assert_eq!(snap.partitions_done, 1);
+        assert_eq!(snap.partitions["split-0"].rows, 14_596);
+        assert!(snap.partitions["split-0"].done);
+        assert_eq!(snap.partitions["split-1"].error.as_deref(), Some("boom"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn late_running_report_never_downgrades_a_finished_split() {
+        let mut states = HashMap::new();
+        let mut since = 0u64;
+        assert!(apply_status(
+            &mut states,
+            PartitionStatus::completed(0, "split-0", 10),
+            &mut since
+        ));
+        assert!(!apply_status(
+            &mut states,
+            PartitionStatus::running(0, "split-0", 4),
+            &mut since
+        ));
+        assert_eq!(states["split-0"].rows, 10);
+        assert!(states["split-0"].done);
+        assert_eq!(since, 10);
+    }
+
+    #[test]
+    fn rows_since_flush_grows_by_new_rows_only() {
+        let mut states = HashMap::new();
+        let mut since = 0u64;
+        apply_status(
+            &mut states,
+            PartitionStatus::running(0, "split-0", 100),
+            &mut since,
+        );
+        apply_status(
+            &mut states,
+            PartitionStatus::running(0, "split-0", 250),
+            &mut since,
+        );
+        apply_status(
+            &mut states,
+            PartitionStatus::completed(0, "split-0", 250),
+            &mut since,
+        );
+        assert_eq!(since, 250);
+    }
+
     #[tokio::test]
     async fn try_report_under_load_does_not_panic() {
         let dir = std::env::temp_dir().join(format!(
-            "rel_progress_load_{}_{}",
+            "el_ballista_progress_load_{}_{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));

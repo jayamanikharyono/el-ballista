@@ -17,7 +17,7 @@ in the middle of a data path.
 
 There is also no urgency. The consumer of this tool is an orchestrator (Airflow, Dagster,
 Cloud Composer) invoking a job spec (a JSON file). That works today with a Rust binary and needs
-no bindings at all. `rel run` itself is a diagnostic (it counts rows, delivers no data and writes
+no bindings at all. `el-ballista run` itself is a diagnostic (it counts rows, delivers no data and writes
 no checkpoint), so the production job is a small Rust binary built on the library's
 checkpointed `PostgresConnector::…run_with(consumer)`, which hands each split's Arrow stream to
 a writer:

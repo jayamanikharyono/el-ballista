@@ -19,10 +19,10 @@ impl<'a> PostgresSchemaReader<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
+    /// use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
     ///
     /// let meta = PostgresSchemaReader::new(ex.pool()).get_table_metadata("orders").await?;
     /// for c in &meta.columns {
@@ -42,10 +42,10 @@ impl<'a> PostgresSchemaReader<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
+    /// use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
     ///
     /// let reader = PostgresSchemaReader::with_schema(ex.pool(), "sales");
     /// let meta = reader.get_table_metadata("orders").await?; // sales.orders
@@ -104,10 +104,10 @@ impl<'a> PostgresSchemaReader<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
+    /// # use el_ballista::connector::errors::ExtractorError;
+    /// # use el_ballista::connector::postgres::PostgresExtractor;
     /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use rust_ballista_extraction_layer::connector::postgres::schema_reader::PostgresSchemaReader;
+    /// use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
     ///
     /// let meta = PostgresSchemaReader::new(ex.pool()).get_table_metadata("public.orders").await?;
     /// for c in &meta.columns {

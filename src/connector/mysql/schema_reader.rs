@@ -30,8 +30,8 @@ impl<'a> MysqlSchemaReader<'a> {
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// # use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
-    /// use rust_ballista_extraction_layer::connector::mysql::schema_reader::MysqlSchemaReader;
+    /// # use el_ballista::connector::mysql::MysqlExtractor;
+    /// use el_ballista::connector::mysql::schema_reader::MysqlSchemaReader;
     ///
     /// # let password = std::env::var("MYSQL_PASSWORD")?;
     /// # let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "sakila", 4).await?;
@@ -64,8 +64,8 @@ impl<'a> MysqlSchemaReader<'a> {
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    /// # use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
-    /// use rust_ballista_extraction_layer::connector::mysql::schema_reader::MysqlSchemaReader;
+    /// # use el_ballista::connector::mysql::MysqlExtractor;
+    /// use el_ballista::connector::mysql::schema_reader::MysqlSchemaReader;
     ///
     /// # let password = std::env::var("MYSQL_PASSWORD")?;
     /// # let ex = MysqlExtractor::connect("127.0.0.1", 3306, "root", &password, "sakila", 4).await?;

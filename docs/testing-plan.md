@@ -34,6 +34,10 @@ docker compose -f tests/docker/compose.yaml down -v
 ```
 
 - `scripts/e2e.sh` does steps 1 + 4 + teardown in one go (`cargo test --all -- --test-threads=1`).
+- `scripts/examples.sh` runs every example against the compose Postgres (plus a local scheduler
+  and two workers for the distributed ones), checks each one's output, and prints a PASS/FAIL
+  summary. Each run works in a fresh `target/examples-run/<timestamp>/`, so checkpointed
+  examples always start from zero.
 - Endpoints default to the compose services: Postgres
   `postgres://postgres:postgres@127.0.0.1:5432/test`, MySQL
   `mysql://root:password@127.0.0.1:3306/test`. `DATABASE_URL` / `MYSQL_URL` point the suites
@@ -43,7 +47,7 @@ docker compose -f tests/docker/compose.yaml down -v
 
 | Target | Tests | How counted / run |
 |---|---:|---|
-| Unit (`src/**`, lib target) | 252 | `cargo test --lib -- --list` |
+| Unit (`src/**`, lib target) | 255 | `cargo test --lib -- --list` |
 | Binary target (`src/main.rs`) | 0 | `cargo test --bins -- --list` (the bin is a thin wrapper over the lib) |
 | Doc tests | 134 | `cargo test --doc`: 133 run, 1 `ignore`d (`Predicate::render_to`'s sketch) |
 | Integration (`tests/*.rs`, 16 files) | 98 | `cargo test --tests -- --list`; run with `--test-threads=1` |
@@ -80,7 +84,7 @@ Pure logic, in `#[cfg(test)] mod tests` next to the code. Per module:
 | `connector::postgres::distributed::context` | 1 | A remote session targets one partition per worker |
 | `telemetry` | 1 | Recording metrics without an installed recorder is a no-op |
 | `run_report` | 4 | Totals and status from split outcomes; snake_case JSON round trip; run ids validated as file names; atomic write, read and oldest-first listing (junk files skipped, no temp files left) |
-| others (21 modules) | 50 | `pipeline::splits` 4, `inline_sql` 4, `postgres::dialect` 4, `mysql::row_adapter` 4, `types::table_metadata` 3, `pushdown::ir` 3, `postgres::stats` 3, `postgres::api` 3, `checkpoint::fingerprint` 3, `pushdown::stats` 2, `errors` 3, `table_codec` 2, `mysql::query_builder` 2, `mysql::dialect` 2, `checkpoint::progress` 2, and one each in `types::job_id`, `pushdown`, `pushdown::explain`, `postgres::engine`, `plan_codec`, `checkpoint` |
+| others (21 modules) | 53 | `checkpoint::progress` 5 (running totals count each split once), `pipeline::splits` 4, `inline_sql` 4, `postgres::dialect` 4, `mysql::row_adapter` 4, `types::table_metadata` 3, `pushdown::ir` 3, `postgres::stats` 3, `postgres::api` 3, `checkpoint::fingerprint` 3, `pushdown::stats` 2, `errors` 3, `table_codec` 2, `mysql::query_builder` 2, `mysql::dialect` 2, and one each in `types::job_id`, `pushdown`, `pushdown::explain`, `postgres::engine`, `plan_codec`, `checkpoint` |
 
 ## 3. Integration harness and fixtures
 
@@ -100,8 +104,8 @@ Pure logic, in `#[cfg(test)] mod tests` next to the code. Per module:
 - **MySQL — `tests/common/mysql.rs` (`MySqlTestDb`).** Same rules; a private database per test
   with its own 8-row hostile table.
 - **Cluster — `tests/common/cluster.rs` (`TestCluster`).** Distributed tests start a real
-  `rel scheduler` + `rel worker` cluster as child processes (`rel` = the
-  `rust-ballista-extraction-layer` binary) and can kill a worker mid-job.
+  `el-ballista scheduler` + `el-ballista worker` cluster as child processes and can kill a worker
+  mid-job.
 - **dvdrental.** Both compose engines are seeded from the same `.dat` files
   (`tests/data/dvdrental`; MySQL through `tests/data/dvdrental_mysql.sql`), so the matrix and
   cross-engine suites compare real, identical data.
@@ -150,7 +154,7 @@ Runs on pull requests and on pushes to `master`, `ubuntu-latest`, 75-minute job 
 `connector::query_tag::QuerySession` prepends a comment such as
 
 ```
-/* rust-extract query_id=q_1a2b3c4d pipeline=payment_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
+/* el-ballista query_id=q_1a2b3c4d pipeline=payment_extract run_id=r_9f8e7d6c strategy=full partition=7/23 */
 ```
 
 to every data-scan query from `PostgresExecutionPlan` and `PostgresExtractor`, so a statement is
@@ -161,7 +165,7 @@ cancel-on-drop path finds its backend (covered by `pg_decode.rs`
 ## 7. Notes and open items
 
 - `main.rs` does not re-declare the library's modules (it `use`s
-  `rust_ballista_extraction_layer::…`), so unit tests compile and run once, under the lib target;
+  `el_ballista::…`), so unit tests compile and run once, under the lib target;
   the bin target has none.
 - Open: a live check that `PushdownPolicy::Strict` returns the same rows as `always`
   (`pg_pushdown.rs` and `pg_pushdown_prop.rs` compare `always` vs `never` only).

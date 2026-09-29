@@ -257,12 +257,12 @@ Filters arrive at the provider as a set (DataFusion splits `AND` into separate f
 filter is estimated **together with the other range filters on the same column**, as one window:
 for `updated_at >= '2026-09-27'` and `updated_at < '2026-09-28'`, each side is judged by the
 one-day window's selectivity, not by its own open-ended half. Both sides therefore get the same
-decision. `rel plan` names the basis: `low selectivity (0.50% from histogram, window of 2 range
+decision. `el-ballista plan` names the basis: `low selectivity (0.50% from histogram, window of 2 range
 filters)`.
 
 A window's cost is the table-size heuristic over the window's selectivity, even when an
 `EXPLAIN` of one side is cached: that `EXPLAIN` prices an open-ended half-range, not the window.
-It also keeps `rel plan` (which warms `EXPLAIN`) in agreement with a first run (which has not).
+It also keeps `el-ballista plan` (which warms `EXPLAIN`) in agreement with a first run (which has not).
 
 Fallback: without the column's distribution (never analyzed, a type the distribution query does
 not cover, the query failed, or a provider rebuilt from a serialized plan), a range filter keeps

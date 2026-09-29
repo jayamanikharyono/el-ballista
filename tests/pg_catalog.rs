@@ -10,8 +10,8 @@
 mod common;
 
 use common::TestDb;
-use rust_ballista_extraction_layer::connector::postgres::explain::ExplainEstimator;
-use rust_ballista_extraction_layer::pushdown::stats::TableStatsSource;
+use el_ballista::connector::postgres::explain::ExplainEstimator;
+use el_ballista::pushdown::stats::TableStatsSource;
 use std::sync::Arc;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never skips.

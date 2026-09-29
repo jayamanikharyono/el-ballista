@@ -19,16 +19,16 @@ use std::sync::Arc;
 use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
-use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
-use rust_ballista_extraction_layer::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
-use rust_ballista_extraction_layer::connector::postgres::register_table;
-use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
-use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
+use el_ballista::connector::postgres::PostgresTableProvider;
+use el_ballista::connector::postgres::distributed::DistributedContext;
+use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
+use el_ballista::connector::postgres::register_table;
+use el_ballista::pushdown::PushdownPolicy;
+use el_ballista::pushdown::cost_model::CostParams;
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -298,7 +298,7 @@ async fn pushdown_differential_table() -> R {
 #[tokio::test]
 async fn cost_statistics_refresh_after_ttl() -> R {
     use datafusion::prelude::{col, lit};
-    use rust_ballista_extraction_layer::pushdown::Decision;
+    use el_ballista::pushdown::Decision;
 
     let db = live!();
     let s = db.schema.clone();

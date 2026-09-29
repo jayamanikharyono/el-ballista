@@ -117,7 +117,7 @@ Three rules apply to both dialects:
    column's `Decimal128` precision or scale (unconstrained `numeric` maps to
    `Decimal128(38, 10)`) fail the scan with `ExtractorError::UnsupportedValue` naming the
    column, on both the cursor and the COPY path. A configurable
-   `on_unrepresentable = "error" | "null"` (with a `rel_null_coerced_total` counter) is not
+   `on_unrepresentable = "error" | "null"` (with a `el_ballista_null_coerced_total` counter) is not
    implemented.
 
 Per-dialect mapping tables live in each connector document.
@@ -154,7 +154,7 @@ production incident:
 - **Connections and queries are identifiable.** Postgres connections set `application_name`
   (`source.application_name`, default `el-ballista`). Every scan query starts with a SQL
   comment tag (`connector::query_tag`), e.g.
-  `/* rust-extract query_id=q_… pipeline=el-ballista run_id=r_… strategy=full+pushdown partition=3/8 */`:
+  `/* el-ballista query_id=q_… pipeline=el-ballista run_id=r_… strategy=full+pushdown partition=3/8 */`:
   `pipeline` is the `application_name`, `run_id` is shared by every query of one run, and
   `query_id` is fresh per query. A DBA looking at `pg_stat_activity` or the server log can
   attribute every scan. The job id itself is not in either; give each job its

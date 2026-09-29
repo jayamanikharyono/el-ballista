@@ -16,14 +16,14 @@ use arrow::array::TimestampMicrosecondArray;
 use arrow::array::{Array, Date32Array, Decimal128Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
     PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::errors::ExtractorError;
-use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
-use rust_ballista_extraction_layer::connector::postgres::parallel::compute_keyset_partitions;
-use rust_ballista_extraction_layer::connector::postgres::register_table;
+use el_ballista::connector::errors::ExtractorError;
+use el_ballista::connector::postgres::extractor::PostgresExtractor;
+use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
+use el_ballista::connector::postgres::register_table;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

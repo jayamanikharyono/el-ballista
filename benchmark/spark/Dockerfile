@@ -1,5 +1,5 @@
 # Benchmark image for the PySpark baseline.
-#   docker build -f benchmark/spark/Dockerfile -t rel-bench-spark:latest benchmark/spark
+#   docker build -f benchmark/spark/Dockerfile -t el-ballista-bench-spark:latest benchmark/spark
 #
 # Pinned, multi-arch base (amd64 + arm64). The PostgreSQL JDBC driver is baked in via
 # remote ADD (no curl needed) so runs work offline. SPARK_HOME=/opt/spark is the

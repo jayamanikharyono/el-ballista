@@ -7,7 +7,7 @@
 //!   parallel scan configuration, and the DataFrame builder API concepts.
 //!
 //! This is a smoke test / illustration of the pieces wired together with DataFusion doing
-//! the in-memory transform work, not a production entry point. Run it with `rel demo`; it
+//! the in-memory transform work, not a production entry point. Run it with `el-ballista demo`; it
 //! connects to the dvdrental demo database (`postgres@localhost:5432/test`, started by
 //! `docker compose -f tests/docker/compose.yaml up -d --wait`) with the password from the environment variable
 //! named by [`DEMO_PASSWORD_ENV`] (never a hard-coded password).
@@ -19,24 +19,24 @@ use datafusion::functions_aggregate::expr_fn::{count, sum};
 use datafusion::prelude::*;
 use std::sync::Arc;
 
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
     JobId, ParallelScanConfig, ParallelStrategy, PushdownConfig, PushdownPolicy, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresExtractor;
-use rust_ballista_extraction_layer::connector::postgres::dialect::PostgresDialect;
-use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
-use rust_ballista_extraction_layer::connector::postgres::stats::StatisticsCollector;
-use rust_ballista_extraction_layer::errors::AppError;
-use rust_ballista_extraction_layer::pushdown::dialect::SqlDialect;
-use rust_ballista_extraction_layer::pushdown::{ColumnKind, ColumnKinds, translate_with};
+use el_ballista::connector::postgres::PostgresExtractor;
+use el_ballista::connector::postgres::dialect::PostgresDialect;
+use el_ballista::connector::postgres::inline_sql::PredicateInlineSql;
+use el_ballista::connector::postgres::stats::StatisticsCollector;
+use el_ballista::errors::AppError;
+use el_ballista::pushdown::dialect::SqlDialect;
+use el_ballista::pushdown::{ColumnKind, ColumnKinds, translate_with};
 
 pub(crate) async fn run() -> Result<(), AppError> {
     println!("\n=== Extraction Feature Demonstration ===\n");
 
     let password = std::env::var(DEMO_PASSWORD_ENV).map_err(|_| {
         AppError::Config(format!(
-            "`rel demo` reads the database password from ${DEMO_PASSWORD_ENV}; set it first"
+            "`el-ballista demo` reads the database password from ${DEMO_PASSWORD_ENV}; set it first"
         ))
     })?;
 

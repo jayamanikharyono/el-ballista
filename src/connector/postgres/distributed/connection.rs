@@ -38,8 +38,8 @@ impl PostgresConnectionDescriptor {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::config::SourceConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::PostgresConnectionDescriptor;
+    /// use el_ballista::config::SourceConfig;
+    /// use el_ballista::connector::postgres::distributed::PostgresConnectionDescriptor;
     ///
     /// let source: SourceConfig = serde_json::from_str(
     ///     r#"{"host": "db", "port": 5432, "user": "etl", "password_env": "PGPASSWORD", "database": "shop"}"#,

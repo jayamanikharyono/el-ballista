@@ -82,7 +82,7 @@ pub struct RunOutcome {
     /// Ballista workers (distributed runs only).
     pub workers: Option<usize>,
     /// Id of this run: every source query of the run carries it in its SQL comment tag
-    /// (`/* rust-extract … run_id=… */`), and it names the run report.
+    /// (`/* el-ballista … run_id=… */`), and it names the run report.
     pub run_id: String,
     /// The run report file, if one was written (see `checkpoint.run_reports` and
     /// [`crate::run_report`]). `None` when report files are off or the write failed.
@@ -868,6 +868,7 @@ impl Pipeline {
             let (stream, progress) = SplitStream::new(
                 stream,
                 job_id.clone(),
+                index,
                 split.split_id.clone(),
                 reporter.cloned(),
             );

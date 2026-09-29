@@ -19,8 +19,8 @@ use super::dialect::MysqlDialect;
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::connector::mysql::query_builder::build_full_table;
-/// use rust_ballista_extraction_layer::types::{ColumnMetadata, TableMetadata};
+/// use el_ballista::connector::mysql::query_builder::build_full_table;
+/// use el_ballista::types::{ColumnMetadata, TableMetadata};
 ///
 /// let table = TableMetadata {
 ///     schema_name: "app".into(),

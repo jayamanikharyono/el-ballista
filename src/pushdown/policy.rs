@@ -44,7 +44,7 @@ impl PushdownPolicy {
     ///
     /// # Examples
     /// ```
-    /// use rust_ballista_extraction_layer::pushdown::PushdownPolicy;
+    /// use el_ballista::pushdown::PushdownPolicy;
     /// assert_eq!(PushdownPolicy::parse("NEVER"), Ok(PushdownPolicy::Never));
     /// assert!(PushdownPolicy::parse("nevr").is_err());
     /// ```
@@ -85,12 +85,12 @@ pub enum Decision {
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::pushdown::decide_translated;
+/// use el_ballista::pushdown::decide_translated;
 /// use std::collections::HashMap;
 /// use datafusion::prelude::{col, lit};
-/// use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
-/// use rust_ballista_extraction_layer::pushdown::stats::SourceStatistics;
-/// use rust_ballista_extraction_layer::pushdown::{ColumnKinds, CostInputs, Decision, PushdownPolicy, translate};
+/// use el_ballista::pushdown::cost_model::CostParams;
+/// use el_ballista::pushdown::stats::SourceStatistics;
+/// use el_ballista::pushdown::{ColumnKinds, CostInputs, Decision, PushdownPolicy, translate};
 ///
 /// let stats = SourceStatistics {
 ///     table_name: "orders".into(), row_count_estimate: 1e6, table_size_bytes: 0,
@@ -119,19 +119,19 @@ pub fn decide_translated(
     decide_explained(fidelity, predicate, policy, deny, push, inputs).0
 }
 
-/// [`decide_translated`] plus a human-readable reason for the verdict (for `rel plan
+/// [`decide_translated`] plus a human-readable reason for the verdict (for `el-ballista plan
 /// --explain`). One function computes both, so the explanation can never describe a different
 /// decision than the one taken.
 ///
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::pushdown::decide_explained;
+/// use el_ballista::pushdown::decide_explained;
 /// use std::collections::HashMap;
 /// use datafusion::prelude::{col, lit};
-/// use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
-/// use rust_ballista_extraction_layer::pushdown::stats::SourceStatistics;
-/// use rust_ballista_extraction_layer::pushdown::{ColumnKinds, CostInputs, Decision, PushdownPolicy, translate};
+/// use el_ballista::pushdown::cost_model::CostParams;
+/// use el_ballista::pushdown::stats::SourceStatistics;
+/// use el_ballista::pushdown::{ColumnKinds, CostInputs, Decision, PushdownPolicy, translate};
 ///
 /// let stats = SourceStatistics {
 ///     table_name: "orders".into(), row_count_estimate: 1e6, table_size_bytes: 0,

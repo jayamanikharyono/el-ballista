@@ -46,7 +46,7 @@ use super::executors::{rest_authority, rest_call};
 const POLL: Duration = Duration::from_secs(1);
 /// Upper bound for waiting until the scheduler drops a dead executor before re-running. It
 /// covers Ballista's own default executor timeout (180 s) plus its 15 s expiry check, for
-/// schedulers not started by `rel scheduler` (whose default timeout is 30 s).
+/// schedulers not started by `el-ballista scheduler` (whose default timeout is 30 s).
 const REMOVAL_WAIT: Duration = Duration::from_secs(240);
 
 /// Watchdog settings of one distributed extraction.
@@ -623,11 +623,14 @@ mod tests {
             ]
         );
         let jobs = br#"[
-            {"job_id":"j1","job_name":"rel-x","status":"Running"},
-            {"job_id":"j2","job_name":"rel-x","status":"Successful"},
+            {"job_id":"j1","job_name":"el-ballista-x","status":"Running"},
+            {"job_id":"j2","job_name":"el-ballista-x","status":"Successful"},
             {"job_id":"j3","job_name":"other","status":"Running"},
-            {"job_id":"j4","job_name":"rel-x","status":"Queued"}]"#;
-        assert_eq!(parse_active_jobs(jobs, "rel-x").unwrap(), vec!["j1", "j4"]);
+            {"job_id":"j4","job_name":"el-ballista-x","status":"Queued"}]"#;
+        assert_eq!(
+            parse_active_jobs(jobs, "el-ballista-x").unwrap(),
+            vec!["j1", "j4"]
+        );
         assert!(parse_beats(b"{}").is_err());
     }
 
@@ -644,7 +647,7 @@ mod tests {
     fn settings(url: &str, max_retries: u32) -> WatchSettings {
         WatchSettings {
             scheduler_url: url.to_string(),
-            job_name: "rel-test".into(),
+            job_name: "el-ballista-test".into(),
             max_retries,
             executor_timeout: Duration::from_secs(30),
             job_timeout: Some(Duration::from_millis(150)),

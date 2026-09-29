@@ -24,7 +24,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::Stream;
 
-use crate::checkpoint::progress::ProgressReporter;
+use crate::checkpoint::progress::{PartitionStatus, ProgressReporter};
 use crate::checkpoint::{JobCheckpoint, PlanIdentity, PlannedSplit, SplitBounds, SplitState};
 use crate::config::JobConfig;
 use crate::connector::errors::ExtractorError;
@@ -295,6 +295,8 @@ pub(crate) struct SplitStream {
     inner: SendableRecordBatchStream,
     schema: SchemaRef,
     job_id: JobId,
+    /// 0-based position of the split in the plan (for progress reports).
+    index: usize,
     split_id: String,
     progress: Arc<SplitProgress>,
     reporter: Option<ProgressReporter>,
@@ -304,6 +306,7 @@ impl SplitStream {
     pub(crate) fn new(
         inner: SendableRecordBatchStream,
         job_id: JobId,
+        index: usize,
         split_id: String,
         reporter: Option<ProgressReporter>,
     ) -> (Self, Arc<SplitProgress>) {
@@ -314,6 +317,7 @@ impl SplitStream {
                 inner,
                 schema,
                 job_id,
+                index,
                 split_id,
                 progress: progress.clone(),
                 reporter,
@@ -334,7 +338,7 @@ impl Stream for SplitStream {
                 let rows = batch.num_rows() as u64;
                 let bytes = batch.get_array_memory_size() as u64;
                 let p = &this.progress;
-                p.rows.fetch_add(rows, Ordering::AcqRel);
+                let total_rows = p.rows.fetch_add(rows, Ordering::AcqRel) + rows;
                 let n = p.batches.fetch_add(1, Ordering::AcqRel) + 1;
                 p.bytes.fetch_add(bytes, Ordering::AcqRel);
                 log::debug!(
@@ -344,7 +348,13 @@ impl Stream for SplitStream {
                 );
                 crate::telemetry::record_batch(this.job_id.as_str(), rows, bytes);
                 if let Some(reporter) = &this.reporter {
-                    reporter.try_add_rows(rows);
+                    // The split's running total, not a delta: the progress writer replaces the
+                    // split's state with it, so the final `completed` report can't double it.
+                    reporter.try_report(PartitionStatus::running(
+                        this.index,
+                        this.split_id.clone(),
+                        total_rows,
+                    ));
                 }
             }
             Poll::Ready(Some(Err(e))) => {
@@ -512,6 +522,7 @@ mod tests {
         let (mut s, progress) = SplitStream::new(
             Box::pin(inner),
             JobId::new("j").unwrap(),
+            0,
             "split-0".into(),
             None,
         );

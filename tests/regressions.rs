@@ -22,17 +22,17 @@
 use arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use futures::TryStreamExt;
-use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-use rust_ballista_extraction_layer::checkpoint::{CheckpointError, CheckpointStore};
-use rust_ballista_extraction_layer::config::{
+use el_ballista::checkpoint::json_store::JsonCheckpointStore;
+use el_ballista::checkpoint::{CheckpointError, CheckpointStore};
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
     ParallelScanConfig, PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::mysql::MysqlExtractor;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
-use rust_ballista_extraction_layer::errors::AppError;
+use el_ballista::connector::mysql::MysqlExtractor;
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::extractor::PostgresExtractor;
+use el_ballista::errors::AppError;
+use futures::TryStreamExt;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -185,7 +185,7 @@ impl Pg {
         let mut cfg = self.job(table);
         cfg.pushdown.policy = policy.parse().unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
-        rust_ballista_extraction_layer::connector::postgres::register_table(&ctx, &cfg)
+        el_ballista::connector::postgres::register_table(&ctx, &cfg)
             .await
             .map_err(|e| e.to_string())?;
         let df = ctx
@@ -281,9 +281,9 @@ async fn b1_negative_zero_float_range_loses_rows() -> R {
 #[tokio::test]
 async fn b5_not_is_null_rendered_sql_has_wrong_precedence() -> R {
     use datafusion::prelude::col;
-    use rust_ballista_extraction_layer::pushdown::translate;
+    use el_ballista::pushdown::translate;
     // `render_inline` (Postgres inline SQL) lives in the Postgres connector.
-    use rust_ballista_extraction_layer::connector::postgres::inline_sql::PredicateInlineSql;
+    use el_ballista::connector::postgres::inline_sql::PredicateInlineSql;
     let pg = Pg::new(&[
         "CREATE TABLE $S.t (id bigint PRIMARY KEY, flag boolean)",
         "INSERT INTO $S.t VALUES (1,true),(2,false),(3,NULL)",

@@ -10,7 +10,7 @@ Several designs in them were later changed or removed:
 - watermark / incremental state and backfill (ranges are caller-supplied filters; the design
   is kept in [`../deferred/incremental-extraction.md`](../deferred/incremental-extraction.md));
 - the in-process Ballista cluster (standalone is plain DataFusion; distributed is real
-  `rel scheduler` + `rel worker` processes);
+  `el-ballista scheduler` + `el-ballista worker` processes);
 - the `SourceAwarePushdownRule` optimizer rule (push/keep is decided in the table provider's
   `supports_filters_pushdown`).
 

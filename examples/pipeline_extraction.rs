@@ -1,19 +1,19 @@
 //! Connector API example — extract via the fluent `PostgresConnector` builder.
 //!
 //! `connector.extract().standalone()` / `.distributed()` is the single entry point the CLI
-//! (`rel run` / `rel distribute`) also uses. `collect()` / `stream()` return the Arrow data
+//! (`el-ballista run` / `el-ballista distribute`) also uses. `collect()` / `stream()` return the Arrow data
 //! with no checkpoint side effects; `run_with(consumer)` is the operational job (a split is
 //! checkpointed only after the consumer acknowledged it); `run()` is a diagnostic row count.
 //!
 //! Usage: cargo run --example pipeline_extraction -- [config.json]
 
+use el_ballista::connector::postgres::PostgresConnector;
 use futures::TryStreamExt;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     let config_path = std::env::args()
         .nth(1)
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Diagnostic count only (no checkpoint, nothing delivered) — distributed over Ballista.
-    // Needs a running cluster (`rel scheduler` + `rel worker`) at the configured scheduler
+    // Needs a running cluster (`el-ballista scheduler` + `el-ballista worker`) at the configured scheduler
     // URL, else the standard local endpoint; skipped with a note when none is reachable.
     let counted = match connector.extract().distributed().run().await {
         Ok(counted) => counted,

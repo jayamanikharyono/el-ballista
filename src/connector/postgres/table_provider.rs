@@ -38,7 +38,7 @@ fn default_provider_batch_bytes() -> usize {
 }
 
 /// The serializable form of a `PostgresTableProvider` — what the codec embeds in the logical
-/// plan the `rel distribute` client sends to the scheduler (see `distributed::table_codec`).
+/// plan the `el-ballista distribute` client sends to the scheduler (see `distributed::table_codec`).
 /// The scheduler and every executor rebuild the provider from this model; only the descriptor is
 /// carried, never a live pool or a password.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,10 +212,10 @@ impl PostgresTableProvider {
     /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::sync::Arc;
     /// use datafusion::prelude::SessionContext;
-    /// use rust_ballista_extraction_layer::config::JobConfig;
-    /// use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
-    /// use rust_ballista_extraction_layer::connector::postgres::distributed::PostgresConnectionDescriptor;
-    /// use rust_ballista_extraction_layer::pushdown::cost_model::CostParams;
+    /// use el_ballista::config::JobConfig;
+    /// use el_ballista::connector::postgres::PostgresTableProvider;
+    /// use el_ballista::connector::postgres::distributed::PostgresConnectionDescriptor;
+    /// use el_ballista::pushdown::cost_model::CostParams;
     ///
     /// let cfg = JobConfig::from_file("job.json")?;
     /// let provider = PostgresTableProvider::new(
@@ -369,7 +369,7 @@ impl PostgresTableProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
+    /// # use el_ballista::connector::postgres::PostgresTableProvider;
     /// # fn demo(provider: PostgresTableProvider) {
     /// println!("scanning {}", provider.table_name());
     /// # }
@@ -416,7 +416,7 @@ impl PostgresTableProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
+    /// # use el_ballista::connector::postgres::PostgresTableProvider;
     /// # fn demo(provider: PostgresTableProvider) {
     /// // Prefer binary COPY; scans whose shape needs a cursor still use one.
     /// let provider = provider.with_use_copy(true);
@@ -530,7 +530,7 @@ impl PostgresTableProvider {
     }
 
     /// The policy decision for one filter judged **alone** (translation fidelity × policy × cost
-    /// model). `supports_filters_pushdown` and `rel plan` decide the whole filter set instead
+    /// model). `supports_filters_pushdown` and `el-ballista plan` decide the whole filter set instead
     /// (see [`Self::explain_decisions`]): a range filter is estimated together with the other
     /// ranges on its column there, so a lone half of a window can be kept here yet pushed as
     /// part of the set. (`scan` does not re-decide — see there.)
@@ -538,10 +538,10 @@ impl PostgresTableProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
+    /// # use el_ballista::connector::postgres::PostgresTableProvider;
     /// # fn demo(provider: PostgresTableProvider) {
     /// use datafusion::prelude::{col, lit};
-    /// use rust_ballista_extraction_layer::pushdown::Decision;
+    /// use el_ballista::pushdown::Decision;
     ///
     /// match provider.decide_cost(&col("status").eq(lit("PAID"))) {
     ///     Decision::Push { fidelity, .. } => println!("pushed ({fidelity:?})"),
@@ -560,7 +560,7 @@ impl PostgresTableProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
+    /// # use el_ballista::connector::postgres::PostgresTableProvider;
     /// # fn demo(provider: PostgresTableProvider) {
     /// use datafusion::prelude::{col, lit};
     ///
@@ -602,7 +602,7 @@ impl PostgresTableProvider {
     /// # Examples
     ///
     /// ```no_run
-    /// # use rust_ballista_extraction_layer::connector::postgres::PostgresTableProvider;
+    /// # use el_ballista::connector::postgres::PostgresTableProvider;
     /// # fn demo(provider: PostgresTableProvider) {
     /// use datafusion::prelude::{col, lit};
     ///
@@ -622,7 +622,7 @@ impl PostgresTableProvider {
 
     /// Warm the EXPLAIN estimate cache for a set of filter expressions (best-effort; failures
     /// only log). Call before planning when estimates should influence decisions
-    /// (`rel plan` does this). `scan` also calls it — for *future* queries only.
+    /// (`el-ballista plan` does this). `scan` also calls it — for *future* queries only.
     pub(crate) async fn warm_explain(&self, filters: &[Expr]) {
         let Some(estimator) = self.estimator.as_ref() else {
             return;
@@ -677,7 +677,7 @@ impl PostgresTableProvider {
     }
 }
 
-/// `PUSH (<fidelity>; <reason>; <sql>)` or `KEEP (<reason>)` — the `rel plan` wording.
+/// `PUSH (<fidelity>; <reason>; <sql>)` or `KEEP (<reason>)` — the `el-ballista plan` wording.
 fn describe_decision((decision, reason): (Decision, String)) -> String {
     match decision {
         Decision::Push {
@@ -875,8 +875,8 @@ impl TableProvider for PostgresTableProvider {
 /// ```no_run
 /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 /// use datafusion::prelude::SessionContext;
-/// use rust_ballista_extraction_layer::config::JobConfig;
-/// use rust_ballista_extraction_layer::connector::postgres::register_table;
+/// use el_ballista::config::JobConfig;
+/// use el_ballista::connector::postgres::register_table;
 ///
 /// let config = JobConfig::from_file("job.json")?;
 /// let ctx = SessionContext::new();
@@ -1089,7 +1089,7 @@ mod tests {
     #[test]
     fn test_decoded_provider_decisions() {
         // Always: translation decides. Cost-based without stats: keep (never push blindly).
-        let always = test_provider("REL_TEST_UNUSED", PushdownPolicy::Always);
+        let always = test_provider("EL_BALLISTA_TEST_UNUSED", PushdownPolicy::Always);
         let verdicts = always
             .supports_filters_pushdown(&[
                 &col("id").eq(lit(1i64)),
@@ -1107,7 +1107,7 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
             ]
         );
-        let cost = test_provider("REL_TEST_UNUSED", PushdownPolicy::CostBased);
+        let cost = test_provider("EL_BALLISTA_TEST_UNUSED", PushdownPolicy::CostBased);
         assert!(matches!(
             cost.decide_cost(&col("status").eq(lit("PAID"))),
             Decision::Keep
@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_model_round_trip_keeps_column_kinds() {
-        let provider = test_provider("REL_TEST_UNUSED", PushdownPolicy::Always);
+        let provider = test_provider("EL_BALLISTA_TEST_UNUSED", PushdownPolicy::Always);
         let decoded = PostgresTableProvider::from_model(provider.schema(), provider.to_model());
         assert_eq!(decoded.column_kinds, provider.column_kinds);
     }

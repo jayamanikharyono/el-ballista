@@ -90,7 +90,7 @@ pub enum CheckpointError {
     #[error(
         "job '{job_id}': the stored checkpoint belongs to a different extraction plan \
          (stored {stored}, current {current}; differs in: {differs}). Its completed splits \
-         cannot be reused: use a new job_id, or run `rel checkpoint reset --config <file>` \
+         cannot be reused: use a new job_id, or run `el-ballista checkpoint reset --config <file>` \
          to discard it"
     )]
     PlanMismatch {
@@ -221,8 +221,8 @@ impl JobCheckpoint {
     ///
     /// ```
     /// use chrono::Utc;
-    /// use rust_ballista_extraction_layer::checkpoint::{JobCheckpoint, SplitState, SplitStatus};
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::checkpoint::{JobCheckpoint, SplitState, SplitStatus};
+    /// use el_ballista::types::JobId;
     ///
     /// let split = |id: &str, state| SplitStatus {
     ///     split_id: id.into(), state, rows_extracted: 0,
@@ -237,7 +237,7 @@ impl JobCheckpoint {
     /// };
     /// let pending: Vec<&str> = checkpoint.pending_splits().iter().map(|s| s.split_id.as_str()).collect();
     /// assert_eq!(pending, ["split-1"]);
-    /// # Ok::<(), rust_ballista_extraction_layer::types::InvalidJobId>(())
+    /// # Ok::<(), el_ballista::types::InvalidJobId>(())
     /// ```
     pub fn pending_splits(&self) -> Vec<&SplitStatus> {
         self.splits
@@ -252,8 +252,8 @@ impl JobCheckpoint {
     ///
     /// ```
     /// use chrono::Utc;
-    /// use rust_ballista_extraction_layer::checkpoint::{JobCheckpoint, SplitState, SplitStatus};
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::checkpoint::{JobCheckpoint, SplitState, SplitStatus};
+    /// use el_ballista::types::JobId;
     ///
     /// let split = |id: &str, state| SplitStatus {
     ///     split_id: id.into(), state, rows_extracted: 0,
@@ -267,7 +267,7 @@ impl JobCheckpoint {
     ///     updated_at: Utc::now(),
     /// };
     /// assert!(!checkpoint.all_completed()); // split-1 failed
-    /// # Ok::<(), rust_ballista_extraction_layer::types::InvalidJobId>(())
+    /// # Ok::<(), el_ballista::types::InvalidJobId>(())
     /// ```
     pub fn all_completed(&self) -> bool {
         !self.splits.is_empty() && self.splits.iter().all(|s| s.state == SplitState::Completed)
@@ -279,8 +279,8 @@ impl JobCheckpoint {
     ///
     /// ```
     /// use chrono::Utc;
-    /// use rust_ballista_extraction_layer::checkpoint::{JobCheckpoint, SplitState, SplitStatus};
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::checkpoint::{JobCheckpoint, SplitState, SplitStatus};
+    /// use el_ballista::types::JobId;
     ///
     /// let split = |id: &str, state| SplitStatus {
     ///     split_id: id.into(), state, rows_extracted: 0,
@@ -295,7 +295,7 @@ impl JobCheckpoint {
     /// };
     /// assert_eq!(checkpoint.split("split-1").map(|s| s.state), Some(SplitState::Failed));
     /// assert!(checkpoint.split("split-9").is_none());
-    /// # Ok::<(), rust_ballista_extraction_layer::types::InvalidJobId>(())
+    /// # Ok::<(), el_ballista::types::InvalidJobId>(())
     /// ```
     pub fn split(&self, split_id: &str) -> Option<&SplitStatus> {
         self.splits.iter().find(|s| s.split_id == split_id)

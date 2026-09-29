@@ -12,12 +12,12 @@ mod mysql_common;
 use arrow::array::Array;
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::prelude::SessionContext;
-use mysql_common::MySqlTestDb;
-use rust_ballista_extraction_layer::connector::mysql::{
+use el_ballista::connector::mysql::{
     MysqlError, MysqlExtractor, dialect::MysqlDialect, schema_reader::MysqlSchemaReader,
     type_mapper::arrow_type_for,
 };
-use rust_ballista_extraction_layer::types::ColumnMetadata;
+use el_ballista::types::ColumnMetadata;
+use mysql_common::MySqlTestDb;
 
 /// Number of columns in the MySQL hostile fixture (`tests/common/mysql.rs`).
 const HOSTILE_COLUMNS: usize = 23;
@@ -304,7 +304,7 @@ async fn datafusion_filtered_range_simulation() {
 
 #[tokio::test]
 async fn dialect_quote_and_placeholder() {
-    use rust_ballista_extraction_layer::pushdown::dialect::SqlDialect;
+    use el_ballista::pushdown::dialect::SqlDialect;
     let d = MysqlDialect;
     assert_eq!(d.quote_ident("order"), "`order`");
     assert_eq!(d.quote_ident("a`b"), "`a``b`");

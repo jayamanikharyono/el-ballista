@@ -1,6 +1,6 @@
 # MySQL Connector
 
-Module: `rust_ballista_extraction_layer::connector::mysql` (in this crate — there is no separate
+Module: `el_ballista::connector::mysql` (in this crate — there is no separate
 connector crate). Built on `sqlx` (`MySqlPool`, `?` placeholders, backtick quoting).
 
 > **Status: experimental prototype (walking skeleton).** §0 below is the complete list of what
@@ -148,7 +148,7 @@ The table below is **what ships** (`type_mapper::arrow_type_for`, decoded by `ro
 ## 3. Values MySQL permits that Arrow cannot represent
 
 This is MySQL's distinguishing hazard. **Today** every such value fails the extraction with a
-typed error. The `on_unrepresentable` policy and the `rel_null_coerced_total` counter described
+typed error. The `on_unrepresentable` policy and the `el_ballista_null_coerced_total` counter described
 below are *(design, not implemented)*.
 
 **Zero dates.** Unless `sql_mode` includes `NO_ZERO_DATE` and `NO_ZERO_IN_DATE`, MySQL accepts
@@ -157,7 +157,7 @@ below are *(design, not implemented)*.
 carries one `(col = 0)` marker per `DATE`/`DATETIME`/`TIMESTAMP` column and a zero date raises
 `MysqlError::ZeroDate { column }`; a partial zero date fails decoding (`MysqlError::Decode`).
 A real NULL stays NULL. *(Design, not implemented:)* an opt-in policy that maps them to null,
-incrementing `rel_null_coerced_total{reason="zero_date"}`. Legacy
+incrementing `el_ballista_null_coerced_total{reason="zero_date"}`. Legacy
 schemas frequently use `0000-00-00` as a "no value" sentinel, so this counter is often non-zero
 on the first run against an old database — which is exactly the moment to learn about
 it, rather than discovering it in a warehouse query six weeks later.
@@ -167,7 +167,7 @@ it, rather than discovering it in a warehouse query six weeks later.
 
 **Truncated data in non-strict mode.** With a permissive `sql_mode`, MySQL silently truncates
 oversized values on write. Nothing the extractor can do about data already stored, but the
-planned `rel doctor` command would report the source's `sql_mode` so the behavior is at least
+planned `el-ballista doctor` command would report the source's `sql_mode` so the behavior is at least
 visible.
 
 **Case-insensitive collation.** MySQL 8.0's default `utf8mb4_0900_ai_ci` is accent- and
@@ -308,7 +308,7 @@ ANALYZE TABLE orders UPDATE HISTOGRAM ON status, updated_at WITH 64 BUCKETS;
 Without histograms, selectivity estimates for non-indexed predicates are guesses. The design's
 policy is to be conservative in that case — an unknown selectivity is treated as *low* (few rows
 removed), which biases toward keeping the filter in Arrow rather than pushing a predicate that
-might trigger a full scan on a production database. The planned `rel doctor` command would report
+might trigger a full scan on a production database. The planned `el-ballista doctor` command would report
 which columns referenced by a job lack histograms and print the `ANALYZE` statement that would
 fix it.
 
@@ -342,11 +342,11 @@ Connection attributes carry the job identity for DBA attribution (visible in
 ### Required privileges
 
 ```sql
-CREATE USER 'rel_extract'@'%' IDENTIFIED BY '…';
-GRANT SELECT                ON app.*  TO 'rel_extract'@'%';
+CREATE USER 'el_ballista'@'%' IDENTIFIED BY '…';
+GRANT SELECT                ON app.*  TO 'el_ballista'@'%';
 -- Only needed for the deferred §§5.2/5.4 features, not for prototype extraction:
--- GRANT PROCESS               ON *.*    TO 'rel_extract'@'%';  -- INNODB_TRX for §5.2
--- GRANT REPLICATION CLIENT    ON *.*    TO 'rel_extract'@'%';  -- SHOW REPLICA STATUS for §5.4
+-- GRANT PROCESS               ON *.*    TO 'el_ballista'@'%';  -- INNODB_TRX for §5.2
+-- GRANT REPLICATION CLIENT    ON *.*    TO 'el_ballista'@'%';  -- SHOW REPLICA STATUS for §5.4
 ```
 
 `PROCESS` and `REPLICATION CLIENT` are broad grants. Where a DBA declines them, the design

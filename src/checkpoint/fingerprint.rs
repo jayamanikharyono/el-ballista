@@ -24,7 +24,7 @@ const VERSION: &str = "v1";
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::checkpoint::fingerprint::fnv1a64;
+/// use el_ballista::checkpoint::fingerprint::fnv1a64;
 /// assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
 /// assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
 /// ```
@@ -45,7 +45,7 @@ fn fnv_update(mut hash: u64, bytes: &[u8]) -> u64 {
 /// # Examples
 ///
 /// ```
-/// use rust_ballista_extraction_layer::checkpoint::PlanIdentity;
+/// use el_ballista::checkpoint::PlanIdentity;
 ///
 /// let a = PlanIdentity::new().with("table", "public.t").with("filters", "id > 8");
 /// let b = PlanIdentity::new().with("table", "public.t").with("filters", "id > 2");
@@ -63,7 +63,7 @@ impl PlanIdentity {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::checkpoint::PlanIdentity;
+    /// use el_ballista::checkpoint::PlanIdentity;
     ///
     /// let identity = PlanIdentity::new();
     /// assert!(identity.components().is_empty());
@@ -77,7 +77,7 @@ impl PlanIdentity {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::checkpoint::PlanIdentity;
+    /// use el_ballista::checkpoint::PlanIdentity;
     ///
     /// let identity = PlanIdentity::new()
     ///     .with("table", "public.orders")
@@ -95,7 +95,7 @@ impl PlanIdentity {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::checkpoint::PlanIdentity;
+    /// use el_ballista::checkpoint::PlanIdentity;
     ///
     /// let identity = PlanIdentity::new().with("table", "t").with("filters", "id > 2");
     /// let keys: Vec<&String> = identity.components().keys().collect();
@@ -110,7 +110,7 @@ impl PlanIdentity {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::checkpoint::PlanIdentity;
+    /// use el_ballista::checkpoint::PlanIdentity;
     ///
     /// let fp = PlanIdentity::new().with("table", "public.t").fingerprint();
     /// assert!(fp.starts_with("v1-") && fp.len() == 19);
@@ -133,7 +133,7 @@ impl PlanIdentity {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::checkpoint::PlanIdentity;
+    /// use el_ballista::checkpoint::PlanIdentity;
     ///
     /// let stored = PlanIdentity::new().with("table", "t").with("partitions", "4");
     /// let current = PlanIdentity::new().with("table", "t").with("partitions", "8");

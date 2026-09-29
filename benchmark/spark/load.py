@@ -50,7 +50,7 @@ def main():
     from pyspark.sql import SparkSession
 
     spark = (
-        SparkSession.builder.appName("rel-bench-spark")
+        SparkSession.builder.appName("el-ballista-bench-spark")
         # local[N] caps concurrent tasks: each task buffers its partition, so fewer
         # cores = lower peak memory at the cost of speed. Size N to the box.
         .master(os.environ.get("BENCH_SPARK_MASTER") or "local[*]")

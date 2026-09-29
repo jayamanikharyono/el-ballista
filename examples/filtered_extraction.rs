@@ -11,18 +11,19 @@
 //!
 //! Usage:
 //! ```bash
-//! cargo run --example filtered_extraction
+//! cargo run --example filtered_extraction -- [config.json]
+//! # default: examples/configs/extract.example.json
 //! ```
 
+use el_ballista::config::JobConfig;
+use el_ballista::connector::postgres::PostgresConnector;
 use futures::TryStreamExt;
-use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Filtered Extraction Example");
@@ -35,7 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   { "column": "payment_date", "op": ">=", "value": "2007-04-06T00:00:00Z" }
     // No watermark state, no backfill orchestration — just filters.
     println!("► Step 1: Job spec + caller-provided filters");
-    let config = JobConfig::from_file("examples/configs/extract.example.json")?;
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "examples/configs/extract.example.json".to_string());
+    let config = JobConfig::from_file(&config_path)?;
     println!("  Table: {}", config.resolved_table());
     println!("  Filters: {} (decisions below)", config.filters.len());
 

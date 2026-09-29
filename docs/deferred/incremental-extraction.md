@@ -42,7 +42,7 @@ window-derived `job_id`):
 
 - **The window pushes to Postgres** when an index serves it, or when the column's `pg_stats`
   histogram and most-common values show the window is selective. Both sides of the window are
-  estimated together, so a narrow window pushes even without an index; `rel plan` shows the
+  estimated together, so a narrow window pushes even without an index; `el-ballista plan` shows the
   decision and its reason. Details: [`pushdown.md`](../pushdown.md).
 - **Use one `job_id` per window.** The checkpoint fingerprint includes the filters, so running
   the same `job_id` with a new window fails with `PlanMismatch`, and rerunning a completed
@@ -320,7 +320,7 @@ When a local file stops being enough (multiple schedulers, history worth indexin
 Postgres-backed store:
 
 ```sql
-CREATE TABLE rel_checkpoint (
+CREATE TABLE el_ballista_checkpoint (
     job_id            text        NOT NULL,
     source_ref        text        NOT NULL,
     table_name        text        NOT NULL,
@@ -337,7 +337,7 @@ CREATE TABLE rel_checkpoint (
     PRIMARY KEY (job_id, source_ref, table_name, namespace)
 );
 
-CREATE TABLE rel_run_history (
+CREATE TABLE el_ballista_run_history (
     run_id          uuid PRIMARY KEY,
     job_id          text        NOT NULL,
     window_lo       jsonb,

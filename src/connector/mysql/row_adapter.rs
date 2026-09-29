@@ -126,8 +126,8 @@ impl MysqlRowAdapter {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::connector::mysql::row_adapter::MysqlRowAdapter;
-    /// use rust_ballista_extraction_layer::types::{ColumnMetadata, TableMetadata};
+    /// use el_ballista::connector::mysql::row_adapter::MysqlRowAdapter;
+    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
     ///
     /// let table = TableMetadata {
     ///     schema_name: "app".into(),

@@ -2,7 +2,7 @@
 
 **A source-aware extraction layer on Apache DataFusion and Ballista, written in Rust.**
 
-[![CI](https://github.com/jayamanikharyono/rust-ballista-extraction-layer/actions/workflows/ci.yml/badge.svg)](https://github.com/jayamanikharyono/rust-ballista-extraction-layer/actions/workflows/ci.yml)
+[![CI](https://github.com/jayamanikharyono/el-ballista/actions/workflows/ci.yml/badge.svg)](https://github.com/jayamanikharyono/el-ballista/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 El Ballista reads tables from PostgreSQL into bounded streams of Apache Arrow `RecordBatch`es.
@@ -142,7 +142,7 @@ against `payment` in the dvdrental demo database (14,596 rows):
 ```
 
 ```bash
-cargo run --bin rust-ballista-extraction-layer -- plan \
+cargo run --bin el-ballista -- plan \
   --config examples/configs/pushdown_showcase.json
 ```
 
@@ -206,13 +206,13 @@ checkpoint says what is left to do and is rewritten as splits finish; the report
 one run did and is kept after later runs: the plan fingerprint, every filter's pushdown
 decision with its reason, each split's outcome, rows, bytes and time (or error), and the
 totals. The `run_id` is the same one every source query of the run carries in its SQL comment,
-so a report lines up with Postgres logs. `rel runs list` and `rel runs show` read them.
+so a report lines up with Postgres logs. `el-ballista runs list` and `el-ballista runs show` read them.
 
 ### Standalone or distributed
 
 | | Standalone | Distributed |
 |---|---|---|
-| What runs | DataFusion inside your process | Your process plans; `rel scheduler` + `rel worker`s execute |
+| What runs | DataFusion inside your process | Your process plans; `el-ballista scheduler` + `el-ballista worker`s execute |
 | Postgres connections | up to `pool_max` | `pool_max / workers` per worker (total stays `pool_max`) |
 | When to use | Default. One machine, every core, no scheduling overhead | When one machine's CPUs are the bottleneck |
 
@@ -228,7 +228,7 @@ watchdog details: [`docs/running.md`](docs/running.md#execution-modes-standalone
 Needs Rust stable (edition 2024) and Docker. There are two datasets, kept apart on purpose:
 
 - **Demo and tests:** the dvdrental sample database, from `tests/docker/compose.yaml`. The
-  examples, the `rel` commands below, the integration tests and CI all use it.
+  examples, the `el-ballista` commands below, the integration tests and CI all use it.
 - **Benchmark:** a synthetic `orders` table, loaded and grown to 50M rows only inside the
   benchmark's own container by [`benchmark/run.sh`](benchmark/README.md).
 
@@ -238,11 +238,11 @@ docker compose -f tests/docker/compose.yaml up -d --wait
 export PGPASSWORD=postgres
 
 # See where each filter will run
-cargo run --bin rust-ballista-extraction-layer -- plan \
+cargo run --bin el-ballista -- plan \
   --config examples/configs/pushdown_showcase.json
 
 # Diagnostic run: scans with pushdown, counts rows, discards them
-cargo run --bin rust-ballista-extraction-layer -- run \
+cargo run --bin el-ballista -- run \
   --config examples/configs/extract.example.json
 # -> job 'payment_extract' (filtered, diagnostic): counted 422 row(s) in 1 split(s); ...
 
@@ -252,14 +252,14 @@ cargo run --release --example parquet_export -- examples/configs/full_extract.ex
 # -> run r_06e579f7: report ./.checkpoints/runs/payment_full/r_06e579f7.json
 
 # The run reports of that job
-cargo run --bin rust-ballista-extraction-layer -- runs list \
+cargo run --bin el-ballista -- runs list \
   --config examples/configs/full_extract.example.json
 ```
 
-`rel run` and `rel distribute` are diagnostic: they deliver no data and write no checkpoint.
+`el-ballista run` and `el-ballista distribute` are diagnostic: they deliver no data and write no checkpoint.
 Real jobs use the library's `run_with` (below), as `parquet_export` does. Re-running the same
 job skips the splits already completed; for a fresh export use a new `job_id` or
-`rel checkpoint reset --config …`. (`rel` = the `rust-ballista-extraction-layer` binary.)
+`el-ballista checkpoint reset --config …`.
 
 ### Examples
 
@@ -272,6 +272,9 @@ job skips the splits already completed; for a fresh export use a new `job_id` or
 | `dataframe_extraction` | DataFusion DataFrame and SQL over the source table |
 | `parallel_extraction` | Keyset partitioning across concurrent scans |
 | `distributed_extraction` | The same job on a Ballista cluster, streamed to Parquet |
+
+`scripts/examples.sh` runs every example (including the distributed ones and the benchmark
+harness) against the demo database and checks each one's output.
 
 Setup details, the job spec in 60 seconds and common errors: [`QUICKSTART.md`](QUICKSTART.md).
 
@@ -344,11 +347,11 @@ Results at a 4g engine budget:
 
 | engine | scenario | elapsed_ms | cpu_seconds | peak_mem_mib |
 |---|---|---|---|---|
-| rust-datafusion-standalone | full | 33702 | 52.17 | 190 |
-| rust-ballista-remote | full | 66904 | 105.17 | 288 |
+| el-ballista-standalone | full | 33702 | 52.17 | 190 |
+| el-ballista-distributed | full | 66904 | 105.17 | 288 |
 | pyspark-3.5.4 | full | 150437 | 212.2 | 3768 |
-| rust-datafusion-standalone | selective | 8326 | 16.61 | 31 |
-| rust-ballista-remote | selective | 9088 | 17.13 | 70 |
+| el-ballista-standalone | selective | 8326 | 16.61 | 31 |
+| el-ballista-distributed | selective | 9088 | 17.13 | 70 |
 | pyspark-3.5.4 | selective | 19501 | 13.04 | 541 |
 
 `peak_mem_mib` is the container working set, summed across containers for distributed.
@@ -374,7 +377,7 @@ Results at a 4g engine budget:
 
 ## Testing
 
-- **252 unit tests** (no database): pushdown translation, policy and cost, strict config
+- **255 unit tests** (no database): pushdown translation, policy and cost, strict config
   parsing, type mapping and decoding, partition math, checkpoints and the job lock, codecs.
 - **134 doc tests** on the public API examples (133 run, 1 ignored sketch).
 - **98 integration tests in 16 files** against a Docker Compose stack (Postgres 17 + MySQL 8):

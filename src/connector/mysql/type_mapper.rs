@@ -53,8 +53,8 @@ pub(crate) fn is_boolean_tinyint(col: &ColumnMetadata) -> bool {
 ///
 /// ```
 /// use arrow::datatypes::DataType;
-/// use rust_ballista_extraction_layer::connector::mysql::type_mapper::arrow_type_for;
-/// use rust_ballista_extraction_layer::types::ColumnMetadata;
+/// use el_ballista::connector::mysql::type_mapper::arrow_type_for;
+/// use el_ballista::types::ColumnMetadata;
 ///
 /// let col = ColumnMetadata {
 ///     column_name: "n".into(),

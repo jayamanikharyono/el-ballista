@@ -17,7 +17,7 @@
 //!   (default `pool_max`) partitions scan at once, so buffered batches stay bounded by that
 //!   concurrency, not by the partition count.
 //! - `http://host:port`: `.distributed().scheduler(url).workers(n).stream()` on a
-//!   `rel scheduler` + `rel worker` deployment; every worker process budgets
+//!   `el-ballista scheduler` + `el-ballista worker` deployment; every worker process budgets
 //!   `pool_max / workers` connections.
 //!
 //! - Config without `filters`/`columns`: full load (every column, every row).
@@ -41,12 +41,12 @@ use std::fs::File;
 use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
+use el_ballista::config::JobConfig;
+use el_ballista::connector::postgres::PostgresConnector;
 use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use rust_ballista_extraction_layer::config::JobConfig;
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,9 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (before the config is read) to the last Parquet byte written.
     let t_scan = Instant::now();
     let t_start_epoch_ms = epoch_ms();
-    // Route the `log` facade to stderr (+ optional --log-file / REL_LOG_FILE).
+    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
     // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
-    rust_ballista_extraction_layer::logging::init_from_env_and_args();
+    el_ballista::logging::init_from_env_and_args();
 
     let config_path = std::env::args()
         .nth(1)
@@ -106,14 +106,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connector = PostgresConnector::from_config(config)?;
 
     // Standalone: `.standalone()` — plain DataFusion in this process, whole pool_max.
-    // Remote: `.distributed()` on the `rel scheduler` + `rel worker` cluster.
+    // Remote: `.distributed()` on the `el-ballista scheduler` + `el-ballista worker` cluster.
     let scheduler_url = std::env::var("BENCH_SCHEDULER_URL")
         .ok()
         .filter(|s| !s.is_empty());
     let engine = if scheduler_url.is_some() {
-        "rust-ballista-remote"
+        "el-ballista-distributed"
     } else {
-        "rust-datafusion-standalone"
+        "el-ballista-standalone"
     };
 
     let mut stream = match scheduler_url.as_deref() {

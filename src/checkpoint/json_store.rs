@@ -43,9 +43,9 @@ impl JsonCheckpointStore {
     /// # Examples
     ///
     /// ```no_run
-    /// use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
+    /// use el_ballista::checkpoint::json_store::JsonCheckpointStore;
     /// let store = JsonCheckpointStore::new(".checkpoints")?;
-    /// # Ok::<(), rust_ballista_extraction_layer::checkpoint::CheckpointError>(())
+    /// # Ok::<(), el_ballista::checkpoint::CheckpointError>(())
     /// ```
     pub fn new(dir: impl AsRef<Path>) -> Result<Self, CheckpointError> {
         let dir = dir.as_ref().to_path_buf();
@@ -61,12 +61,12 @@ impl JsonCheckpointStore {
     /// # Examples
     ///
     /// ```
-    /// use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
+    /// use el_ballista::checkpoint::json_store::JsonCheckpointStore;
     ///
-    /// let dir = std::env::temp_dir().join("rel-doc-json-store-dir");
+    /// let dir = std::env::temp_dir().join("el-ballista-doc-json-store-dir");
     /// let store = JsonCheckpointStore::new(&dir)?;
     /// assert_eq!(store.dir(), dir.as_path());
-    /// # Ok::<(), rust_ballista_extraction_layer::checkpoint::CheckpointError>(())
+    /// # Ok::<(), el_ballista::checkpoint::CheckpointError>(())
     /// ```
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -80,10 +80,10 @@ impl JsonCheckpointStore {
     /// # #[tokio::main(flavor = "current_thread")]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use std::time::Duration;
-    /// use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-    /// use rust_ballista_extraction_layer::types::JobId;
+    /// use el_ballista::checkpoint::json_store::JsonCheckpointStore;
+    /// use el_ballista::types::JobId;
     ///
-    /// let dir = std::env::temp_dir().join(format!("rel-doc-store-lock-{}", std::process::id()));
+    /// let dir = std::env::temp_dir().join(format!("el-ballista-doc-store-lock-{}", std::process::id()));
     /// let store = JsonCheckpointStore::new(&dir)?;
     /// let lock = store.lock(&JobId::new("orders")?, Duration::from_secs(60)).await?;
     /// // ... extract and commit splits while holding the lock ...
@@ -378,7 +378,7 @@ mod tests {
     /// Unique temp dir per test: the store is file-backed, so parallel tests must not share.
     fn test_store() -> (JsonCheckpointStore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "rel_checkpoint_test_{}_{}",
+            "el_ballista_checkpoint_test_{}_{}",
             std::process::id(),
             TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
@@ -476,7 +476,10 @@ mod tests {
             CheckpointError::PlanMismatch { differs, .. } => assert_eq!(differs, "filters"),
             other => panic!("expected PlanMismatch, got {other}"),
         }
-        assert!(err.to_string().contains("rel checkpoint reset"), "{err}");
+        assert!(
+            err.to_string().contains("el-ballista checkpoint reset"),
+            "{err}"
+        );
 
         // The stored checkpoint is untouched by the refused begin.
         let stored = store.read(&key).await.unwrap().unwrap();

@@ -5,12 +5,12 @@
 //! the environment this was written in, so new dependencies were kept to ones already resolved
 //! in Cargo.Lock transitively. `clap` was not one of them.
 //!
-//! Subcommands: `rel run` / `rel distribute` (DIAGNOSTIC full or filtered extraction:
+//! Subcommands: `el-ballista run` / `el-ballista distribute` (DIAGNOSTIC full or filtered extraction:
 //! scans, counts rows, discards them — no data delivered, no checkpoint written; this
 //! project is not a sink, the operational job is the library's `run_with(consumer)`),
-//! `rel checkpoint show|reset` (split status of `run_with` jobs), `rel runs list|show` (the
-//! per-run reports under `<checkpoint.dir>/runs/`), `rel demo`, and
-//! `rel plan` (per-filter push/keep decisions plus a limited row preview, docs/pushdown.md).
+//! `el-ballista checkpoint show|reset` (split status of `run_with` jobs), `el-ballista runs list|show` (the
+//! per-run reports under `<checkpoint.dir>/runs/`), `el-ballista demo`, and
+//! `el-ballista plan` (per-filter push/keep decisions plus a limited row preview, docs/pushdown.md).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,23 +22,19 @@ use ballista_scheduler::config::{SchedulerConfig, TaskDistributionPolicy};
 use ballista_scheduler::scheduler_process::start_server;
 use datafusion::error::DataFusionError;
 
-use rust_ballista_extraction_layer::checkpoint::CheckpointStore;
-use rust_ballista_extraction_layer::checkpoint::json_store::JsonCheckpointStore;
-use rust_ballista_extraction_layer::config::{
-    FilterEntry, FilterInput, JobConfig, PushdownPolicy, policy_name,
-};
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::distributed::{
-    PostgresLogicalCodec, PostgresPhysicalCodec,
-};
-use rust_ballista_extraction_layer::connector::postgres::pipeline::parse_filter_expr;
-use rust_ballista_extraction_layer::errors::AppError;
-use rust_ballista_extraction_layer::run_report::{list_reports, read_report};
+use el_ballista::checkpoint::CheckpointStore;
+use el_ballista::checkpoint::json_store::JsonCheckpointStore;
+use el_ballista::config::{FilterEntry, FilterInput, JobConfig, PushdownPolicy, policy_name};
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::distributed::{PostgresLogicalCodec, PostgresPhysicalCodec};
+use el_ballista::connector::postgres::pipeline::parse_filter_expr;
+use el_ballista::errors::AppError;
+use el_ballista::run_report::{list_reports, read_report};
 
-/// Rows `rel plan` previews when `--limit` is not given.
+/// Rows `el-ballista plan` previews when `--limit` is not given.
 const DEFAULT_PLAN_LIMIT: usize = 20;
 
-pub(crate) const USAGE: &str = "usage:\n  rel run --config <path> [--filter 'col=value' ...]\n  rel distribute --config <path> [--workers N] [--scheduler-url http://host:port (default: config, else http://localhost:50050)] [--filter 'col=value' ...]\n  rel plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value' ...] [--limit n]\n  rel checkpoint show --config <path>\n  rel checkpoint reset --config <path>\n  rel runs list --config <path>\n  rel runs show --config <path> [--run <run_id> (default: the latest run)]\n  rel demo\n  rel scheduler [--scheduler-url http://host:port] [--bind-host <ip>] [--executor-timeout-secs N (default 30)]\n  rel worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N] [--port P] [--grpc-port P] [--heartbeat-secs N (default 5)]\n\n  `rel run` / `rel distribute` are DIAGNOSTIC: they scan the job (full table, or the\n  config `filters` plus --filter flags), count rows and discard them. No data is delivered\n  and no checkpoint is read or written. This project is not a sink: the operational,\n  checkpointed job is the library API `PostgresConnector::...run_with(consumer)`, whose\n  split state `rel checkpoint show|reset` inspects and clears.\n  Every `run_with` run also writes a run report (`<checkpoint.dir>/runs/<job>/<run_id>.json`),\n  listed by `rel runs list` and printed by `rel runs show`.\n  `rel plan` prints each filter's pushdown decision and previews --limit rows (default 20).\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also REL_LOG_FILE)\n  note: at debug level every generated SQL query is logged";
+pub(crate) const USAGE: &str = "usage:\n  el-ballista run --config <path> [--filter 'col=value' ...]\n  el-ballista distribute --config <path> [--workers N] [--scheduler-url http://host:port (default: config, else http://localhost:50050)] [--filter 'col=value' ...]\n  el-ballista plan --config <path> [--policy always|never|cost_based|strict|hinted] [--filter 'col=value' ...] [--limit n]\n  el-ballista checkpoint show --config <path>\n  el-ballista checkpoint reset --config <path>\n  el-ballista runs list --config <path>\n  el-ballista runs show --config <path> [--run <run_id> (default: the latest run)]\n  el-ballista demo\n  el-ballista scheduler [--scheduler-url http://host:port] [--bind-host <ip>] [--executor-timeout-secs N (default 30)]\n  el-ballista worker --scheduler-url http://host:port [--bind-host <ip>] [--external-host <name>] [--concurrent-tasks N] [--port P] [--grpc-port P] [--heartbeat-secs N (default 5)]\n\n  `el-ballista run` / `el-ballista distribute` are DIAGNOSTIC: they scan the job (full table, or the\n  config `filters` plus --filter flags), count rows and discard them. No data is delivered\n  and no checkpoint is read or written. This project is not a sink: the operational,\n  checkpointed job is the library API `PostgresConnector::...run_with(consumer)`, whose\n  split state `el-ballista checkpoint show|reset` inspects and clears.\n  Every `run_with` run also writes a run report (`<checkpoint.dir>/runs/<job>/<run_id>.json`),\n  listed by `el-ballista runs list` and printed by `el-ballista runs show`.\n  `el-ballista plan` prints each filter's pushdown decision and previews --limit rows (default 20).\n\nglobal options (place after the subcommand):\n  --log-level <off|error|warn|info|debug|trace>   log level (default info; also RUST_LOG)\n  --log-file <path>                               also append logs to a file (also EL_BALLISTA_LOG_FILE)\n  note: at debug level every generated SQL query is logged";
 
 pub(crate) async fn dispatch() -> Result<(), AppError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -163,11 +159,11 @@ fn expect_flag(args: &[String], flag: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Config(format!("missing required flag {flag}\n{USAGE}")))
 }
 
-/// `rel worker` heartbeat interval. Ballista's own default is 60 s, which lets a dead worker
+/// `el-ballista worker` heartbeat interval. Ballista's own default is 60 s, which lets a dead worker
 /// go unnoticed for minutes; 5 s lets the scheduler and the client-side job watchdog
 /// (`distributed.executor_timeout_secs`) spot one within seconds.
 const DEFAULT_HEARTBEAT_SECS: u64 = 5;
-/// `rel scheduler`: an executor whose heartbeat is older than this is removed (Ballista's
+/// `el-ballista scheduler`: an executor whose heartbeat is older than this is removed (Ballista's
 /// default is 180 s). Must stay well above the worker heartbeat interval.
 const DEFAULT_EXECUTOR_TIMEOUT_SECS: u64 = 30;
 /// How often the scheduler checks for executors past their timeout (Ballista default 15 s).
@@ -221,7 +217,7 @@ fn load_config_with_filters(
     Ok(config)
 }
 
-/// `rel run` — DIAGNOSTIC: scan the job's splits (full table, or its filters pushed to
+/// `el-ballista run` — DIAGNOSTIC: scan the job's splits (full table, or its filters pushed to
 /// the source), count rows, discard the batches. Reads and writes no checkpoint and delivers
 /// no data; the operational job is the library's `run_with(consumer)`.
 async fn run_job(config_path: &str, cli_filters: &[String]) -> Result<(), AppError> {
@@ -250,7 +246,7 @@ fn report_io(what: &str, e: std::io::Error) -> AppError {
     AppError::Config(format!("cannot read run reports ({what}): {e}"))
 }
 
-/// `rel runs list` — one line per run report of the job, oldest first.
+/// `el-ballista runs list` — one line per run report of the job, oldest first.
 async fn runs_list(config_path: &str) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let dir = std::path::Path::new(&config.checkpoint.dir);
@@ -298,7 +294,7 @@ fn json_name<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_default()
 }
 
-/// `rel runs show` — the full report of one run (default: the latest) as JSON.
+/// `el-ballista runs show` — the full report of one run (default: the latest) as JSON.
 async fn runs_show(config_path: &str, run_id: Option<&str>) -> Result<(), AppError> {
     let config = JobConfig::from_file(config_path)?;
     let dir = std::path::Path::new(&config.checkpoint.dir);
@@ -351,13 +347,13 @@ async fn checkpoint_reset(config_path: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// `rel plan` — docs/pushdown.md's `rel plan --explain`, scoped down: filters come from the
+/// `el-ballista plan` — docs/pushdown.md's `el-ballista plan --explain`, scoped down: filters come from the
 /// config's `filters` plus `column<op>value` `--filter` flags. Uses exactly the path every
 /// run uses ([`Pipeline::explain_filters`], schema-coerced predicates, the same provider), so
 /// the preview cannot disagree with execution. Prints each filter's push/keep decision, then
 /// previews at most `--limit` rows (default 20 — never the whole table).
 ///
-/// [`Pipeline::explain_filters`]: rust_ballista_extraction_layer::connector::postgres::pipeline::Pipeline::explain_filters
+/// [`Pipeline::explain_filters`]: el_ballista::connector::postgres::pipeline::Pipeline::explain_filters
 async fn plan_explain(
     config_path: &str,
     policy_str: Option<&str>,
@@ -388,9 +384,9 @@ async fn plan_explain(
     Ok(())
 }
 
-/// `rel distribute` — docs/roadmap.md Phase 4. DIAGNOSTIC like `rel run` (rows counted and
+/// `el-ballista distribute` — docs/roadmap.md Phase 4. DIAGNOSTIC like `el-ballista run` (rows counted and
 /// discarded, no checkpoint), but the extraction itself is executed by a running Ballista
-/// cluster (`rel scheduler` + `rel worker`s) at `--scheduler-url`, else the config's
+/// cluster (`el-ballista scheduler` + `el-ballista worker`s) at `--scheduler-url`, else the config's
 /// `distributed.scheduler_url`, else `http://localhost:50050`. Every executor process budgets
 /// its source pool to `pool_max / workers`.
 async fn run_distributed(
@@ -423,8 +419,8 @@ async fn run_distributed(
     Ok(())
 }
 
-/// `rel scheduler` — standalone long-running Ballista scheduler. Runs forever; on its own
-/// process so it stays up across `rel worker` restarts. Workers (`rel worker`) connect to the
+/// `el-ballista scheduler` — standalone long-running Ballista scheduler. Runs forever; on its own
+/// process so it stays up across `el-ballista worker` restarts. Workers (`el-ballista worker`) connect to the
 /// URL it advertises. `bind_host` is the local interface to listen on (default: 127.0.0.1 for
 /// `localhost`, else the URL host); containers pass `0.0.0.0` so other containers reach it.
 ///
@@ -484,7 +480,7 @@ async fn run_scheduler(
         })
 }
 
-/// `rel worker` — one long-running Ballista executor, connected to `--scheduler-url`. Run one
+/// `el-ballista worker` — one long-running Ballista executor, connected to `--scheduler-url`. Run one
 /// per machine (or per process). Each resolves the source descriptor in encoded tasks and opens
 /// only its `pool_max / workers` share of connections (via `SourcePoolRegistry`), so a
 /// three-worker deployment still shows the source the same connection count as a single machine.
@@ -536,7 +532,7 @@ async fn run_worker(
     })
 }
 
-/// Listen ports of one `rel worker`.
+/// Listen ports of one `el-ballista worker`.
 #[derive(Debug, Clone, Copy)]
 struct WorkerPorts {
     /// Arrow Flight service (shuffle / result data), `--port`.

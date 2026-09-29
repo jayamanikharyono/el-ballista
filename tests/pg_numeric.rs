@@ -9,7 +9,7 @@
 mod common;
 
 use common::TestDb;
-use rust_ballista_extraction_layer::connector::postgres::extractor::PostgresExtractor;
+use el_ballista::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.

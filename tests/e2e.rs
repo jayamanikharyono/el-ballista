@@ -1,6 +1,6 @@
 //! End-to-end suite: Postgres → extractor → Arrow → Ballista → validation.
 //!
-//! The distributed tests run on a real cluster: `rel scheduler` + two `rel worker` child
+//! The distributed tests run on a real cluster: `el-ballista scheduler` + two `el-ballista worker` child
 //! processes of this crate's binary (`common::TestCluster`), exactly as deployed minus the
 //! containers. Postgres always comes from the Docker compose stack
 //! (`tests/docker/compose.yaml` — `DATABASE_URL` overrides the default endpoint); no
@@ -22,22 +22,20 @@
 mod common;
 
 use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
+use el_ballista::checkpoint::{CheckpointStore, SplitState, json_store::JsonCheckpointStore};
+use el_ballista::connector::postgres::pipeline::SplitInfo;
+use el_ballista::errors::{AppError, ConsumerError};
 use futures::TryStreamExt;
-use rust_ballista_extraction_layer::checkpoint::{
-    CheckpointStore, SplitState, json_store::JsonCheckpointStore,
-};
-use rust_ballista_extraction_layer::connector::postgres::pipeline::SplitInfo;
-use rust_ballista_extraction_layer::errors::{AppError, ConsumerError};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
-use rust_ballista_extraction_layer::config::{
+use el_ballista::config::{
     CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
     ParallelScanConfig, PushdownConfig, SourceConfig,
 };
-use rust_ballista_extraction_layer::connector::postgres::PostgresConnector;
-use rust_ballista_extraction_layer::connector::postgres::distributed::DistributedContext;
+use el_ballista::connector::postgres::PostgresConnector;
+use el_ballista::connector::postgres::distributed::DistributedContext;
 
 struct E2E {
     db: TestDb,

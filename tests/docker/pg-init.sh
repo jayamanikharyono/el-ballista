@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Postgres compose init: restore the native dvdrental directory dump into $POSTGRES_DB, then
 # ANALYZE it. This database is both the integration-test fixture and the demo database the
-# examples and `rel` commands point at.
+# examples and `el-ballista` commands point at.
 # Runs once, before the server accepts TCP connections (the entrypoint opens the network
 # only after every /docker-entrypoint-initdb.d script completes), so the healthcheck's
 # TCP `pg_isready -h 127.0.0.1` only passes once the data is fully loaded.

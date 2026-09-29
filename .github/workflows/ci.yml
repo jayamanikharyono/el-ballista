@@ -10,6 +10,8 @@ env:
   RUST_LOG: warn
   CARGO_BUILD_JOBS: 2
   RUSTFLAGS: "-C debuginfo=0"
+  # Incremental caches are useless on a fresh runner and cost gigabytes of disk.
+  CARGO_INCREMENTAL: 0
   # Both databases come from the compose stack (tests/docker/compose.yaml: Postgres 17 + MySQL 8,
   # seeded from tests/data) — the same stack developers run locally. These are the harness
   # defaults, spelled out so the job is explicit about what it connects to.
@@ -21,6 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
+      # The runner's root disk starts with only ~14 GB free. A debug build of every target
+      # (lib, bin, examples, one binary per tests/*.rs) plus clippy's artifacts gets close to
+      # that, and when the disk fills the linker dies with `signal 7 [Bus error]`.
+      # Drop preinstalled SDKs this job never uses.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune --all --force >/dev/null
+          df -h /
+
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -28,16 +42,12 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # Caches ~/.cargo and target/ keyed on the toolchain and Cargo.lock, and prunes stale
+      # artifacts before saving. (A plain actions/cache of target/ with a prefix restore key kept
+      # every old artifact forever: after the crate rename it restored the old-name build next to
+      # the new one and filled the disk.)
       - name: Cache cargo registry + build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+        uses: Swatinem/rust-cache@v2
 
       # Blocking gates: formatting and lints must be clean.
       - name: cargo fmt --check
@@ -71,6 +81,12 @@ jobs:
       - name: Database logs (on failure)
         if: failure()
         run: docker compose -f tests/docker/compose.yaml logs --no-color --tail=200
+
+      - name: Disk usage (on failure)
+        if: failure()
+        run: |
+          df -h /
+          du -sh target ~/.cargo 2>/dev/null || true
 
       - name: Tear down test databases
         if: always()

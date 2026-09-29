@@ -1,0 +1,7 @@
+El Ballista
+Copyright 2026 Jaya Haryono Manik
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The dvdrental test data in tests/data/ is a port of MySQL's Sakila sample
+database, licensed under the New BSD license (see tests/data/README.md).

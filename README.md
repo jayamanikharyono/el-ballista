@@ -455,4 +455,9 @@ every change).
 
 ## License
 
-Apache License 2.0. See [`LICENSE`](LICENSE).
+Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
+Copyright 2026 Jaya Haryono Manik.
+
+## Author
+
+Jaya Haryono Manik — [@jayamanikharyono](https://github.com/jayamanikharyono)

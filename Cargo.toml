@@ -3,6 +3,7 @@ name = "el-ballista"
 version = "0.1.0"
 edition = "2024"
 description = "A source-aware PostgreSQL extraction layer on Apache DataFusion and Ballista"
+authors = ["Jaya Haryono Manik"]
 license = "Apache-2.0"
 repository = "https://github.com/jayamanikharyono/el-ballista"
 readme = "README.md"

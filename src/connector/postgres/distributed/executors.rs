@@ -19,6 +19,7 @@
 //! minimal client ([`rest_call`]) serves the job watchdog ([`super::watchdog`]).
 
 use std::time::Duration;
+use tracing::{debug, info, warn};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -88,19 +89,19 @@ pub(crate) fn check_budget(
 /// unreachable, REST disabled, unexpected body); only a well-formed listing is `Some`.
 pub(crate) async fn fetch_registered_executors(scheduler_url: &str) -> Option<RegisteredExecutors> {
     let Some(authority) = rest_authority(scheduler_url) else {
-        log::warn!("scheduler URL {scheduler_url:?} is not plain http://; executors not verified");
+        debug!(scheduler_url = %scheduler_url, "not a plain http:// URL; the REST API is not probed");
         return None;
     };
     match rest_call(authority, "GET", "/api/executors").await {
         Ok(body) => match parse_executors(&body) {
             Ok(executors) => Some(executors),
             Err(e) => {
-                log::warn!("scheduler REST /api/executors: unexpected response ({e})");
+                debug!(error = %e, "unexpected /api/executors response");
                 None
             }
         },
         Err(e) => {
-            log::warn!("scheduler REST /api/executors unavailable ({e}); executors not verified");
+            debug!(error = %e, "scheduler REST API unavailable");
             None
         }
     }
@@ -131,30 +132,34 @@ pub(crate) async fn rest_call(
 }
 
 /// Verify a remote deployment against the budget: `Err` only when the budget is exceeded.
+/// `Ok(true)` when the scheduler REST API listed the executors, `Ok(false)` when it could
+/// not be asked (then the job watchdog cannot see workers either).
 pub(crate) async fn verify_remote_executors(
     scheduler_url: &str,
     workers: usize,
     budget: u32,
-) -> Result<(), ExtractorError> {
+) -> Result<bool, ExtractorError> {
     let Some(registered) = fetch_registered_executors(scheduler_url).await else {
-        log::warn!(
-            "remote Ballista: could not list executors; the source budget (pool_max over \
-             {workers} worker(s) = {budget} connection(s) per process) assumes exactly {workers} \
-             executor process(es)"
+        warn!(
+            scheduler_url = %scheduler_url,
+            workers,
+            connections_per_worker = budget,
+            "could not list the scheduler's executors; the source budget assumes exactly \
+             `workers` executor processes"
         );
-        return Ok(());
+        return Ok(false);
     };
     match check_budget(&registered, workers, budget) {
         BudgetCheck::Ok => {
-            log::info!(
-                "remote Ballista: {} executor(s) registered, matching the source budget",
-                registered.task_slots.len()
+            info!(
+                executors = registered.task_slots.len(),
+                "executors registered, matching the source budget"
             );
-            Ok(())
+            Ok(true)
         }
         BudgetCheck::Warn(msg) => {
-            log::warn!("remote Ballista: {msg}");
-            Ok(())
+            warn!("{msg}");
+            Ok(true)
         }
         BudgetCheck::Exceeded(msg) => Err(ExtractorError::InvalidConfig(msg)),
     }

@@ -20,10 +20,9 @@ use datafusion::logical_expr::Expr;
 use datafusion::prelude::{DataFrame, SessionContext};
 
 use crate::config::JobConfig;
-use crate::connector::postgres::PostgresTableProvider;
 use crate::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
+use crate::connector::postgres::table_provider::job_provider;
 use crate::errors::AppError;
-use crate::pushdown::cost_model::CostParams;
 
 /// The connector reference [`ExtractContext::source`] accepts: the job config names exactly
 /// one Postgres source.
@@ -46,7 +45,7 @@ impl ExtractContext {
     /// ```no_run
     /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
     /// use el_ballista::config::JobConfig;
-    /// use el_ballista::connector::postgres::engine::ExtractContext;
+    /// use el_ballista::connector::postgres::ExtractContext;
     ///
     /// let ctx = ExtractContext::from_config(JobConfig::from_file("job.json")?).await?;
     /// let batches = ctx.source("postgres", "public.orders").await?.collect().await?;
@@ -71,7 +70,7 @@ impl ExtractContext {
     /// ```no_run
     /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
     /// use el_ballista::config::JobConfig;
-    /// use el_ballista::connector::postgres::engine::ExtractContext;
+    /// use el_ballista::connector::postgres::ExtractContext;
     /// let ctx = ExtractContext::from_config(JobConfig::from_file("job.json")?).await?;
     /// let orders = ctx.source("postgres", "public.orders").await?;
     /// # let _ = orders; Ok(()) }
@@ -88,27 +87,17 @@ impl ExtractContext {
         }
         let descriptor = PostgresConnectionDescriptor::from_config(&self.config.source, 1);
 
-        let provider = PostgresTableProvider::new(
+        // The same builder as `register_table`: pushdown, batch size, COPY and the
+        // `parallel_scan` partitions all follow the job config.
+        let provider = job_provider(
+            &self.config,
             descriptor,
             table_name,
-            self.config.pushdown.policy,
-            self.config.pushdown.deny.clone(),
-            self.config.pushdown.push.clone(),
-            CostParams {
-                max_source_cost: self.config.pushdown.max_source_cost,
-                keep_threshold: self.config.pushdown.keep_threshold,
-            },
-            self.config.pushdown.statistics_ttl_secs,
-            self.config.execution.batch_size,
+            1,
+            Some(self.config.parallel_scan.partition_column.clone()),
+            None,
         )
-        .await
-        .map_err(AppError::Extractor)?;
-
-        let provider = provider
-            .with_parallel_strategy(self.config.parallel_scan.strategy)
-            .with_max_batch_bytes(self.config.execution.max_batch_bytes)
-            .with_use_copy(self.config.execution.use_copy)
-            .with_copy_statement_timeout_ms(self.config.execution.copy_statement_timeout_ms);
+        .await?;
 
         self.session_ctx
             .register_table(table_name, Arc::new(provider))
@@ -130,7 +119,7 @@ impl ExtractContext {
     /// ```no_run
     /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
     /// use el_ballista::config::JobConfig;
-    /// use el_ballista::connector::postgres::engine::ExtractContext;
+    /// use el_ballista::connector::postgres::ExtractContext;
     /// let ctx = ExtractContext::from_config(JobConfig::from_file("job.json")?).await?;
     /// let _ = ctx.source("postgres", "public.orders").await?;
     /// let df = ctx.sql("SELECT status, count(*) FROM \"public.orders\" GROUP BY status").await?;
@@ -158,7 +147,7 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # async fn demo(orders: el_ballista::connector::postgres::SourceDataFrame)
     /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let paid = orders.filter(col("status").eq(lit("PAID")))?;
@@ -175,7 +164,7 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # async fn demo(orders: el_ballista::connector::postgres::SourceDataFrame)
     /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let slim = orders.select(vec![col("order_id"), col("amount")])?;
@@ -192,7 +181,7 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # async fn demo(orders: el_ballista::connector::postgres::SourceDataFrame)
     /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let doubled = orders.with_column("amount2", col("amount") * lit(2))?;
@@ -212,7 +201,7 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # async fn demo(orders: el_ballista::connector::postgres::SourceDataFrame)
     /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let first_ten = orders.limit(0, Some(10))?;
@@ -230,7 +219,7 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # async fn demo(orders: el_ballista::connector::postgres::SourceDataFrame)
     /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// let batches = orders.filter(col("status").eq(lit("PAID")))?.collect().await?;
@@ -246,7 +235,7 @@ impl SourceDataFrame {
     /// # Examples
     ///
     /// ```no_run
-    /// # async fn demo(orders: el_ballista::connector::postgres::engine::SourceDataFrame)
+    /// # async fn demo(orders: el_ballista::connector::postgres::SourceDataFrame)
     /// # -> Result<(), el_ballista::errors::AppError> {
     /// use datafusion::prelude::{col, lit};
     /// use futures::TryStreamExt;

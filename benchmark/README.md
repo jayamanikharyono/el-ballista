@@ -51,6 +51,11 @@ also run the DuckDB row-by-row check (needs `pip install duckdb`). Change `--mem
 | PySpark | 3.5.4 |
 | PostgreSQL | 17.11 |
 
+Versions as measured: the Rust and PostgreSQL images use floating tags (`rust:1-slim-bookworm`,
+`postgres:17`).
+
+Versions as measured: the Rust and PostgreSQL images use floating tags (`rust:1-slim-bookworm`, `postgres:17`).
+
 ## Workload
 
 Two scenarios, one definition in `run.sh` for both engines: Rust gets it as job config (`bench-config-<scenario>.json`: structured `filters` + `columns`); Spark gets the same predicate rendered as SQL for its JDBC read.
@@ -72,8 +77,8 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 
 | Mode | How the scan runs |
 |---|---|
-| `standalone` | Plain DataFusion in one container — no Ballista scheduler or executor. The provider is registered in a `SessionContext` (`connector::postgres::register_table`); DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU), and the process uses the whole `pool_max`. Engine label `el-ballista-standalone`. |
-| `distributed` | Real `bench-scheduler` + `bench-worker-N` containers (our scheduler/worker with Postgres codecs — stock Ballista binaries cannot decode our plans), remote client container. The engine cores are **split**, not shared: the first core runs the scheduler + client, each of the 3 workers (default) gets its own core from the rest (0 / 1 / 2 / 3 on the default pin). Each worker gets as many task slots as source connections (`pool_max / workers` = 4). A **fresh cluster is started for every attempt**, like every other engine container. Workers advertise container names so the scheduler dials them back; every process resolves the source password independently. |
+| `standalone` | Plain DataFusion in one container — no Ballista scheduler or executor. The harness runs the connector's `.extract().standalone()`, which registers the provider in a plain `SessionContext`; DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU), and the process uses the whole `pool_max`. Engine label `el-ballista-standalone`. |
+| `distributed` | Real `bench-scheduler` + `bench-worker-N` containers (our scheduler/worker with Postgres codecs — stock Ballista binaries cannot decode our plans), remote client container. The engine cores are **split**, not shared: the first core runs the scheduler + client, each of the 3 workers (default) gets its own core from the rest (0 / 1 / 2 / 3 on the default pin). Each worker gets as many task slots as source connections (`pool_max / workers` = 4). A **fresh cluster is started for every attempt**, like every other engine container. Workers advertise container names so the scheduler dials them back. The client and every worker resolve the source password independently; the scheduler never connects to the source. The client checks the executors through the scheduler REST API, which is required: the generated config sets no `distributed.job_timeout_secs`. |
 
 | | Rust | Spark |
 |---|---|---|
@@ -81,10 +86,10 @@ Two Rust deployments (`--mode standalone|distributed|both`, default `both`):
 | Scenario definition | The job config file only: `run.sh` writes `bench-config-full.json` and `bench-config-selective.json` with structured `filters` / `columns`; the harness builds no SQL | SQL predicate + column list, rendered by `run.sh` from the same structured definition (JDBC needs SQL) |
 | Read fan-out | `--rust-partitions` keyset partitions; default = engine cores (4 on the 0-3 pin) | `--spark-partitions` JDBC partitions on `order_id`; default = engine cores, Spark's own default parallelism for `local[*]` |
 | Source connections | `pool_max` 12: standalone 12, distributed 3 workers × 4 | JDBC: one connection per running task |
-| Fetch | Binary `COPY … TO STDOUT` by default (`--no-use-copy`: cursor `FETCH`), `execution.batch_size` rows per Arrow batch / `FETCH` window — `run.sh` writes `--batch-size` into the generated job spec when set, else the code default 8192 applies | JDBC `fetchsize` = `--batch-size` when set, else omitted (Spark default 0 = driver default, which buffers each partition fully) |
+| Fetch | Binary `COPY … TO STDOUT` by default (`--no-use-copy`: cursor `FETCH`), `execution.batch_size` rows per Arrow batch / `FETCH` window — `run.sh` writes `--batch-size` into the generated job spec when set, else the code default 8192 applies | JDBC `fetchsize` = `--batch-size` when set, else 8192 (matching Rust's default batch; Spark's own default 0 makes the driver buffer each partition fully) |
 | Output writer | `parquet::arrow::ArrowWriter` in the bench binary, Snappy, **one file** | `df.repartition(1).write.parquet`, Snappy, **one file** (the read stays partitioned; one task writes) |
 | Timed | **End to end:** program entry point (before the config is read) to the last Parquet byte written — config load, schema discovery, split planning, scan, encode (`scan_ms` + `write_ms` split in JSON) | **End to end:** program entry point (before the SparkSession / JVM starts) to the last Parquet byte written — session start-up and the partition-bounds query included; the row-count read-back runs after the timer |
-| Other settings | Tool defaults | Tool defaults (no shuffle or other tuning); only the driver heap is set, solved from the container budget |
+| Other settings | Tool defaults | Tool defaults (no shuffle or other tuning); only the driver heap (solved from the container budget) and the JDBC `fetchsize` are set |
 
 Batch size (`--batch-size`) is optional and applies to **both** engines: Spark's JDBC `fetchsize` and the Rust job spec's `execution.batch_size` (rows per Arrow batch and per cursor `FETCH`; `run.sh` writes it into the generated `bench-config-<scenario>.json`). **Auto run** (flag absent): Rust uses its code default of 8192 rows per batch, and Spark's JDBC `fetchsize` is set to the same 8192. With Spark's own default (`fetchsize` 0) the Postgres JDBC driver buffers each partition's whole result in the heap, 12.5M rows per task at 50M rows over 4 partitions, so the published runs always set a fetch size (see *Why Spark gets a fetch size* under Results). **Manual run** (`--batch-size 64000`): both engines use that many rows per batch. The batch size never changes the partition count (engine cores by default), so a batch experiment changes one thing. Override counts independently (`--rust-partitions`, `--spark-partitions`) to test sensitivity, but keep them equal for the headline number.
 
@@ -115,14 +120,15 @@ Failed and hung attempts never stall the run:
 benchmark/
 ├── PostgresDB/initdb/ # seed SQL for bench-pg (500 users, 20k orders), mounted by run.sh
 ├── rust/
-│   ├── Dockerfile     # multi-stage release build of bench_full_load
+│   ├── Dockerfile     # multi-stage release build of bench_full_load (examples/bench_full_load.rs)
 │   └── bench-config.json  # template job spec (image default); run.sh mounts a generated
 │                          # bench-config-<scenario>.json per run instead
 ├── spark/
 │   ├── Dockerfile     # apache/spark:3.5.4 + PostgreSQL JDBC 42.7.13 baked in
 │   └── load.py        # the equivalent workload, JSON summary to stdout
 ├── scale.sql          # grow toward SCALE_ROWS (~10M default); run.sh computes the
-#                       # factor from the live count and skips when already there
+│                      # factor from the live count and skips when already there
+├── correctness.py     # DuckDB row-by-row check of the Parquet outputs
 ├── run.sh             # orchestrator: build → postgres → scale → run → profile → gate → report
 ├── results/           # *.json, *_cluster.csv, *_c_*.csv, summary.md (gitignored)
 └── output/            # parquet outputs (gitignored)
@@ -310,7 +316,7 @@ make row order nondeterministic, so file hashes would false-fail on every run.
 
 ## Results
 
-Toolchain: see [Versions](#versions). Source database is the PostgreSQL above.
+Toolchain: see [Versions](#versions). Source database is the PostgreSQL above. These numbers were measured before commit 0327f07 (client-computed partition bounds, the scheduler REST-or-timeout requirement) and later changes; they have not been re-measured since.
 
 Spec (all three tables):
 
@@ -463,9 +469,10 @@ different bytes, always:
   adapt from the inside, so the same script flag means the same budget everywhere.
   bench-pg (cores 4-7 + 2g, fixed) is the same fixture for every engine and scenario.
 - Memory shape: Rust streams to disk, so its memory stays O(batch) at any row count
-  (batches flow straight into the writer). Spark's JDBC read is bounded only when a fetch
-  size is set (`--batch-size`); with the default the Postgres driver buffers each whole
-  partition in the heap, so the partition size, not the batch, sets Spark's memory.
+  (batches flow straight into the writer). Spark's JDBC read is bounded by its fetch size, which
+  `run.sh` always sets (8192, or `--batch-size`); with Spark's own default (0) the Postgres
+  driver would buffer each whole partition in the heap, so the partition size, not the batch,
+  would set Spark's memory.
 - Apple Silicon works unmodified: every image is multi-arch (amd64 + arm64).
 
 ## Troubleshooting

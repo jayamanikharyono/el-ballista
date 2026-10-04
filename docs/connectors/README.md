@@ -19,7 +19,6 @@ abstractions (see `src/connector/mod.rs` for the contract):
 /// backend: `connector::postgres::dialect::PostgresDialect`, `connector::mysql::MysqlDialect`).
 pub trait SqlDialect: Send + Sync {
     fn quote_ident(&self, name: &str) -> String;
-    fn placeholder(&self, param_index: usize) -> String;   // "$1" for pg, "?" for MySQL
     fn cast_type_name(&self, to: CastType) -> &'static str;
     fn collation_name(&self, collation: Collation) -> &'static str; // Binary -> "\"C\"" on pg
 }
@@ -48,14 +47,15 @@ pub trait CheckpointStore: Send + Sync {
 }
 ```
 
-`begin` binds the checkpoint to the plan (a fingerprint of table, projection, resolved filters,
-strategy, partitions and partition column, plus the stored split bounds): resuming with a
-different plan is a `CheckpointError::PlanMismatch`.
+`begin` binds the checkpoint to the plan (a fingerprint of source `host:port/database`, table,
+schema, projection, resolved filters, strategy, partitions, partition column and execution
+mode): resuming with a different plan is a `CheckpointError::PlanMismatch`, and resumed splits
+must match the stored bounds (`CheckpointError::SplitPlanMismatch`).
 
 The PostgreSQL connector implements `TableProvider` (`supports_filters_pushdown` + `scan`) and
 `ExecutionPlan` (`PostgresExecutionPlan`, streaming `RecordBatch`es from a `DECLARE … CURSOR` /
-`FETCH` loop or a binary `COPY`). A `SourceConnector` trait sketch exists in
-`src/connector/mod.rs` but nothing uses it yet ([connector-abstraction](../connector-abstraction.md)).
+`FETCH` loop or a binary `COPY`). A shared `SourceConnector` trait is only a design proposal
+so far ([connector-abstraction](../connector-abstraction.md)); no code implements one.
 
 ---
 
@@ -86,7 +86,7 @@ COPY:   binary COPY frames ──► field bytes ────────┘
 
 On the cursor path each row still passes through sqlx's `PgRow` (a driver-side row buffer), so
 "no intermediate row struct" holds for the Arrow side, not the driver side. `json`, `jsonb`,
-`uuid` and enum columns are selected as `::text` and arrive as Postgres' own text rendering.
+`uuid` and user-defined (enum, composite) columns are selected as `::text` and arrive as Postgres' own text rendering.
 A batch is flushed when it reaches `batch_size` rows **or** `max_batch_bytes` bytes — never
 only at the end of the result set — which is what makes backpressure work end to end (see
 [architecture](../architecture.md#5-execution-and-memory)).
@@ -107,7 +107,8 @@ Three rules apply to both dialects:
 
 2. **Never widen silently to `Utf8`.** Falling back to a string for anything unrecognized produces
    a pipeline that "works" and a warehouse full of strings that nobody can aggregate. On Postgres
-   an unmapped type is an `UnsupportedType` error before the scan starts. A per-column `cast_to`
+   an unmapped type is an `UnsupportedType` error naming the column before the scan starts,
+   unless the job's `columns` leaves it out (it is then dropped from the provider's schema). A per-column `cast_to`
    escape hatch in the job spec is not implemented — and the MySQL prototype currently
    violates this rule (types outside its mapping table fall back to `Utf8`; see
    [mysql.md](mysql.md)), which must be fixed when the prototype is promoted.
@@ -156,7 +157,7 @@ production incident:
   comment tag (`connector::query_tag`), e.g.
   `/* el-ballista query_id=q_… pipeline=el-ballista run_id=r_… strategy=full+pushdown partition=3/8 */`:
   `pipeline` is the `application_name`, `run_id` is shared by every query of one run, and
-  `query_id` is fresh per query. A DBA looking at `pg_stat_activity` or the server log can
+  `query_id` is fresh per partition scan (its `DECLARE`/`FETCH`/`CLOSE`, or its `COPY`, share it). A DBA looking at `pg_stat_activity` or the server log can
   attribute every scan. The job id itself is not in either; give each job its
   own `application_name` to tell jobs apart.
 - **Session settings are explicit.** Postgres pools set `TIME ZONE 'UTC'`, `statement_timeout`,

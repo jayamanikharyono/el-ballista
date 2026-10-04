@@ -259,24 +259,17 @@ pub(crate) fn estimate_selectivity_from_stats(
             l_sel + r_sel - (l_sel * r_sel)
         }
         Predicate::Not(p) => 1.0 - estimate_selectivity_from_stats(p, stats),
-        Predicate::IsNull(p) => match p.as_ref() {
-            Predicate::Column(col_name) => stats
-                .columns
-                .get(col_name)
+        // Through a cast too: `CAST(col AS text)` is NULL exactly when the value is.
+        Predicate::IsNull(p) => operand_column(p)
+            .and_then(|col_name| stats.columns.get(col_name))
+            .map(|col: &ColumnStats| f64::from(col.null_frac))
+            .unwrap_or(0.01), // Conservative: assume 1% nulls if unknown
+        Predicate::IsNotNull(p) => {
+            1.0 - operand_column(p)
+                .and_then(|col_name| stats.columns.get(col_name))
                 .map(|col: &ColumnStats| f64::from(col.null_frac))
-                .unwrap_or(0.01), // Conservative: assume 1% nulls if unknown
-            _ => 0.01,
-        },
-        Predicate::IsNotNull(p) => match p.as_ref() {
-            Predicate::Column(col_name) => {
-                1.0 - stats
-                    .columns
-                    .get(col_name)
-                    .map(|col: &ColumnStats| f64::from(col.null_frac))
-                    .unwrap_or(0.01)
-            }
-            _ => 0.99,
-        },
+                .unwrap_or(0.01)
+        }
     };
     selectivity.clamp(0.0, 1.0)
 }
@@ -712,6 +705,30 @@ mod tests {
         let params = CostParams::default();
         assert_eq!(params.max_source_cost, 50_000);
         assert_eq!(params.keep_threshold, 0.30);
+    }
+
+    #[test]
+    fn test_null_test_selectivity_looks_through_a_text_cast() {
+        // A text-cast column's null test is pushed as `CAST(col AS text) IS NULL`: the
+        // column's `null_frac` still applies, not the 1% default.
+        let mut stats = create_test_stats();
+        if let Some(col) = stats.columns.get_mut("status") {
+            col.null_frac = 0.25;
+        }
+        let cast = || {
+            Box::new(Predicate::Cast {
+                expr: Box::new(Predicate::Column("status".to_string())),
+                to_type: crate::pushdown::CastType::Text,
+            })
+        };
+        let is_null = estimate_selectivity_from_stats(&Predicate::IsNull(cast()), &stats);
+        let not_null = estimate_selectivity_from_stats(&Predicate::IsNotNull(cast()), &stats);
+        assert!((is_null - 0.25).abs() < 1e-12, "{is_null}");
+        assert!((not_null - 0.75).abs() < 1e-12, "{not_null}");
+        // Unknown column: the conservative defaults.
+        let unknown = Box::new(Predicate::Column("nope".to_string()));
+        let is_null = estimate_selectivity_from_stats(&Predicate::IsNull(unknown), &stats);
+        assert!((is_null - 0.01).abs() < 1e-12, "{is_null}");
     }
 
     #[test]

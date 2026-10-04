@@ -16,8 +16,7 @@
 use std::fs::File;
 use std::path::PathBuf;
 
-use el_ballista::connector::postgres::PostgresConnector;
-use el_ballista::connector::postgres::pipeline::SplitInfo;
+use el_ballista::connector::postgres::{PostgresConnector, SplitInfo};
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;

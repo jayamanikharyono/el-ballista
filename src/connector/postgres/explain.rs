@@ -3,23 +3,17 @@
 //! [`ExplainEstimate`]) live in [`crate::pushdown::explain`]; this is the Postgres executor for
 //! them, plus the Postgres-specific plan parsing.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::debug;
 
 use crate::connector::errors::ExtractorError;
 use crate::pushdown::explain::{AccessMethod, ExplainEstimate};
 
 /// Map a Postgres EXPLAIN `Node Type` to an [`AccessMethod`].
-///
-/// # Examples
-/// ```
-/// use el_ballista::connector::postgres::explain::access_method_from_node_type;
-/// use el_ballista::pushdown::explain::AccessMethod;
-/// assert_eq!(access_method_from_node_type("Index Scan"), AccessMethod::IndexScan);
-/// ```
 pub fn access_method_from_node_type(node_type: &str) -> AccessMethod {
     match node_type {
         "Seq Scan" => AccessMethod::SequentialScan,
@@ -31,6 +25,33 @@ pub fn access_method_from_node_type(node_type: &str) -> AccessMethod {
 }
 
 /// Caches EXPLAIN estimates for query patterns to avoid repeated estimation.
+/// Most estimates one estimator keeps. Keys include the predicate's literals, so a long-lived
+/// provider queried with ever-new values (a moving time window) would otherwise grow forever.
+const MAX_CACHED_ESTIMATES: usize = 1024;
+
+/// Cache `estimate` under `key`, first dropping expired entries and then, if the cache is
+/// still at `max`, the oldest one: the cache never holds more than `max` estimates.
+fn insert_bounded(
+    cache: &mut HashMap<String, ExplainEstimate>,
+    key: String,
+    estimate: ExplainEstimate,
+    ttl: Duration,
+    now: DateTime<Utc>,
+    max: usize,
+) {
+    cache.retain(|_, e| now.signed_duration_since(e.estimated_at) < ttl);
+    if cache.len() >= max.max(1) && !cache.contains_key(&key) {
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, e)| e.estimated_at)
+            .map(|(k, _)| k.clone());
+        if let Some(oldest) = oldest {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, estimate);
+}
+
 #[derive(Debug)]
 pub struct ExplainEstimator {
     pool: Arc<PgPool>,
@@ -40,20 +61,6 @@ pub struct ExplainEstimator {
 
 impl ExplainEstimator {
     /// An estimator over `pool` whose cached estimates expire after `ttl_secs`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
-    /// use std::sync::Arc;
-    /// use el_ballista::connector::postgres::explain::ExplainEstimator;
-    ///
-    /// let estimator = ExplainEstimator::new(Arc::new(ex.pool().clone()), 300);
-    /// let estimate = estimator.estimate_cost("orders", "public", "status = 'PAID'").await?;
-    /// println!("{:?}, cost {:?}", estimate.access_method, estimate.total_cost);
-    /// # Ok(()) }
-    /// ```
     pub fn new(pool: Arc<PgPool>, ttl_secs: u64) -> Self {
         Self {
             pool,
@@ -69,21 +76,6 @@ impl ExplainEstimator {
     /// Estimate the cost of a query without executing it.
     /// Returns cached estimate if available and fresh, otherwise runs EXPLAIN and caches.
     /// The cache is keyed by table *and* predicate: different predicates plan differently.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
-    /// use std::sync::Arc;
-    /// use el_ballista::connector::postgres::explain::ExplainEstimator;
-    ///
-    /// let estimator = ExplainEstimator::new(Arc::new(ex.pool().clone()), 300);
-    /// let predicate = "created_at >= '2026-01-01'";
-    /// let estimate = estimator.estimate_cost("orders", "public", predicate).await?;
-    /// println!("{:?} rows, {:?}", estimate.plan_rows, estimate.access_method);
-    /// # Ok(()) }
-    /// ```
     pub async fn estimate_cost(
         &self,
         table_name: &str,
@@ -106,7 +98,14 @@ impl ExplainEstimator {
 
         {
             let mut cache = self.cache.write().await;
-            cache.insert(cache_key, estimate.clone());
+            insert_bounded(
+                &mut cache,
+                cache_key,
+                estimate.clone(),
+                self.ttl(),
+                Utc::now(),
+                MAX_CACHED_ESTIMATES,
+            );
         }
 
         Ok(estimate)
@@ -115,22 +114,6 @@ impl ExplainEstimator {
     /// Best-effort synchronous read of a cached estimate. Used on the sync planning path
     /// (`supports_filters_pushdown`), which cannot run EXPLAIN itself. Returns `None` on a
     /// cold cache (or a contended lock) — the cost model then falls back to statistics alone.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
-    /// use std::sync::Arc;
-    /// use el_ballista::connector::postgres::explain::ExplainEstimator;
-    ///
-    /// let estimator = ExplainEstimator::new(Arc::new(ex.pool().clone()), 300);
-    /// let pred = "id = 7";
-    /// assert!(estimator.cached_estimate("orders", "public", pred).is_none()); // cold cache
-    /// estimator.estimate_cost("orders", "public", pred).await?;
-    /// assert!(estimator.cached_estimate("orders", "public", pred).is_some());
-    /// # Ok(()) }
-    /// ```
     pub fn cached_estimate(
         &self,
         table_name: &str,
@@ -161,7 +144,7 @@ impl ExplainEstimator {
             table_name.replace('"', "\"\""),
             predicate,
         );
-        log::debug!("EXPLAIN estimation: {sql}");
+        debug!(sql = %sql, "EXPLAIN estimate");
 
         // `EXPLAIN (FORMAT JSON)` returns its single output column as SQL type `json`, so
         // decode as JSON and re-stringify once for the (unit-tested) parser.
@@ -214,6 +197,43 @@ fn parse_explain_json(json_str: &str) -> Result<ExplainEstimate, ExtractorError>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_estimate_cache_drops_expired_entries_and_stays_bounded() {
+        use super::{ExplainEstimate, insert_bounded};
+        use crate::pushdown::explain::AccessMethod;
+        use chrono::{Duration, Utc};
+        use std::collections::HashMap;
+
+        let now = Utc::now();
+        let at = |secs_ago: i64| ExplainEstimate {
+            access_method: AccessMethod::SequentialScan,
+            total_cost: Some(1.0),
+            plan_rows: Some(1.0),
+            index_name: None,
+            estimated_at: now - Duration::seconds(secs_ago),
+        };
+        let ttl = Duration::seconds(60);
+        let mut cache = HashMap::new();
+        cache.insert("expired".to_string(), at(120));
+        cache.insert("old".to_string(), at(30));
+        cache.insert("new".to_string(), at(10));
+
+        // Expired entries go on the next insert.
+        insert_bounded(&mut cache, "a".into(), at(0), ttl, now, 10);
+        assert!(!cache.contains_key("expired"));
+        assert_eq!(cache.len(), 3);
+
+        // At the cap, the oldest fresh entry makes room.
+        insert_bounded(&mut cache, "b".into(), at(0), ttl, now, 3);
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains_key("old") && cache.contains_key("b"));
+
+        // Refreshing a key already cached evicts nothing.
+        insert_bounded(&mut cache, "b".into(), at(0), ttl, now, 3);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key("new") && cache.contains_key("a"));
+    }
+
     use super::*;
 
     #[test]

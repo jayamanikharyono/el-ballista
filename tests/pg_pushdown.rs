@@ -25,10 +25,7 @@ use el_ballista::config::{
 };
 use el_ballista::connector::postgres::PostgresTableProvider;
 use el_ballista::connector::postgres::distributed::DistributedContext;
-use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
 use el_ballista::connector::postgres::register_table;
-use el_ballista::pushdown::PushdownPolicy;
-use el_ballista::pushdown::cost_model::CostParams;
 
 type R<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -107,7 +104,20 @@ async fn distributed_ctx(
     Ok(ctx)
 }
 
-async fn ids_in(ctx: &SessionContext, table: &str, filter: &str) -> R<Vec<i64>> {
+async fn ids_in(ctx: &DistributedContext, table: &str, filter: &str) -> R<Vec<i64>> {
+    let batches = ctx
+        .collect_sql(&format!("SELECT id FROM {table} WHERE {filter}"))
+        .await?;
+    let mut ids = Vec::new();
+    for b in &batches {
+        ids.extend(common::int64_col(b, "id"));
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// `SELECT id FROM <table> WHERE <filter>` on a plain (standalone) DataFusion context.
+async fn local_ids(ctx: &SessionContext, table: &str, filter: &str) -> R<Vec<i64>> {
     let batches = ctx
         .sql(&format!("SELECT id FROM {table} WHERE {filter}"))
         .await?
@@ -125,20 +135,24 @@ async fn ids_in(ctx: &SessionContext, table: &str, filter: &str) -> R<Vec<i64>> 
 /// inspecting what the physical plan pushes.
 async fn local_always_ctx(db: &TestDb, table: &str) -> R<SessionContext> {
     let config = job_for(db, table, "always");
-    let provider = PostgresTableProvider::new(
-        PostgresConnectionDescriptor::from_config(&config.source, 1),
-        &config.resolved_table(),
-        PushdownPolicy::Always,
-        Vec::new(),
-        Vec::new(),
-        CostParams::default(),
-        config.pushdown.statistics_ttl_secs,
-        config.execution.batch_size,
-    )
-    .await?;
+    let provider = PostgresTableProvider::from_config(&config).await?;
     let ctx = SessionContext::new();
     ctx.register_table(table, Arc::new(provider))?;
     Ok(ctx)
+}
+
+/// Whether the distributed session's plan pushes any filter into the Postgres scan (its
+/// `TableScan` carries `full_filters` / `partial_filters`): the non-vacuity check for the
+/// differential, taken from the very context whose rows are compared.
+async fn distributed_pushes(ctx: &DistributedContext, table: &str, filter: &str) -> R<bool> {
+    let plan = ctx
+        .explain_sql(&format!("SELECT id FROM {table} WHERE {filter}"))
+        .await?;
+    let scan = plan
+        .lines()
+        .find(|l| l.trim_start().starts_with("TableScan:"))
+        .ok_or_else(|| format!("no TableScan in plan:\n{plan}"))?;
+    Ok(scan.contains("full_filters=") || scan.contains("partial_filters="))
 }
 
 /// How many filters the physical plan pushes into the Postgres scan: the non-vacuity check
@@ -178,7 +192,9 @@ async fn pushdown_matches_no_pushdown() -> R {
 }
 
 /// One differential row per hazard: collation-sensitive text, `NOT`, float `-0.0`/`NaN`,
-/// `IS NULL` precedence, enums under `OR`, uuid/jsonb text comparisons, and dates.
+/// `IS NULL` precedence, enums under `OR`, uuid/jsonb text comparisons, dates, and null tests
+/// on a composite column (SQL's row `IS NULL` is true for a row of NULL fields, which Arrow
+/// holds as the non-NULL text `(,)`).
 #[tokio::test]
 async fn pushdown_differential_table() -> R {
     let db = live!();
@@ -188,6 +204,7 @@ async fn pushdown_differential_table() -> R {
             "CREATE COLLATION {s}.ci (provider = icu, locale = 'und-u-ks-level2', \
              deterministic = false)"
         ),
+        format!("CREATE TYPE {s}.pair AS (a int, b text)"),
         format!(
             r#"CREATE TABLE {s}.pd (
                 id bigint PRIMARY KEY,
@@ -199,17 +216,20 @@ async fn pushdown_differential_table() -> R {
                 uid uuid,
                 meta jsonb,
                 note text,
-                d date
+                d date,
+                pr {s}.pair
             )"#
         ),
         format!(r#"CREATE INDEX pd_name_idx ON {s}.pd (name)"#),
+        // `pr`: every field set, every field NULL, one field NULL, the row itself NULL, and
+        // the first field NULL.
         format!(
             r#"INSERT INTO {s}.pd VALUES
-            (1, 'B', 'FOO', '-0',  true,  'sad',      '123e4567-e89b-12d3-a456-426614174000', '"x"', 'a',     '2024-02-29'),
-            (2, 'a', 'bar', 1.0,   false, 'ok',       '123e4567-e89b-12d3-a456-426614174001', '1',   NULL,    '1970-01-01'),
-            (3, 'c', 'foo', -1.0,  NULL,  'ecstatic', '123e4567-e89b-12d3-a456-426614174002', NULL,  'b',     '2024-01-01'),
-            (4, NULL, NULL, NULL,  NULL,  NULL,       NULL,                                   'true', E'c\\d', NULL),
-            (5, 'Ä', 'Foo', 'NaN', true,  'sad',      NULL,                                   '"y"', '',      '9999-12-31')"#
+            (1, 'B', 'FOO', '-0',  true,  'sad',      '123e4567-e89b-12d3-a456-426614174000', '"x"', 'a',     '2024-02-29', ROW(1, 'x')::{s}.pair),
+            (2, 'a', 'bar', 1.0,   false, 'ok',       '123e4567-e89b-12d3-a456-426614174001', '1',   NULL,    '1970-01-01', ROW(NULL, NULL)::{s}.pair),
+            (3, 'c', 'foo', -1.0,  NULL,  'ecstatic', '123e4567-e89b-12d3-a456-426614174002', NULL,  'b',     '2024-01-01', ROW(1, NULL)::{s}.pair),
+            (4, NULL, NULL, NULL,  NULL,  NULL,       NULL,                                   'true', E'c\\d', NULL,        NULL),
+            (5, 'Ä', 'Foo', 'NaN', true,  'sad',      NULL,                                   '"y"', '',      '9999-12-31', ROW(NULL, 'y')::{s}.pair)"#
         ),
         format!("ANALYZE {s}.pd"),
     ];
@@ -251,6 +271,10 @@ async fn pushdown_differential_table() -> R {
         ("name IS NULL", true),
         ("note IS NOT NULL", true),
         ("uid IS NULL", true),
+        // Composite: Arrow holds the text form, so only row 4 (the NULL row) is NULL.
+        ("pr IS NULL", true),
+        ("pr IS NOT NULL", true),
+        ("NOT (pr IS NULL)", true),
         // Backslash literal (bound parameter).
         (r"note = 'c\d'", true),
         // Dates: every operator, NOT, a two-sided window, leap day, epoch, year 9999 and NULL.
@@ -274,10 +298,13 @@ async fn pushdown_differential_table() -> R {
 
     let mut failures = Vec::new();
     for (filter, expect_pushed) in cases {
-        let kept = ids_in(&never.session, "pd", filter).await?;
-        let pushed = ids_in(&always.session, "pd", filter).await?;
+        let kept = ids_in(&never, "pd", filter).await?;
+        let pushed = ids_in(&always, "pd", filter).await?;
         let n = pushed_filter_count(&local, "pd", filter).await?;
-        println!("{filter:<50} never={kept:?} always={pushed:?} pushed_filters={n}");
+        let shipped = distributed_pushes(&always, "pd", filter).await?;
+        println!(
+            "{filter:<50} never={kept:?} always={pushed:?} pushed_filters={n} distributed={shipped}"
+        );
         if pushed != kept {
             failures.push(format!(
                 "`{filter}`: always={pushed:?} never={kept:?} (pushdown changed the answer)"
@@ -288,8 +315,23 @@ async fn pushdown_differential_table() -> R {
                 "`{filter}`: expected pushed={expect_pushed}, plan pushed {n} filter(s)"
             ));
         }
+        // The rows above come from the distributed contexts: the `always` one must really
+        // have pushed, or the comparison is vacuous.
+        if shipped != *expect_pushed {
+            failures.push(format!(
+                "`{filter}`: expected pushed={expect_pushed}, the distributed plan pushed={shipped}"
+            ));
+        }
     }
     assert!(failures.is_empty(), "failures:\n{}", failures.join("\n"));
+
+    // Trivial oracle for the composite rows: in Arrow only the NULL row (4) is NULL; a row
+    // of NULL fields (2) or with one NULL field (3, 5) is not.
+    assert_eq!(ids_in(&always, "pd", "pr IS NULL").await?, vec![4]);
+    assert_eq!(
+        ids_in(&always, "pd", "pr IS NOT NULL").await?,
+        vec![1, 2, 3, 5]
+    );
     Ok(())
 }
 
@@ -310,18 +352,9 @@ async fn cost_statistics_refresh_after_ttl() -> R {
             .execute(&db.pool)
             .await?;
     }
-    let config = job_for(&db, "st", "cost_based");
-    let provider = PostgresTableProvider::new(
-        PostgresConnectionDescriptor::from_config(&config.source, 1),
-        &config.resolved_table(),
-        PushdownPolicy::CostBased,
-        Vec::new(),
-        Vec::new(),
-        CostParams::default(),
-        0, // statistics TTL: stale immediately
-        config.execution.batch_size,
-    )
-    .await?;
+    let mut config = job_for(&db, "st", "cost_based");
+    config.pushdown.statistics_ttl_secs = 0; // stale immediately
+    let provider = PostgresTableProvider::from_config(&config).await?;
     let filter = col("v").eq(lit(5i64));
     // Never analyzed: no column statistics, unindexed column -> keep.
     assert!(matches!(provider.decide_cost(&filter), Decision::Keep));
@@ -385,19 +418,7 @@ async fn range_windows_push_on_histogram_estimates() -> R {
     }
 
     let config = job_for(&db, "ev", "cost_based");
-    let provider = Arc::new(
-        PostgresTableProvider::new(
-            PostgresConnectionDescriptor::from_config(&config.source, 1),
-            &config.resolved_table(),
-            PushdownPolicy::CostBased,
-            Vec::new(),
-            Vec::new(),
-            CostParams::default(),
-            config.pushdown.statistics_ttl_secs,
-            config.execution.batch_size,
-        )
-        .await?,
-    );
+    let provider = Arc::new(PostgresTableProvider::from_config(&config).await?);
 
     // Day 100 of 200: 2026-04-11 .. 2026-04-12.
     let day =
@@ -479,7 +500,7 @@ async fn range_windows_push_on_histogram_estimates() -> R {
         "d >= '2026-04-11' AND d < '2026-04-12'",
     ] {
         let pushed = pushed_filter_count(&ctx, "ev", filter).await?;
-        let got = ids_in(&ctx, "ev", filter).await?;
+        let got = local_ids(&ctx, "ev", filter).await?;
         let kept = ids_where(&db, "ev", "never", filter).await?;
         println!("{filter}: pushed_filters={pushed} rows={}", got.len());
         if pushed != 2 {

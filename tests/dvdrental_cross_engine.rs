@@ -8,12 +8,20 @@
 //!   2. the same counts via the Postgres and MySQL connectors (extraction matches the reference),
 //!   3. the actual values (category names) read through each connector are byte-identical.
 //!
+//! The Postgres side is extracted through the public connector (`PostgresConnector` →
+//! `standalone().stream()`, via `tests/common`'s `extract_one`), cursor path, one unsplit scan.
+//!
 //! Requires the compose stack up (`docker compose -f tests/docker/compose.yaml up -d --wait`). Never skips: a
 //! failure to connect is a hard failure, with a message pointing at the stack.
 
+mod common;
+
 use arrow::array::{Array, BinaryArray, StringArray};
+use el_ballista::config::{
+    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
+    PushdownConfig, SourceConfig,
+};
 use el_ballista::connector::mysql::MysqlExtractor;
-use el_ballista::connector::postgres::PostgresExtractor;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool, Row};
@@ -119,11 +127,57 @@ async fn my_pool() -> MySqlPool {
         })
 }
 
-async fn pg_extractor() -> PostgresExtractor {
-    let (h, p, u, pw, db) = parse(&pg_url(), 5432);
-    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "el-ballista-cross-engine")
+/// Name of the env var every Postgres `JobConfig` in this file reads its password from.
+const CROSS_PASSWORD_ENV: &str = "CROSS_ENGINE_PG_PASSWORD";
+static CROSS_PASSWORD_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Set [`CROSS_PASSWORD_ENV`] exactly once per process and never remove it (the connector reads
+/// the password from `source.password_env`, never from the config). Every test in this file
+/// calls this as its FIRST statement, so all of them block in `call_once` until the single
+/// write is done — no env read in this binary can overlap it.
+fn cross_password_env() -> &'static str {
+    CROSS_PASSWORD_ONCE.call_once(|| {
+        let (_, _, _, pw, _) = parse(&pg_url(), 5432);
+        // SAFETY: runs once, inside `call_once`, and the value is never changed or removed
+        // afterwards; every reader of this variable goes through this function first.
+        unsafe { std::env::set_var(CROSS_PASSWORD_ENV, pw) };
+    });
+    CROSS_PASSWORD_ENV
+}
+
+/// `public.<table>` extracted through the Postgres connector (`columns`: `None` = all; cursor
+/// path, default batch size and byte cap, one unsplit scan, no filters), as one batch.
+async fn pg_extract(table: &str, columns: Option<&[&str]>) -> arrow::record_batch::RecordBatch {
+    let env_var = cross_password_env();
+    let (h, p, u, _pw, db) = parse(&pg_url(), 5432);
+    let config = JobConfig {
+        job_id: format!("cross-engine-{table}").parse().unwrap(),
+        table: table.to_string(),
+        columns: columns.map(|c| c.iter().map(|s| s.to_string()).collect()),
+        filters: Vec::new(),
+        source: SourceConfig {
+            host: h,
+            port: p,
+            user: u,
+            password_env: env_var.to_string(),
+            database: db,
+            pool_max: 4,
+            statement_timeout_ms: 30_000,
+            application_name: "el-ballista-cross-engine".to_string(),
+            schema: "public".to_string(),
+        },
+        checkpoint: CheckpointConfig::default(),
+        pushdown: PushdownConfig::default(),
+        parallel_scan: ParallelScanConfig::default(),
+        execution: ExecutionConfig {
+            use_copy: false,
+            ..ExecutionConfig::default()
+        },
+        distributed: DistributedConfig::default(),
+    };
+    common::extract_one(&config)
         .await
-        .unwrap_or_else(|e| panic!("PostgresExtractor::connect: {e}"))
+        .unwrap_or_else(|e| panic!("PG extract {table}: {e}"))
 }
 
 async fn my_extractor() -> (MysqlExtractor, String) {
@@ -152,6 +206,7 @@ fn sorted_string_col(batch: &arrow::record_batch::RecordBatch, name: &str) -> Ve
 
 #[tokio::test]
 async fn direct_row_counts_match_reference_on_both_engines() {
+    cross_password_env();
     let pg = pg_pool().await;
     let my = my_pool().await;
     for (t, expected) in TABLES {
@@ -178,13 +233,10 @@ async fn direct_row_counts_match_reference_on_both_engines() {
 
 #[tokio::test]
 async fn connector_extraction_row_counts_match_reference() {
-    let pgx = pg_extractor().await;
+    cross_password_env();
     let (myx, db) = my_extractor().await;
     for (t, expected) in CONNECTOR_TABLES {
-        let pg_batch = pgx
-            .extract_full_table(&format!("public.{t}"), None)
-            .await
-            .unwrap_or_else(|e| panic!("PG extract {t}: {e}"));
+        let pg_batch = pg_extract(t, None).await;
         let my_batch = myx
             .extract_full_table(&format!("{db}.{t}"), None)
             .await
@@ -204,13 +256,10 @@ async fn connector_extraction_row_counts_match_reference() {
 
 #[tokio::test]
 async fn connectors_read_identical_category_names() {
-    let pgx = pg_extractor().await;
+    cross_password_env();
     let (myx, db) = my_extractor().await;
 
-    let pg_batch = pgx
-        .extract_full_table("public.category", Some(vec!["name"]))
-        .await
-        .expect("PG extract category");
+    let pg_batch = pg_extract("category", Some(&["name"])).await;
     let my_batch = myx
         .extract_full_table(&format!("{db}.category"), Some(vec!["name"]))
         .await
@@ -257,13 +306,10 @@ async fn connectors_read_identical_staff_picture() {
     // 18 ASCII chars — the seed's UNHEX post-step (see gen_mysql_seed.py) restores byte parity.
     // Both connectors surface it as Arrow Binary; differential oracle (PG vs MySQL) plus the
     // absolute bytes from tests/data/dvdrental/3079.dat (`\x89504e470d0a5a0a`, staff 1; NULL staff 2).
-    let pgx = pg_extractor().await;
+    cross_password_env();
     let (myx, db) = my_extractor().await;
 
-    let pg_batch = pgx
-        .extract_full_table("public.staff", Some(vec!["picture"]))
-        .await
-        .expect("PG extract staff.picture");
+    let pg_batch = pg_extract("staff", Some(&["picture"])).await;
     let my_batch = myx
         .extract_full_table(&format!("{db}.staff"), Some(vec!["picture"]))
         .await

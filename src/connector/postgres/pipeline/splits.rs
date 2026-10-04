@@ -23,6 +23,7 @@ use datafusion::execution::RecordBatchStream;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::Stream;
+use tracing::{debug, warn};
 
 use crate::checkpoint::progress::{PartitionStatus, ProgressReporter};
 use crate::checkpoint::{JobCheckpoint, PlanIdentity, PlannedSplit, SplitBounds, SplitState};
@@ -75,10 +76,12 @@ fn strategy_name(strategy: ParallelStrategy) -> &'static str {
     }
 }
 
-/// The plan identity a checkpoint is bound to: table, output schema, projection, the
-/// resolved (schema-coerced) filter predicates, parallel strategy, partitions, partition
-/// column and execution mode. Batch size, COPY vs cursor and pushdown policy are excluded:
-/// they change how rows are fetched, not which rows a split holds.
+/// The plan identity a checkpoint is bound to: the source database (`host:port/database`),
+/// table, output schema, projection, the resolved (schema-coerced) filter predicates, parallel
+/// strategy, partitions, partition column and execution mode. The source is part of it because
+/// the same table name in another database holds other rows: a job pointed elsewhere must not
+/// skip splits completed against the old one. Batch size, COPY vs cursor and pushdown policy
+/// are excluded: they change how rows are fetched, not which rows a split holds.
 pub(crate) fn plan_identity(
     config: &JobConfig,
     output_schema: &Schema,
@@ -111,7 +114,12 @@ pub(crate) fn plan_identity(
             .collect::<Vec<_>>()
             .join(" AND ")
     };
+    let source = &config.source;
     PlanIdentity::new()
+        .with(
+            "source",
+            format!("{}:{}/{}", source.host, source.port, source.database),
+        )
         .with("table", config.resolved_table())
         .with("schema", schema)
         .with("projection", projection)
@@ -176,10 +184,10 @@ pub(crate) async fn compute_splits(
             // Single-node splits are keyset ranges (re-creatable from stored integer bounds);
             // ctid ranges shift under VACUUM/updates, so ctid partitioning is only offered on
             // the distributed path. One whole-table split, never a scan per partition.
-            log::warn!(
-                "job '{}': parallel_scan.strategy='ctid' is not supported by single-node \
-                 extraction; running one whole-table split (use `.distributed()` for ctid)",
-                config.job_id
+            warn!(
+                strategy = "ctid",
+                "ctid partitioning is not supported standalone; running one whole-table \
+                 split (use `.distributed()` for ctid)"
             );
             Ok(single_split())
         }
@@ -243,11 +251,10 @@ pub(crate) fn pending_splits(checkpoint: &JobCheckpoint) -> (Vec<usize>, usize, 
     let (mut skipped, mut skipped_rows) = (0usize, 0u64);
     for (index, split) in checkpoint.splits.iter().enumerate() {
         if split.state == SplitState::Completed {
-            log::info!(
-                "job '{}': {} already completed ({} rows), skipping",
-                checkpoint.job_id,
-                split.split_id,
-                split.rows_extracted
+            debug!(
+                split_id = %split.split_id,
+                rows = split.rows_extracted,
+                "split already completed, skipping"
             );
             skipped += 1;
             skipped_rows += split.rows_extracted;
@@ -341,11 +348,7 @@ impl Stream for SplitStream {
                 let total_rows = p.rows.fetch_add(rows, Ordering::AcqRel) + rows;
                 let n = p.batches.fetch_add(1, Ordering::AcqRel) + 1;
                 p.bytes.fetch_add(bytes, Ordering::AcqRel);
-                log::debug!(
-                    "extract batch job={} split={} batch={n} rows={rows} batch_bytes={bytes}",
-                    this.job_id,
-                    this.split_id
-                );
+                debug!(batch = n, rows, bytes, "batch");
                 crate::telemetry::record_batch(this.job_id.as_str(), rows, bytes);
                 if let Some(reporter) = &this.reporter {
                     // The split's running total, not a delta: the progress writer replaces the
@@ -357,14 +360,9 @@ impl Stream for SplitStream {
                     ));
                 }
             }
-            Poll::Ready(Some(Err(e))) => {
-                this.progress.errored.store(true, Ordering::Release);
-                log::warn!(
-                    "extract stream error job={} split={}: {e}",
-                    this.job_id,
-                    this.split_id
-                );
-            }
+            // Not logged here: the error reaches the consumer and the run driver, which logs a
+            // failed split once.
+            Poll::Ready(Some(Err(_))) => this.progress.errored.store(true, Ordering::Release),
             Poll::Ready(None) => this.progress.finished.store(true, Ordering::Release),
             Poll::Pending => {}
         }
@@ -442,6 +440,37 @@ mod tests {
             ExecutionMode::Standalone,
         );
         assert_eq!(base.fingerprint(), tuned.fingerprint());
+    }
+
+    #[test]
+    fn identity_changes_with_the_source_database_but_not_with_credentials() {
+        let c = config();
+        let identity = |c: &JobConfig| {
+            plan_identity(
+                c,
+                &schema(),
+                &[col("id").gt(lit(8))],
+                ExecutionMode::Standalone,
+            )
+        };
+        let base = identity(&c);
+        // Same table name, other rows: completed splits must not carry over.
+        let changes: [fn(&mut JobConfig); 3] = [
+            |c| c.source.database.push_str("_other"),
+            |c| c.source.host.push_str(".replica"),
+            |c| c.source.port += 1,
+        ];
+        for change in changes {
+            let mut moved = c.clone();
+            change(&mut moved);
+            assert_eq!(base.diff(identity(&moved).components()), vec!["source"]);
+        }
+        // Who connects and with how many connections does not change which rows exist.
+        let mut tuned = c.clone();
+        tuned.source.user.push_str("_rotated");
+        tuned.source.password_env.push_str("_ROTATED");
+        tuned.source.pool_max += 1;
+        assert_eq!(base.fingerprint(), identity(&tuned).fingerprint());
     }
 
     #[test]

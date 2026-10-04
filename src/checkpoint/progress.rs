@@ -1,7 +1,7 @@
 //! Driver-owned, non-blocking extraction progress.
 //!
 //! Ownership rule: **only the driver writes anything checkpoint-related** (split states
-//! via [`CheckpointStore`] and the advisory progress file below). Ballista executor
+//! via [`CheckpointStore`](super::CheckpointStore) and the advisory progress file below). Ballista executor
 //! tasks / worker processes never touch the checkpoint directory — they stream
 //! `RecordBatch`es back; the driver derives per-partition status from those batches (or
 //! from its own single-node partition loops) and reports it here.
@@ -25,6 +25,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
+use tracing::Instrument;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -201,92 +202,95 @@ impl ProgressFlusher {
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<oneshot::Sender<ProgressSnapshot>>();
 
-        let handle = tokio::spawn(async move {
-            let mut rx = rx;
-            let mut states: HashMap<String, PartitionState> = HashMap::new();
-            // Rows newly observed since the last write (the `flush_rows` trigger), and whether
-            // anything changed since then (the periodic trigger).
-            let mut rows_since_flush: u64 = 0;
-            let mut dirty = false;
-            let mut ticker = tokio::time::interval(flush_interval);
-            // First tick fires immediately; skip it so we don't write an empty snapshot.
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
+        let handle = tokio::spawn(
+            async move {
+                let mut rx = rx;
+                let mut states: HashMap<String, PartitionState> = HashMap::new();
+                // Rows newly observed since the last write (the `flush_rows` trigger), and whether
+                // anything changed since then (the periodic trigger).
+                let mut rows_since_flush: u64 = 0;
+                let mut dirty = false;
+                let mut ticker = tokio::time::interval(flush_interval);
+                // First tick fires immediately; skip it so we don't write an empty snapshot.
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await;
 
-            let snapshot = |states: &HashMap<String, PartitionState>| {
-                let partitions_done = states.values().filter(|s| s.done).count();
-                ProgressSnapshot {
-                    job_id: job_id.clone(),
-                    updated_at: Utc::now(),
-                    rows_extracted: states.values().map(|s| s.rows).sum(),
-                    partitions_total,
-                    partitions_done,
-                    partitions: states.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                    dropped_reports: dropped.load(Ordering::Relaxed),
-                }
-            };
-
-            let write_snapshot = |snap: &ProgressSnapshot| {
-                let dir = dir.clone();
-                let snap = snap.clone();
-                let path = dir.join(&file_name);
-                async move {
-                    // Best-effort: progress is advisory. Never fail the run on it.
-                    if tokio::fs::create_dir_all(&dir).await.is_err() {
-                        return;
+                let snapshot = |states: &HashMap<String, PartitionState>| {
+                    let partitions_done = states.values().filter(|s| s.done).count();
+                    ProgressSnapshot {
+                        job_id: job_id.clone(),
+                        updated_at: Utc::now(),
+                        rows_extracted: states.values().map(|s| s.rows).sum(),
+                        partitions_total,
+                        partitions_done,
+                        partitions: states.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        dropped_reports: dropped.load(Ordering::Relaxed),
                     }
-                    let Ok(text) = serde_json::to_string_pretty(&snap) else {
-                        return;
-                    };
-                    let tmp = path.with_extension("progress.json.tmp");
-                    if tokio::fs::write(&tmp, text.as_bytes()).await.is_err() {
-                        return;
-                    }
-                    let _ = tokio::fs::rename(&tmp, &path).await;
-                }
-            };
+                };
 
-            let mut shutdown_rx = shutdown_rx;
-            loop {
-                tokio::select! {
-                    biased;
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(ProgressMsg::Partition(status)) => {
-                                if apply_status(&mut states, status, &mut rows_since_flush) {
-                                    dirty = true;
-                                }
-                                if rows_since_flush >= flush_rows {
-                                    rows_since_flush = 0;
-                                    dirty = false;
-                                    let snap = snapshot(&states);
-                                    write_snapshot(&snap).await;
-                                }
-                            }
-                            None => break,
+                let write_snapshot = |snap: &ProgressSnapshot| {
+                    let dir = dir.clone();
+                    let snap = snap.clone();
+                    let path = dir.join(&file_name);
+                    async move {
+                        // Best-effort: progress is advisory. Never fail the run on it.
+                        if tokio::fs::create_dir_all(&dir).await.is_err() {
+                            return;
                         }
+                        let Ok(text) = serde_json::to_string_pretty(&snap) else {
+                            return;
+                        };
+                        let tmp = path.with_extension("progress.json.tmp");
+                        if tokio::fs::write(&tmp, text.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = tokio::fs::rename(&tmp, &path).await;
                     }
-                    _ = ticker.tick() => {
-                        // Periodic flush only if something changed since the last write.
-                        if dirty {
-                            rows_since_flush = 0;
-                            dirty = false;
+                };
+
+                let mut shutdown_rx = shutdown_rx;
+                loop {
+                    tokio::select! {
+                        biased;
+                        msg = rx.recv() => {
+                            match msg {
+                                Some(ProgressMsg::Partition(status)) => {
+                                    if apply_status(&mut states, status, &mut rows_since_flush) {
+                                        dirty = true;
+                                    }
+                                    if rows_since_flush >= flush_rows {
+                                        rows_since_flush = 0;
+                                        dirty = false;
+                                        let snap = snapshot(&states);
+                                        write_snapshot(&snap).await;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = ticker.tick() => {
+                            // Periodic flush only if something changed since the last write.
+                            if dirty {
+                                rows_since_flush = 0;
+                                dirty = false;
+                                let snap = snapshot(&states);
+                                write_snapshot(&snap).await;
+                            }
+                        }
+                        reply = &mut shutdown_rx => {
                             let snap = snapshot(&states);
                             write_snapshot(&snap).await;
+                            if let Ok(reply) = reply {
+                                let _ = reply.send(snap.clone());
+                            }
+                            return snap;
                         }
-                    }
-                    reply = &mut shutdown_rx => {
-                        let snap = snapshot(&states);
-                        write_snapshot(&snap).await;
-                        if let Ok(reply) = reply {
-                            let _ = reply.send(snap.clone());
-                        }
-                        return snap;
                     }
                 }
+                snapshot(&states)
             }
-            snapshot(&states)
-        });
+            .instrument(tracing::Span::current()),
+        );
 
         Self {
             reporter,

@@ -28,11 +28,7 @@ use el_ballista::config::{
 };
 use el_ballista::connector::postgres::PostgresConnector;
 use el_ballista::connector::postgres::PostgresTableProvider;
-use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
-use el_ballista::connector::postgres::row_adapter::PostgresRowAdapter;
-use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
 use el_ballista::pushdown::PushdownPolicy;
-use el_ballista::pushdown::cost_model::CostParams;
 use futures::TryStreamExt;
 
 type R = Result<(), Box<dyn std::error::Error>>;
@@ -196,19 +192,10 @@ async fn provider_streams_many_batches_with_the_source_row_set() -> R {
         let expected_ids = source_ids(&db, table).await?;
         let mut baseline: Option<Vec<Vec<String>>> = None;
         for (batch_size, use_copy) in [(8192, false), (7, false), (7, true)] {
-            let config = job(&db, table, 1, batch_size);
-            let provider = PostgresTableProvider::new(
-                PostgresConnectionDescriptor::from_config(&config.source, 1),
-                &config.resolved_table(),
-                PushdownPolicy::Never,
-                Vec::new(),
-                Vec::new(),
-                CostParams::default(),
-                config.pushdown.statistics_ttl_secs,
-                batch_size,
-            )
-            .await?
-            .with_use_copy(use_copy);
+            let mut config = job(&db, table, 1, batch_size);
+            config.pushdown.policy = PushdownPolicy::Never;
+            config.execution.use_copy = use_copy;
+            let provider = PostgresTableProvider::from_config(&config).await?;
             let schema = provider_schema(&provider);
             let ctx = SessionContext::new();
             ctx.register_table(table, Arc::new(provider))?;
@@ -336,34 +323,21 @@ fn expected_hostile_schema() -> Schema {
 #[tokio::test]
 async fn empty_result_schema_equals_the_table_schema() -> R {
     // Oracle: trivial (the hand-written schema: every name, type, timezone, precision and
-    // nullability) and the connector's own single schema function (`build_arrow_schema` over
-    // the catalog metadata) — for an empty result, which carries no batch to inspect.
+    // nullability) against the provider's schema — the connector's single schema function over
+    // the catalog metadata — and against an empty result, which carries no batch to inspect.
     let db = TestDb::connect().await;
     let expected = Arc::new(expected_hostile_schema());
 
-    let metadata = PostgresSchemaReader::new(&db.pool)
-        .get_table_metadata(&db.table())
-        .await?;
-    let built = PostgresRowAdapter::build_arrow_schema(&metadata)?;
-    assert_eq!(
-        built, expected,
-        "build_arrow_schema drifted from the fixture"
-    );
-
     for use_copy in [false, true] {
-        let config = job(&db, "hostile", 1, 8192);
-        let provider = PostgresTableProvider::new(
-            PostgresConnectionDescriptor::from_config(&config.source, 1),
-            &config.resolved_table(),
-            PushdownPolicy::Always,
-            Vec::new(),
-            Vec::new(),
-            CostParams::default(),
-            config.pushdown.statistics_ttl_secs,
-            config.execution.batch_size,
-        )
-        .await?
-        .with_use_copy(use_copy);
+        let mut config = job(&db, "hostile", 1, 8192);
+        config.pushdown.policy = PushdownPolicy::Always;
+        config.execution.use_copy = use_copy;
+        let provider = PostgresTableProvider::from_config(&config).await?;
+        assert_eq!(
+            provider_schema(&provider),
+            expected,
+            "the provider schema drifted from the fixture"
+        );
         let ctx = SessionContext::new();
         ctx.register_table("hostile", Arc::new(provider))?;
         let df = ctx

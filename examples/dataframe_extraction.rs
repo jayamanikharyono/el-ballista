@@ -9,7 +9,7 @@
 
 use datafusion::prelude::{col, lit};
 use el_ballista::config::JobConfig;
-use el_ballista::connector::postgres::engine::ExtractContext;
+use el_ballista::connector::postgres::ExtractContext;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

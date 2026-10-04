@@ -12,12 +12,15 @@
 //! Oracles (AGENTS.md §7): differential = same SQL with pushdown policy `always` vs `never`;
 //! reference = direct SQL against the source; trivial = hand-written expected value.
 //!
-//! Self-contained on purpose: it does not use `tests/common` (its `TestDb` teardown could
-//! deadlock when these tests were written; that is fixed). Each test creates its own schema /
-//! database and removes it with an explicit async cleanup.
+//! Keeps its own fixtures (`Pg` / `My`, not `tests/common`'s `TestDb`): each test creates its
+//! own schema / database with the tables it needs and removes it with an explicit async
+//! cleanup. From `tests/common` it uses only the extraction helpers (`extract_one` /
+//! `extract_batches`), which run the public connector (`PostgresConnector` → `stream()`).
 //!
 //! Needs the compose stack: `docker compose -f tests/docker/compose.yaml up -d --wait`
 //! Run: `cargo test --test regressions -- --test-threads=1`
+
+mod common;
 
 use arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::DataType;
@@ -30,7 +33,6 @@ use el_ballista::config::{
 };
 use el_ballista::connector::mysql::MysqlExtractor;
 use el_ballista::connector::postgres::PostgresConnector;
-use el_ballista::connector::postgres::extractor::PostgresExtractor;
 use el_ballista::errors::AppError;
 use futures::TryStreamExt;
 use sqlx::postgres::PgPoolOptions;
@@ -51,7 +53,6 @@ struct Pg {
     host: String,
     port: u16,
     user: String,
-    password: String,
     database: String,
 }
 
@@ -117,7 +118,6 @@ impl Pg {
             host,
             port,
             user,
-            password,
             database,
         }
     }
@@ -128,21 +128,6 @@ impl Pg {
             .execute(&self.pool)
             .await;
         self.pool.close().await;
-    }
-
-    async fn extractor(&self) -> PostgresExtractor {
-        PostgresExtractor::connect(
-            &self.host,
-            self.port,
-            &self.user,
-            &self.password,
-            &self.database,
-            2,
-            60_000,
-            "el-ballista-regressions",
-        )
-        .await
-        .expect("extractor connect")
     }
 
     fn job(&self, table: &str) -> JobConfig {
@@ -230,6 +215,22 @@ fn rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
+/// True when `err`'s cause chain holds a panicked task. The connector decodes in its own scan
+/// task and surfaces a panic there as a `JoinError` in the stream's error, so a decode panic
+/// arrives as an `Err` whose chain carries a panicked `JoinError`, not as a panic of the caller.
+fn panicked(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if e.downcast_ref::<tokio::task::JoinError>()
+            .is_some_and(|j| j.is_panic())
+        {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------------------
 // B1 — Inexact pushdown that returns FEWER rows than DataFusion's own evaluation
 // ---------------------------------------------------------------------------------------
@@ -283,7 +284,7 @@ async fn b5_not_is_null_rendered_sql_has_wrong_precedence() -> R {
     use datafusion::prelude::col;
     use el_ballista::pushdown::translate;
     // `render_inline` (Postgres inline SQL) lives in the Postgres connector.
-    use el_ballista::connector::postgres::inline_sql::PredicateInlineSql;
+    use el_ballista::connector::postgres::internals::PredicateInlineSql;
     let pg = Pg::new(&[
         "CREATE TABLE $S.t (id bigint PRIMARY KEY, flag boolean)",
         "INSERT INTO $S.t VALUES (1,true),(2,false),(3,NULL)",
@@ -428,20 +429,20 @@ async fn b4_infinity_timestamp_cursor_path_does_not_panic() -> R {
         "INSERT INTO $S.t VALUES (1,'infinity')",
     ])
     .await;
-    let ex = pg.extractor().await;
-    let table = format!("{}.t", pg.schema);
-    let joined = tokio::spawn(async move {
-        ex.extract_full_table(&table, None)
-            .await
-            .map(|b| b.num_rows())
-            .map_err(|e| e.to_string())
-    })
-    .await;
+    // Cursor path: the public connector with `use_copy = false`.
+    let mut cfg = pg.job("t");
+    cfg.execution.use_copy = false;
+    let joined = tokio::spawn(async move { common::extract_one(&cfg).await }).await;
     pg.cleanup().await;
     match joined {
         Err(e) if e.is_panic() => panic!("extraction PANICKED on 'infinity': {e}"),
         Err(e) => panic!("task failed: {e}"),
+        // A panic inside the connector's scan task comes back as an error carrying it.
+        Ok(Err(e)) if panicked(&e) => {
+            panic!("extraction PANICKED on 'infinity' (scan task): {e}")
+        }
         Ok(r) => {
+            let r = r.map(|b| b.num_rows()).map_err(|e| e.to_string());
             println!("  result: {r:?} (Ok or typed Err are both acceptable)");
             Ok(())
         }
@@ -455,25 +456,22 @@ async fn b4_neg_infinity_timestamp_copy_path_is_not_garbage() -> R {
         "INSERT INTO $S.t VALUES (1,'-infinity')",
     ])
     .await;
-    let ex = pg.extractor().await;
-    let mut out = Vec::new();
-    let r = ex
-        .extract_full_table_via_copy_for_each_batch(
-            &format!("{}.t", pg.schema),
-            None,
-            1024,
-            1 << 24,
-            &mut |b| {
-                out.push(b);
-                Ok(())
-            },
-        )
-        .await;
+    // Binary COPY path: the public connector with `use_copy = true` and the same caps.
+    let mut cfg = pg.job("t");
+    cfg.execution.use_copy = true;
+    cfg.execution.batch_size = 1024;
+    cfg.execution.max_batch_bytes = 1 << 24;
+    let r = common::extract_batches(&cfg).await;
     pg.cleanup().await;
-    if let Err(e) = r {
-        println!("  typed error (acceptable): {e}");
-        return Ok(());
-    }
+    let out = match r {
+        // A scan-task panic arrives as an error; it is not an acceptable typed error.
+        Err(e) if panicked(&e) => panic!("COPY decode PANICKED on '-infinity': {e}"),
+        Err(e) => {
+            println!("  typed error (acceptable): {e}");
+            return Ok(());
+        }
+        Ok(out) => out,
+    };
     let b = &out[0];
     let a = b
         .column(1)
@@ -562,12 +560,14 @@ async fn c3_unconstrained_numeric_is_not_truncated() -> R {
         "INSERT INTO $S.t VALUES (1, 1.123456789012)",
     ])
     .await;
-    let ex = pg.extractor().await;
-    let r = ex
-        .extract_full_table(&format!("{}.t", pg.schema), None)
-        .await;
+    // Cursor path, as the old full-table extraction.
+    let mut cfg = pg.job("t");
+    cfg.execution.use_copy = false;
+    let r = common::extract_one(&cfg).await;
     pg.cleanup().await;
     match r {
+        // A scan-task panic arrives as an error; it is not an acceptable typed error.
+        Err(e) if panicked(&e) => panic!("numeric decode PANICKED: {e}"),
         Err(e) => {
             println!("  typed error (acceptable): {e}");
             Ok(())
@@ -595,10 +595,10 @@ async fn c6_jsonb_big_number_round_trips() -> R {
         r#"INSERT INTO $S.t VALUES (1, '{"amt": 12345678901234567.89}')"#,
     ])
     .await;
-    let ex = pg.extractor().await;
-    let b = ex
-        .extract_full_table(&format!("{}.t", pg.schema), None)
-        .await;
+    // Cursor path (the printout below says so).
+    let mut cfg = pg.job("t");
+    cfg.execution.use_copy = false;
+    let b = common::extract_one(&cfg).await;
     pg.cleanup().await;
     let b = b?;
     let a = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();

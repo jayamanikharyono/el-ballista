@@ -23,9 +23,7 @@ use el_ballista::config::{
     PushdownConfig, SourceConfig,
 };
 use el_ballista::connector::postgres::PostgresTableProvider;
-use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
 use el_ballista::pushdown::PushdownPolicy;
-use el_ballista::pushdown::cost_model::CostParams;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
@@ -60,18 +58,9 @@ fn job(db: &TestDb) -> JobConfig {
 }
 
 async fn ctx_with(db: &TestDb, policy: PushdownPolicy) -> R<SessionContext> {
-    let config = job(db);
-    let provider = PostgresTableProvider::new(
-        PostgresConnectionDescriptor::from_config(&config.source, 1),
-        &config.resolved_table(),
-        policy,
-        Vec::new(),
-        Vec::new(),
-        CostParams::default(),
-        config.pushdown.statistics_ttl_secs,
-        config.execution.batch_size,
-    )
-    .await?;
+    let mut config = job(db);
+    config.pushdown.policy = policy;
+    let provider = PostgresTableProvider::from_config(&config).await?;
     let ctx = SessionContext::new();
     ctx.register_table("p", Arc::new(provider))?;
     Ok(ctx)

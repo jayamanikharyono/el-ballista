@@ -14,6 +14,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing::info;
 
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
@@ -25,9 +26,8 @@ use datafusion::error::DataFusionError;
 use el_ballista::checkpoint::CheckpointStore;
 use el_ballista::checkpoint::json_store::JsonCheckpointStore;
 use el_ballista::config::{FilterEntry, FilterInput, JobConfig, PushdownPolicy, policy_name};
-use el_ballista::connector::postgres::PostgresConnector;
 use el_ballista::connector::postgres::distributed::{PostgresLogicalCodec, PostgresPhysicalCodec};
-use el_ballista::connector::postgres::pipeline::parse_filter_expr;
+use el_ballista::connector::postgres::{PostgresConnector, parse_filter_expr};
 use el_ballista::errors::AppError;
 use el_ballista::run_report::{list_reports, read_report};
 
@@ -224,8 +224,9 @@ async fn run_job(config_path: &str, cli_filters: &[String]) -> Result<(), AppErr
     let config = load_config_with_filters(config_path, cli_filters)?;
     let job_id = config.job_id.clone();
     let filtered = !config.filters.is_empty();
-    log::info!(
-        "job '{job_id}': diagnostic run (rows are counted and discarded; no checkpoint is written)"
+    info!(
+        job_id = %job_id,
+        "diagnostic run: rows are counted and discarded; no checkpoint is written"
     );
     let connector = PostgresConnector::from_config(config)?;
     let outcome = connector.extract().standalone().run().await?;
@@ -243,7 +244,10 @@ async fn run_job(config_path: &str, cli_filters: &[String]) -> Result<(), AppErr
 }
 
 fn report_io(what: &str, e: std::io::Error) -> AppError {
-    AppError::Config(format!("cannot read run reports ({what}): {e}"))
+    AppError::Io {
+        context: format!("cannot read run reports ({what})"),
+        source: e,
+    }
 }
 
 /// `el-ballista runs list` — one line per run report of the job, oldest first.
@@ -314,8 +318,10 @@ async fn runs_show(config_path: &str, run_id: Option<&str>) -> Result<(), AppErr
             }
         },
     };
-    let text = serde_json::to_string_pretty(&report)
-        .map_err(|e| AppError::Config(format!("cannot render run report: {e}")))?;
+    let text = serde_json::to_string_pretty(&report).map_err(|e| AppError::Io {
+        context: "cannot render the run report".to_string(),
+        source: std::io::Error::other(e),
+    })?;
     println!("{text}");
     Ok(())
 }
@@ -349,11 +355,9 @@ async fn checkpoint_reset(config_path: &str) -> Result<(), AppError> {
 
 /// `el-ballista plan` — docs/pushdown.md's `el-ballista plan --explain`, scoped down: filters come from the
 /// config's `filters` plus `column<op>value` `--filter` flags. Uses exactly the path every
-/// run uses ([`Pipeline::explain_filters`], schema-coerced predicates, the same provider), so
-/// the preview cannot disagree with execution. Prints each filter's push/keep decision, then
-/// previews at most `--limit` rows (default 20 — never the whole table).
-///
-/// [`Pipeline::explain_filters`]: el_ballista::connector::postgres::pipeline::Pipeline::explain_filters
+/// run uses (`PostgresConnector::explain_filters`: schema-coerced predicates, the same
+/// provider), so the preview cannot disagree with execution. Prints each filter's push/keep
+/// decision, then previews at most `--limit` rows (default 20 — never the whole table).
 async fn plan_explain(
     config_path: &str,
     policy_str: Option<&str>,
@@ -367,10 +371,9 @@ async fn plan_explain(
     }
     let policy = policy_name(config.pushdown.policy);
     let connector = PostgresConnector::from_config(config)?;
-    let pipeline = connector.pipeline();
 
     println!("policy: {policy}");
-    let decisions = pipeline.explain_filters().await?;
+    let decisions = connector.explain_filters().await?;
     if decisions.is_empty() {
         println!("  (no filters: full extraction)");
     }
@@ -380,7 +383,7 @@ async fn plan_explain(
 
     let limit = limit.unwrap_or(DEFAULT_PLAN_LIMIT);
     println!("preview (at most {limit} row(s); --limit to change):");
-    pipeline.preview(limit).await?.show().await?;
+    connector.preview(limit).await?.show().await?;
     Ok(())
 }
 
@@ -443,7 +446,7 @@ async fn run_scheduler(
         }
     });
     let addr: SocketAddr = format!("{bind_host}:{port}").parse().map_err(|e| {
-        AppError::Config(format!("cannot bind scheduler at {bind_host}:{port}: {e}"))
+        AppError::Config(format!("invalid scheduler address {bind_host}:{port}: {e}"))
     })?;
 
     let scheduler_name = format!("{host}:{port}");
@@ -464,9 +467,9 @@ async fn run_scheduler(
         ..SchedulerConfig::default()
     };
 
-    // The scheduler rebuilds providers and plans with the Postgres codecs (never opening a
-    // connection to the source — partition bounds are computed only when a task is planned).
-    log::info!("starting Ballista scheduler at {scheduler_name}");
+    // The scheduler rebuilds providers and plans with the Postgres codecs. It never connects
+    // to the source: the client computed the partition bounds and they come in the plan.
+    info!(scheduler = %scheduler_name, "starting the Ballista scheduler");
     let cluster = BallistaCluster::new_memory(
         scheduler_name,
         Arc::new(default_session_builder),
@@ -524,8 +527,10 @@ async fn run_worker(
         ..ExecutorProcessConfig::default()
     });
 
-    log::info!(
-        "starting Ballista executor (concurrent_tasks={concurrent_tasks}) connected to {scheduler_url}"
+    info!(
+        concurrent_tasks,
+        scheduler_url = %scheduler_url,
+        "starting the Ballista executor"
     );
     start_executor_process(opt).await.map_err(|e| {
         AppError::DataFusion(DataFusionError::External(format!("executor: {e}").into()))

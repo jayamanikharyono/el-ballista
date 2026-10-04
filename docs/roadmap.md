@@ -38,8 +38,9 @@ What exists today:
 - Full and filtered extraction with caller-provided filters.
 - Split checkpoints in a local JSON store (atomic rename): per-split `Pending` / `Running` /
   `Completed` / `Failed`; a retry skips completed splits. The checkpoint is bound to a plan
-  fingerprint and the stored split bounds (`PlanMismatch` on change), and a lock file with a
-  heartbeat (`checkpoint.lock_ttl_secs`) allows one run per job.
+  fingerprint, source database included (`PlanMismatch` on change), and to the stored split
+  bounds (`SplitPlanMismatch`); a lock file with a heartbeat (`checkpoint.lock_ttl_secs`) allows
+  one run per job, and every split-state write first re-checks that the run still holds it.
 - A run report per run (`<checkpoint.dir>/runs/<job>/<run_id>.json`, `el-ballista runs list|show`):
   plan fingerprint, pushdown decisions, per-split outcome / rows / time / error and totals,
   kept after later runs; its `run_id` matches the SQL comment tag of every source query.
@@ -47,7 +48,8 @@ What exists today:
   consumer returns `Ok`. Delivery is at-least-once per split.
 - CLI: `el-ballista run` (diagnostic: counts rows, writes no checkpoint), `el-ballista plan`,
   `el-ballista checkpoint show|reset`, `el-ballista demo`.
-- Logging through the `log` crate with key=value fields per batch and split.
+- Logging through `tracing`: events with fields inside `run` / `split` / `scan` spans; the
+  binary installs `tracing-subscriber`.
 
 Exit criteria:
 
@@ -76,7 +78,7 @@ let batches = ctx
 
 What exists today:
 
-- `ExtractContext` (`connector::postgres::engine`): DataFrame and SQL over the source table.
+- `ExtractContext` (`connector::postgres::ExtractContext`): DataFrame and SQL over the source table.
 - The push/keep decision runs in `PostgresTableProvider::supports_filters_pushdown`, which
   decides the whole filter set at once; `explain_decisions` gives the same decisions for
   previews. There is no custom optimizer rule.
@@ -113,9 +115,9 @@ What exists today: `PostgresExecutionPlan::execute()` runs a `DECLARE … CURSOR
 bounded channel as they fill (by rows or `max_batch_bytes`). Dropping the stream closes the
 cursor or cancels the `COPY`. The builders' `stream()` and `run_with()` are bounded-memory.
 
-Materializing helpers remain on purpose and hold the whole result: `collect()` on the builders,
-`PostgresExtractor::extract_full_table` / `extract_keyset_partition` (tests and small tables),
-and the MySQL prototype's `extract_full_table`. No DataFusion `MemoryPool` limit is configured.
+Materializing helpers remain on purpose and hold the whole result: `collect()` on the builders
+and on the DataFrame `ExtractContext::source` returns, `DistributedContext::collect_sql`, and the MySQL prototype's
+`extract_full_table`. No DataFusion `MemoryPool` limit is configured.
 
 Exit criteria:
 
@@ -149,10 +151,16 @@ What exists today (`connector::postgres::distributed`):
 - Real `el-ballista scheduler` and `el-ballista worker` processes; stock Ballista executors cannot decode the
   Postgres scan plans, so the crate ships its own binaries with plan codecs. Standalone runs are
   plain DataFusion and never touch Ballista.
-- Connection budget: each worker gets `pool_max / workers`, so the total stays `pool_max`.
+- Connection budget: each worker gets `pool_max / workers`, so the workers together stay within
+  `pool_max` (more workers than `pool_max` is refused); the client's planning pool comes on top.
 - A watchdog cancels and re-submits a job whose worker died, because Ballista 54 alone would
   leave it "Running" forever; with no worker left the job aborts. See
   [`running.md`](running.md).
+- The client computes the partition bounds; the plan carries them as typed bounds (no SQL), so
+  the scheduler never connects to the source.
+- Queries run only through `DistributedContext::stream_sql` / `collect_sql`, under the
+  watchdog. `DistributedContext::remote` refuses to run when neither the scheduler REST API
+  answers nor `distributed.job_timeout_secs` is set, since nothing could detect a lost worker.
 - The whole distributed scan is one checkpoint split.
 
 Exit criteria:

@@ -12,13 +12,15 @@ steps, each driven by the MySQL connector growing a capability.
 ## Current state
 
 - **Shared:** `src/pushdown/` is a connector-agnostic crate-root module (`ir`, `translate`,
-  `policy`, `cost_model`, `dialect`, and the backend-neutral `stats` / `explain` types). Both
+  `policy`, `dialect`, and the crate-private `cost_model` and backend-neutral `stats` /
+  `explain` types). Both
   `PostgresDialect` and `MysqlDialect` implement `crate::pushdown::dialect::SqlDialect`.
 - **Postgres:** everything Postgres-specific lives under `src/connector/postgres/`, including
   `dialect`, `param_sink`, `inline_sql`, the `stats` collector, the `explain` executor,
   `distributed`, `engine`, `pipeline` and the `PostgresConnector` builder API (`api.rs`). There
-  are no crate-root re-exports: callers use
-  `el_ballista::connector::postgres::*`. The push/keep decision is made in
+  are no crate-root re-exports, and only the facade is public: `PostgresConnector`,
+  `register_table`, `PostgresTableProvider`, `ExtractContext`, `distributed::DistributedContext`
+  and a few re-exported types; the modules themselves are crate-private. The push/keep decision is made in
   `PostgresTableProvider::supports_filters_pushdown`; there is no custom optimizer rule.
 - **MySQL:** the prototype (`src/connector/mysql/`) is a walking skeleton: `MysqlDialect`, a
   type mapper, an `information_schema` reader, and a full-table extractor that selects raw
@@ -29,9 +31,8 @@ steps, each driven by the MySQL connector growing a capability.
   batch (`extract_full_table`). It has no filters/pushdown, no `TableProvider`, no
   parallel/distributed execution and no checkpointed jobs.
 - **Not yet shared:** `engine::ExtractContext` hard-codes `PostgresTableProvider`, and
-  `distributed::DistributedContext` hard-codes the Postgres codecs. A `SourceConnector` trait
-  sketch (two methods, `dialect` and `table_metadata`) is in `connector/mod.rs`, not wired into
-  anything.
+  `distributed::DistributedContext` hard-codes the Postgres codecs. No `SourceConnector` trait
+  exists yet; the one below is design only.
 
 ## What the MySQL prototype revealed
 
@@ -47,8 +48,8 @@ Two leaks it exposed shaped the current layout:
   "Unsupported source type").
 
 Stays connector-specific (never shared):
-- The SQL dialect impl (`PostgresDialect` / `MysqlDialect`), placeholders (`$1` vs `?`),
-  identifier quoting (`"..."` vs `` `...` ``).
+- The SQL dialect impl (`PostgresDialect` / `MysqlDialect`), placeholders (`$1` vs `?`, bound
+  by each backend's `SqlSink`, e.g. `PgParamSink`, not by the dialect), identifier quoting (`"..."` vs `` `...` ``).
 - Catalog + statistics + EXPLAIN queries (`pg_stats`/`pg_read_all_stats`/EXPLAIN vs MySQL).
 - Type mapping to Arrow and row decoding.
 - Cursor/streaming mechanics (`DECLARE ... CURSOR WITHOUT HOLD` + `FETCH` is Postgres-only).
@@ -65,21 +66,21 @@ these places only:
 - `src/distributed/` (new, step 3): generic Ballista orchestration. The codecs, connection
   descriptor and pool registry stay under `connector/postgres/distributed/`, since each
   connector serializes its own `TableProvider` / `ExecutionPlan`.
-- `connector/mod.rs`: `SourceConnector` grows the methods below.
+- `connector/mod.rs`: gains a `SourceConnector` trait with the methods below.
 - `connector/mysql/`: gains a `TableProvider`, pushdown and a pool registry as the prototype is
   promoted.
 
 ## Proposed `SourceConnector` trait
 
 The engine and distributed layers depend on this instead of `PostgresTableProvider` directly.
-Only `dialect` and `table_metadata` exist today. The rest is added as part of the lift, when the
+None of these methods exist yet. Each is added as part of the lift, when the
 second connector actually needs it, not before.
 
 ```rust
 /// A source backend the generic engine/distributed layers can drive.
 #[async_trait::async_trait]
 pub trait SourceConnector: Send + Sync {
-    /// Backend SQL dialect (rendering, placeholders, quoting, fidelity).
+    /// Backend SQL dialect (identifier quoting, cast names, collations).
     fn dialect(&self) -> &dyn pushdown::dialect::SqlDialect;
 
     /// Read a table's schema into the shared catalog contract.

@@ -9,7 +9,6 @@
 mod common;
 
 use common::TestDb;
-use el_ballista::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
@@ -22,20 +21,13 @@ macro_rules! live {
 #[tokio::test]
 async fn numeric_columns_decode_exact() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
-    let ex = PostgresExtractor::connect(
-        &db.host,
-        db.port,
-        &db.user,
-        &db.password,
-        &db.database,
-        4,
-        300_000,
-        "relex-test",
-    )
-    .await?;
 
+    // Full extraction of every column through the public connector (cursor path).
     // No ORDER BY in extraction: sort by id before asserting per-row positions.
-    let batch = common::sorted_by(&ex.extract_full_table(&db.table(), None).await?, "id");
+    let batch = common::sorted_by(
+        &common::extract_one(&db.extraction_job("hostile", None)).await?,
+        "id",
+    );
     assert_eq!(batch.num_rows(), common::HOSTILE_ROWS);
 
     // amount numeric(12,2): exact unscaled values, NULLs preserved.

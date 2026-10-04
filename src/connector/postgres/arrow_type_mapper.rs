@@ -8,6 +8,24 @@ use std::sync::Arc;
 use crate::connector::errors::ExtractorError;
 use crate::types::ColumnMetadata;
 
+/// Columns selected as `"col"::text AS "col"` and decoded as UTF-8 on both the cursor
+/// and the COPY path:
+/// - enums / other `USER-DEFINED` types: no fixed binary layout to decode;
+/// - `json` / `jsonb`: Postgres' own text rendering, byte for byte (no
+///   `serde_json::Value` round trip that loses big-number precision and key order;
+///   no jsonb version byte);
+/// - `uuid`: the canonical 36-char form without a per-cell `Uuid::to_string`.
+///
+/// The one definition of that set: the query builder casts these columns, the type mapper maps
+/// them to `Utf8`, and pushdown compares them through their text form (`ColumnKind::TextCast`,
+/// or `Label` for an enum), so the three can never disagree.
+pub(crate) fn selects_as_text(column: &ColumnMetadata) -> bool {
+    matches!(
+        column.data_type.as_str(),
+        "USER-DEFINED" | "json" | "jsonb" | "uuid"
+    )
+}
+
 /// Decimal128 scale used for unconstrained `numeric` columns (no typmod): Postgres
 /// accepts any scale there, so values with more fractional digits than this are
 /// rejected with a typed error at decode time instead of being truncated.
@@ -70,17 +88,6 @@ impl std::fmt::Display for NumericDecodeError {
 /// shifted by a table power of ten. The result is `value × 10^scale`, which must be an
 /// integer (else [`NumericDecodeError::ExceedsScale`] — never a silent truncation) with
 /// at most `precision` digits (else [`NumericDecodeError::ExceedsPrecision`]).
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::connector::postgres::arrow_type_mapper::numeric_bytes_to_unscaled;
-///
-/// // 123.45: ndigits=2, weight=0, sign=+, dscale=2, digits [123, 4500].
-/// let raw = [0, 2, 0, 0, 0, 0, 0, 2, 0, 123, 0x11, 0x94];
-/// assert_eq!(numeric_bytes_to_unscaled(&raw, 12, 2), Ok(12345));
-/// assert!(numeric_bytes_to_unscaled(&raw, 12, 1).is_err()); // would truncate
-/// ```
 pub fn numeric_bytes_to_unscaled(
     raw: &[u8],
     precision: u8,
@@ -149,6 +156,10 @@ pub struct ArrowTypeMapper;
 
 impl ArrowTypeMapper {
     pub(crate) fn map(column: &ColumnMetadata) -> Result<DataType, ExtractorError> {
+        // Selected as `::text`: the cursor and COPY paths both receive Postgres' own text.
+        if selects_as_text(column) {
+            return Ok(DataType::Utf8);
+        }
         match column.data_type.as_str() {
             "smallint" => Ok(DataType::Int16),
             "integer" => Ok(DataType::Int32),
@@ -200,15 +211,6 @@ impl ArrowTypeMapper {
                     .map_err(|_| ExtractorError::Internal(format!("numeric scale {scale_raw}")))?;
                 Ok(DataType::Decimal128(precision, scale))
             }
-
-            // Selected as `::text` (see `PostgresQueryBuilder::push_columns`) so the cursor
-            // and COPY paths both receive Postgres' own text rendering, byte for byte.
-            "json" | "jsonb" => Ok(DataType::Utf8),
-            "uuid" => Ok(DataType::Utf8),
-
-            // PostgreSQL ENUM / custom types.
-            // The extractor casts these values to TEXT before decoding.
-            "USER-DEFINED" => Ok(DataType::Utf8),
 
             "ARRAY" => Self::map_array(column),
 

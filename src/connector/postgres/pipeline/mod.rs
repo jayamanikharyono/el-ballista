@@ -41,9 +41,8 @@ use crate::config::JobConfig;
 use crate::connector::postgres::PostgresTableProvider;
 use crate::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
 use crate::errors::AppError;
-use crate::pushdown::cost_model::CostParams;
 
-pub use filters::{FilterDecision, parse_filter_expr, parse_filter_shorthand};
+pub use filters::{FilterDecision, parse_filter_expr};
 pub(crate) use run::DistributedTarget;
 pub use run::RunOutcome;
 pub use splits::SplitInfo;
@@ -58,18 +57,6 @@ impl Pipeline {
     /// Build a pipeline from an already-parsed config. Runs `JobConfig::validate`, so a
     /// degenerate value (`batch_size = 0`, zero partitions, …) is an error here rather than a
     /// silently empty extraction later.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use el_ballista::config::JobConfig;
-    /// use el_ballista::connector::postgres::pipeline::Pipeline;
-    ///
-    /// let config = JobConfig::from_file("job.json")?;
-    /// let pipeline = Pipeline::from_config(config)?;
-    /// println!("{:?}", pipeline.filter_exprs()?);
-    /// # Ok::<(), el_ballista::errors::AppError>(())
-    /// ```
     pub fn from_config(config: JobConfig) -> Result<Self, AppError> {
         config.validate()?;
         Ok(Self { config })
@@ -97,43 +84,18 @@ impl Pipeline {
     /// and execution decide pushdown identically.
     pub(crate) async fn provider(&self) -> Result<PostgresTableProvider, AppError> {
         let descriptor = PostgresConnectionDescriptor::from_config(&self.config.source, 1);
-        let pushdown = &self.config.pushdown;
-        let provider = PostgresTableProvider::new(
+        Ok(PostgresTableProvider::configured(
+            &self.config,
             descriptor,
             &self.config.resolved_table(),
-            pushdown.policy,
-            pushdown.deny.clone(),
-            pushdown.push.clone(),
-            CostParams {
-                max_source_cost: pushdown.max_source_cost,
-                keep_threshold: pushdown.keep_threshold,
-            },
-            pushdown.statistics_ttl_secs,
-            self.config.execution.batch_size,
         )
-        .await?;
-        Ok(provider
-            .with_parallel_strategy(self.config.parallel_scan.strategy)
-            .with_max_batch_bytes(self.config.execution.max_batch_bytes)
-            .with_use_copy(self.config.execution.use_copy)
-            .with_copy_statement_timeout_ms(self.config.execution.copy_statement_timeout_ms))
+        .await?)
     }
 
     /// A DataFrame over the job's table with the job's filters (the same schema-coerced
     /// predicates every run uses), its column projection and `LIMIT limit` — what `el-ballista plan`
     /// shows. Unsplit and checkpoint-free; the limit pushes to the source when the pushdown
     /// rules allow it.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
-    /// use el_ballista::connector::postgres::PostgresConnector;
-    ///
-    /// let connector = PostgresConnector::from_config_file("job.json")?;
-    /// connector.pipeline().preview(20).await?.show().await?;
-    /// # Ok(()) }
-    /// ```
     pub async fn preview(&self, limit: usize) -> Result<DataFrame, AppError> {
         let provider = self.provider().await?;
         let filters = self

@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::{info, warn};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -253,10 +254,14 @@ impl Rest {
         let Some(authority) = self.authority.as_deref() else {
             return 0;
         };
-        let jobs = match rest_call(authority, "GET", "/api/jobs").await {
-            Ok(body) => parse_active_jobs(&body, job_name).unwrap_or_default(),
+        let listing = match rest_call(authority, "GET", "/api/jobs").await {
+            Ok(body) => parse_active_jobs(&body, job_name),
+            Err(e) => Err(e.to_string()),
+        };
+        let jobs = match listing {
+            Ok(jobs) => jobs,
             Err(e) => {
-                log::warn!("distributed job {job_name}: could not list jobs to cancel ({e})");
+                warn!(job = %job_name, error = %e, "could not list the scheduler's jobs to cancel");
                 return 0;
             }
         };
@@ -264,7 +269,9 @@ impl Rest {
         for id in jobs {
             match rest_call(authority, "PATCH", &format!("/api/job/{id}")).await {
                 Ok(_) => cancelled += 1,
-                Err(e) => log::warn!("distributed job {job_name}: cancelling {id} failed ({e})"),
+                Err(e) => {
+                    warn!(job = %job_name, ballista_job = %id, error = %e, "cancelling a job failed")
+                }
             }
         }
         cancelled
@@ -303,10 +310,10 @@ impl Monitor {
         let listing = self.rest.executors().await;
         if listing.is_none() && !self.warned {
             self.warned = true;
-            log::warn!(
-                "distributed job {}: the scheduler REST API does not answer, so dead workers \
-                 cannot be detected; only distributed.job_timeout_secs applies",
-                self.job_name
+            warn!(
+                job = %self.job_name,
+                "the scheduler REST API does not answer, so dead workers cannot be detected; \
+                 only distributed.job_timeout_secs applies"
             );
         }
         self.liveness.observe(Instant::now(), listing.as_deref())
@@ -382,10 +389,12 @@ async fn recover(settings: &WatchSettings, attempt: u32, hang: &Hang) -> State {
     let rest = Rest::new(&settings.scheduler_url);
     let reason = hang.describe();
     let cancelled = rest.cancel(&settings.job_name).await;
-    log::warn!(
-        "distributed job {}: attempt {attempt} hung ({reason}); cancelled {cancelled} job(s) on \
-         the scheduler",
-        settings.job_name
+    warn!(
+        job = %settings.job_name,
+        attempt,
+        reason = %reason,
+        cancelled,
+        "distributed attempt hung; cancelled on the scheduler"
     );
     let total = settings.max_retries + 1;
     if attempt >= total {
@@ -398,21 +407,21 @@ async fn recover(settings: &WatchSettings, attempt: u32, hang: &Hang) -> State {
             match rest.executors().await {
                 Some(listing) if !listing.iter().any(|e| e.id == dead) => break,
                 _ if Instant::now() >= deadline => {
-                    log::warn!(
-                        "distributed job {}: the scheduler still lists worker {dead} after {}s; \
-                         re-running anyway",
-                        settings.job_name,
-                        settings.removal_wait.as_secs()
+                    warn!(
+                        job = %settings.job_name,
+                        worker = %dead,
+                        waited_secs = settings.removal_wait.as_secs(),
+                        "the scheduler still lists the dead worker; re-running anyway"
                     );
                     break;
                 }
                 _ => {
                     if !logged {
                         logged = true;
-                        log::info!(
-                            "distributed job {}: waiting for the scheduler to drop worker {dead} \
-                             before re-running",
-                            settings.job_name
+                        info!(
+                            job = %settings.job_name,
+                            worker = %dead,
+                            "waiting for the scheduler to drop the dead worker before re-running"
                         );
                     }
                     tokio::time::sleep(settings.poll).await;
@@ -446,10 +455,7 @@ async fn step(mut seed: Seed) -> Option<(Result<RecordBatch, DataFusionError>, S
                     continue;
                 }
                 if attempt > 1 {
-                    log::warn!(
-                        "distributed job {}: re-running (attempt {attempt} of {total})",
-                        seed.settings.job_name
-                    );
+                    warn!(job = %seed.settings.job_name, attempt, total, "re-running the distributed job");
                 }
                 let monitor = Box::new(Monitor::begin(&seed.settings).await);
                 match (seed.start)().await {
@@ -489,12 +495,11 @@ async fn step(mut seed: Seed) -> Option<(Result<RecordBatch, DataFusionError>, S
                 if delivered {
                     let rest = Rest::new(&seed.settings.scheduler_url);
                     let cancelled = rest.cancel(&seed.settings.job_name).await;
-                    log::warn!(
-                        "distributed job {}: hung while its results were being fetched ({}); \
-                         cancelled {cancelled} job(s); not re-run because rows were already \
-                         delivered",
-                        seed.settings.job_name,
-                        hang.describe()
+                    warn!(
+                        job = %seed.settings.job_name,
+                        reason = %hang.describe(),
+                        cancelled,
+                        "distributed job hung after rows were delivered; cancelled, not re-run"
                     );
                     seed.state = State::Fail(aborted(
                         attempt,

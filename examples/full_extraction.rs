@@ -1,120 +1,61 @@
-//! Full Load Example
+//! Full extraction: every row of the job's table, streamed in bounded-memory batches.
 //!
-//! Demonstrates extracting the entire contents of a PostgreSQL table.
-//! This pattern is used for initial data loads or periodic full refreshes.
+//! The job config names the table and columns (no filters = every row); the connector
+//! discovers the schema, maps it to Arrow and streams `RecordBatch`es of at most
+//! `execution.batch_size` rows, so memory stays bounded whatever the table size.
 //!
-//! This example validates:
-//! - Full table extraction via extraction layer
-//! - Schema discovery and type mapping
-//! - Row conversion to Arrow RecordBatch
-//! - Large dataset handling
-//!
-//! Usage:
 //! ```bash
-//! PGPASSWORD=... cargo run --example full_extraction
+//! PGPASSWORD=... cargo run --example full_extraction -- [config.json]
+//! # default: examples/configs/full_extract.dvd_rental.json (the dvdrental demo database)
 //! ```
 
-use el_ballista::connector::postgres::PostgresExtractor;
+use el_ballista::connector::postgres::{PostgresConnector, close_pools};
+use futures::TryStreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
-    // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
     el_ballista::logging::init_from_env_and_args();
 
-    // Never hard-code credentials: the password comes from the environment.
-    let password = std::env::var("PGPASSWORD")
-        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/test (the dvdrental demo database)")?;
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "examples/configs/full_extract.dvd_rental.json".to_string());
+    // The password comes from the environment variable the config names (`source.password_env`).
+    let connector = PostgresConnector::from_config_file(&config_path)?;
+    let config = connector.config();
+    println!(
+        "► Full extraction of {}.{} (config {config_path})",
+        config.source.schema, config.table
+    );
 
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  Full Load Example");
-    println!("  Complete Table Extraction");
-    println!("═══════════════════════════════════════════════════════════\n");
-
-    // 1. Connect to PostgreSQL using the extraction layer
-    println!("► Step 1: Connect to PostgreSQL");
-
-    let extractor = PostgresExtractor::connect(
-        "localhost",
-        5432,
-        "postgres",
-        &password,
-        "test",
-        5,
-        30000,
-        "full_load_example",
-    )
-    .await?;
-
-    println!("  ✓ Connected to database");
-    println!("  ✓ Extraction layer initialized");
-
-    // 2. Define extraction parameters
-    println!("\n► Step 2: Define extraction parameters");
-    let table_name = "public.payment";
-    let columns = Some(vec![
-        "payment_id",
-        "customer_id",
-        "amount",
-        "staff_id",
-        "payment_date",
-    ]);
-
-    println!("  Table: {}", table_name);
-    println!("  Columns: {:?}", columns.as_ref().unwrap());
-    println!("  Mode: Full load (all data, no filters)");
-
-    // 3. Execute full table extraction
-    println!("\n► Step 3: Execute full table extraction");
-    println!("  Extracting all rows...");
-
-    let batch = extractor
-        .extract_full_table(table_name, columns.clone())
-        .await?;
-
-    let row_count = batch.num_rows();
-    let column_count = batch.num_columns();
-
-    println!("  ✓ Full table extracted");
-    println!("  ✓ Rows: {}", row_count);
-    println!("  ✓ Columns: {}", column_count);
-
-    // 4. Display schema information
-    println!("\n► Step 4: Schema information");
-    println!("  Arrow Schema: {:?}", batch.schema());
-
-    // 5. Display sample data
-    println!("\n► Step 5: Sample data (first 3 rows)");
-    if row_count > 0 {
-        for i in 0..row_count.min(3) {
-            println!("  [Row {}]: {} columns", i + 1, column_count);
-        }
+    let mut stream = connector.extract().standalone().stream().await?;
+    let schema = stream.schema();
+    println!("  Arrow schema:");
+    for field in schema.fields() {
+        println!(
+            "    {}: {}{}",
+            field.name(),
+            field.data_type(),
+            if field.is_nullable() {
+                " (nullable)"
+            } else {
+                ""
+            }
+        );
     }
 
-    // 6. Use case scenarios
-    println!("\n► Step 6: Use case scenarios");
-    println!("  Full load patterns:");
-    println!("    1. Initial data warehouse load");
-    println!("    2. Periodic full refresh");
-    println!("    3. Schema migration");
-    println!("    4. Data quality validation");
+    let (mut rows, mut batches, mut largest) = (0usize, 0usize, 0usize);
+    while let Some(batch) = stream.try_next().await? {
+        rows += batch.num_rows();
+        batches += 1;
+        largest = largest.max(batch.num_rows());
+    }
+    println!(
+        "  ✓ Total {rows} rows, {} columns, in {batches} batch(es) (largest {largest} rows, cap {})",
+        schema.fields().len(),
+        config.execution.batch_size
+    );
 
-    // 7. Verification
-    println!("\n► Step 7: Verification");
-    println!("  ✓ Full table extracted successfully");
-    println!("  ✓ Total {} rows, {} columns", row_count, column_count);
-    println!("  ✓ Schema correctly mapped");
-    println!("  ✓ Ready for transformation and loading");
-
-    // 8. Status
-    println!("\n► Result");
-    println!("  ✓ Full load extraction complete");
-    println!("  ✓ Data ready for further processing");
-    println!("  ✓ Extraction layer working correctly");
-
-    println!("\n═══════════════════════════════════════════════════════════");
-    println!("  ✓ Full load example complete");
-    println!("═══════════════════════════════════════════════════════════");
-
+    close_pools().await;
     Ok(())
 }

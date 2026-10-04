@@ -18,7 +18,10 @@
 //! (unmapped types, pushed filters with bound literals which `COPY` cannot take)
 //! fall back to the cursor/`SELECT` path with a loud log — never silently wrong data.
 
+use crate::connector::postgres::execution_plan::CopyStatements;
+use sqlx::{Executor, SqlSafeStr};
 use std::future::Future;
+use tracing::{Instrument, debug, warn};
 
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -289,7 +292,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn copy_scan<F, Fut>(
     pool: &PgPool,
-    copy_sql: &str,
+    statements: &CopyStatements,
     tag: &str,
     table_metadata: &TableMetadata,
     batch_size: usize,
@@ -302,7 +305,7 @@ where
     Fut: Future<Output = Result<(), ExtractorError>>,
 {
     // Validate before touching the source (type support, batch size).
-    CopyBatchDecoder::new(table_metadata, batch_size, max_batch_bytes)?;
+    let probe = CopyBatchDecoder::new(table_metadata, batch_size, max_batch_bytes)?;
 
     let mut conn = pool.acquire().await?;
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -315,18 +318,27 @@ where
         tag: tag.to_string(),
         completed: false,
     };
-    // A timeout override is scoped to this COPY: `SET LOCAL` inside an explicit transaction
-    // that is committed only after the scan completed. On any failure the guard closes the
-    // connection, so the override can never leak into a pooled session.
+    // One transaction around the type check and the COPY, committed only after the scan
+    // completed (on any failure the guard closes the connection instead).
+    sqlx::query("BEGIN").execute(&mut *guard.conn).await?;
+    // Binary COPY carries no types: a column whose type changed since planning (`ALTER …
+    // TYPE`) would decode into wrong values. Describing the inner SELECT reports the types
+    // the COPY will send, and takes the table's lock until the transaction ends, so they
+    // cannot change before the COPY reads them.
+    let described = (&mut *guard.conn)
+        .describe(sqlx::AssertSqlSafe(statements.select.clone()).into_sql_str())
+        .await?;
+    probe.builder.check_column_types(described.columns())?;
+    // A timeout override is scoped to this COPY: `SET LOCAL`, so it can never leak into a
+    // pooled session.
     if let Some(ms) = statement_timeout_ms {
-        sqlx::query("BEGIN").execute(&mut *guard.conn).await?;
         let set = format!("SET LOCAL statement_timeout = {ms}");
         sqlx::query(sqlx::AssertSqlSafe(set.as_str()))
             .execute(&mut *guard.conn)
             .await?;
     }
     let result = {
-        let mut stream = guard.conn.copy_out_raw(copy_sql).await?;
+        let mut stream = guard.conn.copy_out_raw(&statements.copy).await?;
         drive_copy_stream(
             &mut stream,
             table_metadata,
@@ -336,7 +348,7 @@ where
         )
         .await
     };
-    if result.is_ok() && statement_timeout_ms.is_some() {
+    if result.is_ok() {
         sqlx::query("COMMIT").execute(&mut *guard.conn).await?;
     }
     guard.completed = result.is_ok();
@@ -365,12 +377,13 @@ impl Drop for CopyCancelGuard {
             // plus one statement) and logs its own outcome.
             Ok(handle) => {
                 let (pool, pid, tag) = (self.pool.clone(), self.pid, std::mem::take(&mut self.tag));
-                drop(handle.spawn(cancel_backend(pool, pid, tag)));
+                let cancel = cancel_backend(pool, pid, tag).instrument(tracing::Span::current());
+                drop(handle.spawn(cancel));
             }
-            Err(_) => log::warn!(
-                "COPY on backend {} ended early outside a tokio runtime; not cancelling \
-                 (the closed connection still stops the scan)",
-                self.pid
+            Err(_) => warn!(
+                pid = self.pid,
+                "COPY ended early outside a tokio runtime; not cancelling it (the closed \
+                 connection still stops the scan)"
             ),
         }
     }
@@ -394,16 +407,18 @@ async fn cancel_backend(pool: PgPool, pid: i32, tag: String) {
             .map(|_| ()),
         Ok(Err(e)) => Err(e),
         Err(_) => {
-            log::warn!(
-                "no pooled connection free within {CANCEL_ACQUIRE_TIMEOUT:?} to cancel COPY on \
-                 backend {pid}; relying on the closed connection to stop it"
+            warn!(
+                pid,
+                timeout_ms = u64::try_from(CANCEL_ACQUIRE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                "no pooled connection free to cancel the unfinished COPY; relying on the \
+                 closed connection to stop it"
             );
             return;
         }
     };
     match result {
-        Ok(()) => log::info!("cancelled unfinished COPY on backend {pid}"),
-        Err(e) => log::warn!("could not cancel unfinished COPY on backend {pid}: {e}"),
+        Ok(()) => debug!(pid, "cancelled the unfinished COPY"),
+        Err(e) => warn!(pid, error = %e, "could not cancel the unfinished COPY"),
     }
 }
 

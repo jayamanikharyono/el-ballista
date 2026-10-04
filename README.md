@@ -10,7 +10,7 @@ For every filter it decides whether Postgres or DataFusion should evaluate it, s
 tables into checkpointed key ranges, and runs either in one process (plain DataFusion) or on
 a Ballista cluster.
 
-> **Status (September 2026):** experimental. PostgreSQL connector implemented and tested
+> **Status (October 2026):** experimental. PostgreSQL connector implemented and tested
 > against live Postgres 17; MySQL is a prototype (schema read + full-table extract only).
 > See [`docs/roadmap.md`](docs/roadmap.md).
 
@@ -36,7 +36,8 @@ The questions it explores:
   split is checkpointed only after the consumer confirms it, so a failed run resumes where
   it stopped.
 - **When does distributing actually help?** The same job config runs standalone or on a
-  Ballista cluster, and the source's connection budget stays fixed either way.
+  Ballista cluster; the workers share one `pool_max` budget (more workers than `pool_max` is
+  refused), and the client's planning connections come on top.
 
 Out of scope on purpose: writing the data (sinks), watermark / incremental state, and CDC.
 The orchestrator owns those.
@@ -158,7 +159,8 @@ Other rules that never push: float comparisons other than `=` (Postgres treats `
 arithmetic (overflow behaves differently), `NOT` over an approximate child, `LIKE`, `IN`,
 and any comparison where the column itself is wrapped in a cast (casts and aliases in the
 projection are always DataFusion's job). Text is always compared under `COLLATE "C"`, so a
-case-insensitive database collation cannot change the result.
+case-insensitive database collation cannot change the result. uuid / json / composite columns
+push only `=`, `<>` and `IS [NOT] NULL`, through their text form.
 
 **Incremental windows.** Timestamp and date comparisons push as plain column comparisons, so
 an index on the watermark column serves them. Without an index, a range is estimated from the
@@ -166,8 +168,8 @@ column's `pg_stats` histogram and most-common values, and the two sides of a win
 together, as in the `payment_date` rows above:
 
 ```text
-payment_date >= '2007-04-06T00:00:00Z' -> PUSH (Exact; low selectivity (2.91% from histogram, window of 2 range filters) ...)
-payment_date < '2007-04-07T00:00:00Z'  -> PUSH (Exact; low selectivity (2.91% from histogram, window of 2 range filters) ...)
+payment_date >= '2007-04-06T00:00:00Z' -> Exact (PUSH (Exact; low selectivity (2.91% from histogram, window of 2 range filters) ...))
+payment_date < '2007-04-07T00:00:00Z'  -> Exact (PUSH (Exact; low selectivity (2.91% from histogram, window of 2 range filters) ...))
 ```
 
 Judged alone, `payment_date >= '2007-04-06'` covers about half the table and would stay in
@@ -197,7 +199,8 @@ With `parallel_scan.strategy: "keyset"` the table is split into non-overlapping 
 
 The operational entry point, `run_with(consumer)`, hands each split's stream to your code and
 records the split as completed only after your consumer returns `Ok`. The checkpoint is bound
-to a fingerprint of the plan (changing a filter is a `PlanMismatch` error, not a silent mix),
+to a fingerprint of the plan (changing a filter or the source database is a `PlanMismatch`
+error, not a silent mix),
 split ranges are stored and reused on retry, and a per-job lock prevents two runs of the same
 job. Delivery is at-least-once per split.
 
@@ -213,12 +216,15 @@ so a report lines up with Postgres logs. `el-ballista runs list` and `el-ballist
 | | Standalone | Distributed |
 |---|---|---|
 | What runs | DataFusion inside your process | Your process plans; `el-ballista scheduler` + `el-ballista worker`s execute |
-| Postgres connections | up to `pool_max` | `pool_max / workers` per worker (total stays `pool_max`) |
+| Postgres connections | up to `pool_max` | `pool_max / workers` per worker (more workers than `pool_max` is refused), plus the client's planning connections |
 | When to use | Default. One machine, every core, no scheduling overhead | When one machine's CPUs are the bottleneck |
 
 Stock Ballista executors cannot decode the Postgres scan plans, so the crate ships its own
-scheduler and worker binaries. A watchdog cancels and re-submits a job whose worker died,
-because Ballista 54 on its own would leave it "Running" forever. Deployment, flags and
+scheduler and worker binaries. The client computes the partition bounds and ships them in the
+plan, so the scheduler never connects to the source. A watchdog cancels and re-submits a job
+whose worker died, because Ballista 54 on its own would leave it "Running" forever; it needs
+the scheduler's REST API, so without it set `distributed.job_timeout_secs` or the run is
+refused. Deployment, flags and
 watchdog details: [`docs/running.md`](docs/running.md#execution-modes-standalone-vs-distributed).
 
 ---
@@ -267,7 +273,7 @@ job skips the splits already completed; for a fresh export use a new `job_id` or
 |---|---|
 | `full_extraction` | Whole-table extraction, schema discovery, type mapping into Arrow |
 | `filtered_extraction` | Caller-provided filters and the per-filter pushdown preview |
-| `pipeline_extraction` | The connector API and all four terminals (start here to learn the API) |
+| `pipeline_extraction` | The connector API: `collect()`, `run_with()` and a distributed `run()` (start here to learn the API) |
 | `parquet_export` | A real `run_with` job: one Parquet file per split, checkpointed, with a run report |
 | `dataframe_extraction` | DataFusion DataFrame and SQL over the source table |
 | `parallel_extraction` | Keyset partitioning across concurrent scans |
@@ -319,6 +325,13 @@ let batches = ctx
     .select(vec![col("order_id"), col("user_id"), col("amount")])?
     .collect().await?;
 ```
+
+That is the whole Postgres API, under `el_ballista::connector::postgres`: `PostgresConnector`
+(plus `filter_exprs`, `explain_filters` and `preview(n)`), `register_table` /
+`PostgresTableProvider::from_config` for your own `SessionContext`, `ExtractContext`, and
+`distributed::DistributedContext` (`stream_sql` / `collect_sql`), plus `close_pools()` for
+shutdown and the result types `SplitInfo`, `RunOutcome`, `FilterDecision` and
+`parse_filter_expr`. Scans, decoding, the pushdown dialect and the pipeline are crate-private.
 
 Full job spec, CLI flags, filter syntax and logging: [`docs/running.md`](docs/running.md).
 
@@ -377,17 +390,17 @@ Results at a 4g engine budget:
 
 ## Testing
 
-- **255 unit tests** (no database): pushdown translation, policy and cost, strict config
+- **266 unit tests** (no database): pushdown translation, policy and cost, strict config
   parsing, type mapping and decoding, partition math, checkpoints and the job lock, codecs.
-- **134 doc tests** on the public API examples (133 run, 1 ignored sketch).
-- **98 integration tests in 16 files** against a Docker Compose stack (Postgres 17 + MySQL 8):
+- **92 doc tests** on the public API examples (91 run, 1 ignored sketch).
+- **99 integration tests in 16 files** against a Docker Compose stack (Postgres 17 + MySQL 8):
   a deliberately hostile fixture (NULL vs `''`, integer extremes, `0x00`/`0xFF` bytes,
   1970/2038/9999 timestamps, enums, arrays) plus the dvdrental dataset on both engines. They
   check decode fidelity, COPY vs cursor, `always` vs `never` pushdown differentials, a seeded
   property-based pushdown test, checkpoint retry and crash recovery, and 1 vs 3 workers.
 - **CI** runs `fmt`, `clippy -D warnings`, and every test above on each pull request.
 
-Counts from `cargo test … -- --list` on 2026-09-27. Per-file matrix and oracles:
+Counts from `cargo test … -- --list` on 2026-10-04. Per-file matrix and oracles:
 [`docs/testing-plan.md`](docs/testing-plan.md).
 
 ---

@@ -9,10 +9,11 @@
 //!
 //! Within one process, read-modify-write cycles on a job file are serialized by an async
 //! mutex (a run marks splits concurrently); across processes, the run holds the job's
-//! [`JobLock`](super::lock::JobLock) (see [`JsonCheckpointStore::lock`]).
+//! [`JobLock`] (see [`JsonCheckpointStore::lock`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing::warn;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -179,9 +180,10 @@ impl JsonCheckpointStore {
         {
             let name = entry.file_name();
             if name.to_str().is_some_and(|n| n.starts_with(&prefix)) {
-                log::info!(
-                    "job '{key}': removing orphaned checkpoint temp file {}",
-                    entry.path().display()
+                warn!(
+                    job_id = %key,
+                    path = %entry.path().display(),
+                    "removing an orphaned checkpoint temp file (an earlier run stopped mid-write)"
                 );
                 match tokio::fs::remove_file(entry.path()).await {
                     Ok(()) => {}
@@ -326,9 +328,7 @@ impl CheckpointStore for JsonCheckpointStore {
             split.rows_extracted = rows_extracted;
             split.error = None;
         })
-        .await?;
-        log::info!("job '{key}' split '{split_id}' completed (rows={rows_extracted})");
-        Ok(())
+        .await
     }
 
     async fn mark_failed(
@@ -337,7 +337,6 @@ impl CheckpointStore for JsonCheckpointStore {
         split_id: &str,
         err: &str,
     ) -> Result<(), CheckpointError> {
-        log::warn!("job '{key}' split '{split_id}' failed: {err}");
         self.update_split(key, split_id, |split| {
             split.state = SplitState::Failed;
             split.error = Some(err.to_string());

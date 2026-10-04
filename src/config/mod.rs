@@ -265,12 +265,14 @@ impl Default for ExecutionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DistributedConfig {
-    /// Remote scheduler endpoint (`http://host:port`), or empty for a standalone deployment
-    /// where the scheduler and `parallel_workers` executors run in this process.
+    /// The `el-ballista scheduler` endpoint (`http://host:port`) a `.distributed()` run submits
+    /// to; empty means `DEFAULT_SCHEDULER_URL` (`http://localhost:50050`). Standalone runs
+    /// ignore it.
     #[serde(default = "default_scheduler_url")]
     pub scheduler_url: String,
-    /// Number of executor processes (standalone mode) or expected workers (remote mode — used
-    /// only to budget the per-process source connection pools; see docs/roadmap.md Phase 4).
+    /// The number of `el-ballista worker` processes: `pool_max` is split into
+    /// `pool_max / workers` source connections per worker, so it may not exceed `pool_max`.
+    /// Standalone runs ignore it.
     #[serde(default = "default_workers")]
     pub workers: usize,
     /// How many times a hung distributed job is cancelled and re-run before the extraction
@@ -285,7 +287,9 @@ pub struct DistributedConfig {
     /// above the workers' `--heartbeat-secs` (default 5 s).
     #[serde(default = "default_executor_timeout_secs")]
     pub executor_timeout_secs: u64,
-    /// Optional wall-clock limit per attempt of a distributed job; unset = no limit.
+    /// Optional wall-clock limit per attempt of a distributed job; unset = no limit. Required
+    /// when the scheduler REST API cannot be asked (unreachable, or not a plain `http://` URL):
+    /// it is then the only way to end a hung job, and a run without either is refused.
     #[serde(default)]
     pub job_timeout_secs: Option<u64>,
 }

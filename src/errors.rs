@@ -53,6 +53,14 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    /// A local file (a run report) could not be listed, read or rendered.
+    #[error("{context}")]
+    Io {
+        context: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The job spec file is not a valid job spec (bad JSON, unknown field, wrong type).
     #[error("invalid config file {}", path.display())]
     ConfigParse {
@@ -228,6 +236,23 @@ pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_errors_keep_their_cause() {
+        use std::error::Error as _;
+        let e = AppError::Io {
+            context: "cannot read run reports (list)".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        // The context alone in Display; the I/O error as the typed source, not flattened text.
+        assert_eq!(e.to_string(), "cannot read run reports (list)");
+        let source = e.source().and_then(|s| s.downcast_ref::<std::io::Error>());
+        assert_eq!(
+            source.map(|s| s.kind()),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(error_chain(&e).len(), 2);
+    }
 
     #[test]
     fn run_failed_wraps_the_cause_with_the_run() {

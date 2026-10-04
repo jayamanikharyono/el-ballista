@@ -1,11 +1,11 @@
 //! Process-wide sharing of budgeted source pools.
 //! distributed/pool_registry.rs
-//! The client (scheduler or the `el-ballista distribute` process) and every Ballista executor in the
-//! same process must not each open their own `pool_max` connections to the source — with N
-//! executors that would be N × `pool_max`, exactly the failure mode docs/roadmap.md Phase 4
-//! names. A single process-wide registry keys one pool per source; executors that materialize a
-//! serialized scan plan resolve the descriptor lazily through the same registry, so an
-//! N-worker process still opens one `budgeted_max_connections`-sized pool per source.
+//! Every scan in a process — the client's planning queries, and each scan task of an
+//! `el-ballista worker` — must share one budgeted pool per source, or a process running N
+//! scans would open N × its share, exactly the failure mode docs/roadmap.md Phase 4 names. A
+//! single process-wide registry keys one pool per source; a worker that materializes a
+//! serialized scan plan resolves the descriptor lazily through the same registry, so it opens
+//! one `budgeted_max_connections`-sized pool per source however many tasks it runs.
 //!
 //! Lifecycle: pools are created lazily on first use and shared for the life of the process.
 //! Idle connections are closed after [`IDLE_TIMEOUT`], so a pool nobody uses any more holds
@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use sqlx::ConnectOptions;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::Semaphore;
@@ -33,15 +34,6 @@ use crate::connector::errors::ExtractorError;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The process-wide pool registry (created on first use).
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::connector::postgres::distributed::pool_registry::registry;
-///
-/// // One registry per process: every caller shares the same budgeted pools.
-/// assert!(std::ptr::eq(registry(), registry()));
-/// ```
 pub fn registry() -> &'static SourcePoolRegistry {
     static REGISTRY: OnceLock<SourcePoolRegistry> = OnceLock::new();
     REGISTRY.get_or_init(SourcePoolRegistry::new)
@@ -126,7 +118,12 @@ impl SourcePoolRegistry {
             .username(&descriptor.user)
             .password(&password)
             .database(&descriptor.database)
-            .application_name(&descriptor.application_name);
+            .application_name(&descriptor.application_name)
+            // sqlx logs every statement it runs (each cursor FETCH included): per-FETCH detail
+            // is `trace`; the scan's own SQL is logged at `debug` by the execution plan. A slow
+            // statement is not degraded operation, so it is not a warning either.
+            .log_statements(log::LevelFilter::Trace)
+            .log_slow_statements(log::LevelFilter::Debug, Duration::from_secs(1));
 
         let statement_timeout = format!("{}ms", descriptor.statement_timeout_ms);
 
@@ -165,21 +162,21 @@ impl SourcePoolRegistry {
         Ok(entry)
     }
 
+    /// Open pools (closed ones are pruned first).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        pools.retain(|_, entry| !entry.pool.is_closed());
+        pools.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Close every registered pool (waiting for checked-out connections to return) and
     /// clear the registry. Later `pool()` calls open fresh pools.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # #[tokio::main(flavor = "current_thread")]
-    /// # async fn main() {
-    /// use el_ballista::connector::postgres::distributed::pool_registry::registry;
-    ///
-    /// // At shutdown: close pooled source connections gracefully.
-    /// registry().close_all().await;
-    /// assert!(registry().is_empty());
-    /// # }
-    /// ```
     pub async fn close_all(&self) {
         let pools: Vec<PgPool> = {
             let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
@@ -188,37 +185,6 @@ impl SourcePoolRegistry {
         for pool in pools {
             pool.close().await;
         }
-    }
-
-    /// Number of registered (not yet closed) pools.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::connector::postgres::distributed::pool_registry::registry;
-    ///
-    /// // Pools open lazily, on the first scan of a source.
-    /// println!("{} open source pool(s)", registry().len());
-    /// ```
-    pub fn len(&self) -> usize {
-        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
-        pools.retain(|_, entry| !entry.pool.is_closed());
-        pools.len()
-    }
-
-    /// True when no pool is registered.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::connector::postgres::distributed::pool_registry::registry;
-    ///
-    /// if registry().is_empty() {
-    ///     println!("no source connections held by this process");
-    /// }
-    /// ```
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 

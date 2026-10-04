@@ -4,8 +4,10 @@
 //! (codecs, keyset distribution, per-process budgets) — the same deployment shape as
 //! `benchmark/run.sh`, minus the containers.
 //!
-//! Children inherit the environment (the source password variable included), so start the
-//! cluster *after* `TestDb::connect()`. They are killed and reaped on `Drop` (also on test
+//! Workers inherit the environment (the source password variable included), so start the
+//! cluster *after* `TestDb::connect()`. The scheduler does not get the password: it plans
+//! from the partitions the client fixed and must never reach the source, so a scheduler-side
+//! source query fails every distributed test. Children are killed and reaped on `Drop` (also on test
 //! panic). Each child's output goes to `$TMPDIR/el-ballista-test-cluster-<pid>-<n>-<role>.log`, kept
 //! only when the test fails, so a failure can be diagnosed.
 
@@ -47,7 +49,11 @@ fn spawn(n: usize, role: &str, args: &[String]) -> Child {
     let log = log_path(n, role);
     let out = File::create(&log).expect("create cluster log");
     let err = out.try_clone().expect("clone cluster log");
-    Command::new(BIN)
+    let mut command = Command::new(BIN);
+    if role == "scheduler" {
+        command.env_remove(super::TEST_PASSWORD_ENV);
+    }
+    command
         .args(args)
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())

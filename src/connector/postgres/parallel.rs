@@ -8,6 +8,7 @@
 //! via exported snapshots are not implemented).
 
 use sqlx::PgPool;
+use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,53 +20,78 @@ fn quote_ident(s: &str) -> String {
 
 pub use crate::types::ParallelStrategy;
 
-/// Configuration for parallel scans.
-#[derive(Debug, Clone)]
-pub struct ParallelScanConfig {
-    pub strategy: ParallelStrategy,
-    pub partitions: usize,
-}
-
-impl Default for ParallelScanConfig {
-    fn default() -> Self {
-        Self {
-            strategy: ParallelStrategy::None,
-            partitions: 1,
-        }
-    }
+/// What a partition's `lo`/`hi` bound. A serialized plan carries this, never SQL text: a
+/// decoded [`ScanPartition`] re-renders its predicate from these typed fields with the same
+/// constructors that rendered it, so plan bytes cannot inject SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum PartitionKind {
+    /// No bounds: the whole table.
+    Whole,
+    /// A keyset range on `column` (see [`keyset_partition`]).
+    Keyset { column: String },
+    /// A physical page range `[lo, hi)`; `open_tail` drops the upper bound (the last
+    /// partition, so pages past the `relpages` estimate are scanned too).
+    Ctid { open_tail: bool },
 }
 
 /// Represents a single partition of a parallel scan.
 ///
-/// `predicate` is the authoritative filter (rendered SQL; `None` = the whole table). For
-/// keyset partitions `lo`/`hi` are informational: `lo` is the inclusive lower key bound,
-/// `hi` the exclusive upper bound, and `hi == None` on the open-ended last partition. The
-/// first keyset partition also holds every row whose key is NULL.
+/// `predicate` is the authoritative filter (rendered SQL; `None` = the whole table), rendered
+/// from `kind`, `lo` and `hi` by this module. It is not serialized: a deserialized partition
+/// renders it again from those typed fields and rejects bounds this module would never
+/// produce. For keyset partitions `lo`/`hi` are informational: `lo` is the inclusive lower key
+/// bound, `hi` the exclusive upper bound, and `hi == None` on the open-ended last partition.
+/// The first keyset partition also holds every row whose key is NULL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "ScanPartitionWire")]
 pub struct ScanPartition {
     pub partition_id: usize,
     pub lo: Option<i64>,
     pub hi: Option<i64>,
+    pub kind: PartitionKind,
+    #[serde(skip_serializing)]
     pub predicate: Option<String>,
+}
+
+/// The serialized form of a [`ScanPartition`]: its typed bounds only.
+#[derive(Deserialize)]
+struct ScanPartitionWire {
+    partition_id: usize,
+    lo: Option<i64>,
+    hi: Option<i64>,
+    kind: PartitionKind,
+}
+
+impl TryFrom<ScanPartitionWire> for ScanPartition {
+    type Error = ExtractorError;
+
+    fn try_from(wire: ScanPartitionWire) -> Result<Self, Self::Error> {
+        let ScanPartitionWire {
+            partition_id,
+            lo,
+            hi,
+            kind,
+        } = wire;
+        match kind {
+            PartitionKind::Whole if lo.is_none() && hi.is_none() => Ok(ScanPartition {
+                partition_id,
+                lo,
+                hi,
+                kind: PartitionKind::Whole,
+                predicate: None,
+            }),
+            PartitionKind::Whole => Err(ExtractorError::InvalidConfig(format!(
+                "whole-table partition {partition_id} with bounds lo={lo:?} hi={hi:?}"
+            ))),
+            PartitionKind::Keyset { column } => keyset_partition(&column, partition_id, lo, hi),
+            PartitionKind::Ctid { open_tail } => ctid_partition(partition_id, lo, hi, open_tail),
+        }
+    }
 }
 
 /// Computes partition bounds for a keyset-based scan.
 /// Uses min/max from the partition column or histogram bounds from pg_stats.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use el_ballista::connector::errors::ExtractorError;
-/// # use el_ballista::connector::postgres::PostgresExtractor;
-/// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-/// use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
-///
-/// let parts = compute_keyset_partitions(ex.pool(), "public", "orders", "id", 4).await?;
-/// for p in &parts {
-///     println!("#{}: {:?}", p.partition_id, p.predicate);
-/// }
-/// # Ok(()) }
-/// ```
 pub async fn compute_keyset_partitions(
     pool: &PgPool,
     schema_name: &str,
@@ -106,12 +132,11 @@ pub async fn compute_keyset_partitions(
         num_partitions,
     );
 
-    log::info!(
-        "computed {} keyset partitions for {}.{} by column {}",
-        partitions.len(),
-        schema_name,
-        table_name,
-        partition_column
+    debug!(
+        table = %format!("{schema_name}.{table_name}"),
+        column = %partition_column,
+        partitions = partitions.len(),
+        "keyset partitions planned"
     );
 
     Ok(partitions)
@@ -139,8 +164,10 @@ fn keyset_partitions_from_bounds(
 ) -> Vec<ScanPartition> {
     if num_partitions <= 1 || min_val >= max_val {
         if min_val > max_val {
-            log::warn!(
-                "keyset partitioning: min > max ({min_val} > {max_val}), falling back to single partition"
+            warn!(
+                min = min_val,
+                max = max_val,
+                "keyset bounds are inverted; scanning unsplit"
             );
         }
         return single_partition();
@@ -169,6 +196,9 @@ fn keyset_partitions_from_bounds(
             partition_id: i,
             lo: Some(lo),
             hi: Some(hi),
+            kind: PartitionKind::Keyset {
+                column: partition_column.to_string(),
+            },
             predicate: Some(keyset_predicate(&col, i, lo, Some(hi))),
         });
         lo = hi;
@@ -180,6 +210,9 @@ fn keyset_partitions_from_bounds(
         partition_id: tail_id,
         lo: Some(lo),
         hi: None,
+        kind: PartitionKind::Keyset {
+            column: partition_column.to_string(),
+        },
         predicate: Some(keyset_predicate(&col, tail_id, lo, None)),
     });
     partitions
@@ -207,16 +240,6 @@ fn keyset_predicate(col: &str, partition_id: usize, lo: i64, hi: Option<i64>) ->
 ///
 /// Only integer bounds are accepted and the predicate is re-rendered from them (never read
 /// back as SQL), so a stored checkpoint cannot inject SQL.
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::connector::postgres::parallel::keyset_partition;
-///
-/// let p = keyset_partition("id", 1, Some(10), None).unwrap();
-/// assert_eq!(p.predicate.as_deref(), Some(r#""id" >= 10"#));
-/// assert!(keyset_partition("id", 1, None, Some(5)).is_err());
-/// ```
 pub fn keyset_partition(
     partition_column: &str,
     partition_id: usize,
@@ -237,10 +260,17 @@ pub fn keyset_partition(
             )));
         }
     };
+    let kind = match predicate {
+        Some(_) => PartitionKind::Keyset {
+            column: partition_column.to_string(),
+        },
+        None => PartitionKind::Whole,
+    };
     Ok(ScanPartition {
         partition_id,
         lo,
         hi,
+        kind,
         predicate,
     })
 }
@@ -251,6 +281,7 @@ fn single_partition() -> Vec<ScanPartition> {
         partition_id: 0,
         lo: None,
         hi: None,
+        kind: PartitionKind::Whole,
         predicate: None,
     }]
 }
@@ -284,12 +315,11 @@ pub(crate) async fn compute_ctid_partitions(
 
     let partitions = ctid_partitions_from_relpages(relpages, num_partitions);
 
-    log::info!(
-        "computed {} ctid partitions for {}.{} ({} pages)",
-        partitions.len(),
-        schema_name,
-        table_name,
-        relpages
+    debug!(
+        table = %format!("{schema_name}.{table_name}"),
+        pages = relpages,
+        partitions = partitions.len(),
+        "ctid partitions planned"
     );
 
     Ok(partitions)
@@ -305,7 +335,7 @@ fn ctid_partitions_from_relpages(relpages: i32, num_partitions: usize) -> Vec<Sc
     );
 
     if relpages <= 0 {
-        log::warn!("ctid partitioning: no pages, falling back to single partition");
+        warn!("ctid partitioning found no pages (never analyzed?); scanning unsplit");
         return single_partition();
     }
 
@@ -321,37 +351,68 @@ fn ctid_partitions_from_relpages(relpages: i32, num_partitions: usize) -> Vec<Sc
         // than the partition count) would otherwise never be scanned. An open tail
         // also avoids emitting an inverted (>= (94,1) AND < (3,1)) always-empty range
         // when relpages < num_partitions.
-        let (page_hi, predicate) = if i == num_partitions - 1 {
+        let open_tail = i == num_partitions - 1;
+        let page_hi = if open_tail {
             // The predicate itself is open-ended (no upper tid bound), so it's correct
             // regardless of `page_hi`'s value. But `page_hi` is still a field callers can
             // read directly (e.g. for logging/display), and `relpages` alone can be
             // *less* than `page_lo` when relpages < num_partitions (more partitions than
             // pages) — reporting that as `hi` would look like an inverted range. Clamp it
             // to `page_lo` so the field always reads as "empty/unbounded", never inverted.
-            (
-                (relpages as usize).max(page_lo),
-                format!("ctid >= '({},1)'::tid", page_lo),
-            )
+            (relpages as usize).max(page_lo)
         } else {
-            let hi = (i + 1) * pages_per_partition;
-            (
-                hi,
-                format!(
-                    "ctid >= '({},1)'::tid AND ctid < '({},1)'::tid",
-                    page_lo, hi
-                ),
-            )
+            (i + 1) * pages_per_partition
         };
+        let (lo, hi) = (page_lo as i64, page_hi as i64);
 
         partitions.push(ScanPartition {
             partition_id: i,
-            lo: Some(page_lo as i64),
-            hi: Some(page_hi as i64),
-            predicate: Some(predicate),
+            lo: Some(lo),
+            hi: Some(hi),
+            kind: PartitionKind::Ctid { open_tail },
+            predicate: Some(ctid_predicate(lo, hi, open_tail)),
         });
     }
 
     partitions
+}
+
+/// The one rendering of a ctid page-range predicate: pages `[lo, hi)`, or from `lo` on when
+/// `open_tail`.
+fn ctid_predicate(lo: i64, hi: i64, open_tail: bool) -> String {
+    if open_tail {
+        format!("ctid >= '({lo},1)'::tid")
+    } else {
+        format!("ctid >= '({lo},1)'::tid AND ctid < '({hi},1)'::tid")
+    }
+}
+
+/// Re-create one ctid partition from its page bounds, as [`compute_ctid_partitions`]
+/// produced it. Only page numbers a Postgres block number can hold are accepted (`hi > lo`
+/// unless it is the open tail, whose `hi` is display-only), and the predicate is rendered
+/// from them, never read back as SQL.
+fn ctid_partition(
+    partition_id: usize,
+    lo: Option<i64>,
+    hi: Option<i64>,
+    open_tail: bool,
+) -> Result<ScanPartition, ExtractorError> {
+    let page = |p: i64| u32::try_from(p).is_ok();
+    match (lo, hi) {
+        (Some(lo), Some(hi)) if page(lo) && page(hi) && (hi > lo || (open_tail && hi >= lo)) => {
+            Ok(ScanPartition {
+                partition_id,
+                lo: Some(lo),
+                hi: Some(hi),
+                kind: PartitionKind::Ctid { open_tail },
+                predicate: Some(ctid_predicate(lo, hi, open_tail)),
+            })
+        }
+        _ => Err(ExtractorError::InvalidConfig(format!(
+            "invalid ctid page bounds for partition {partition_id}: lo={lo:?} hi={hi:?} \
+             open_tail={open_tail}"
+        ))),
+    }
 }
 
 /// Test-only access to the pure keyset math for other modules' unit tests.
@@ -430,10 +491,48 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_scan_config_default() {
-        let config = ParallelScanConfig::default();
-        assert_eq!(config.strategy, ParallelStrategy::None);
-        assert_eq!(config.partitions, 1);
+    fn test_serialized_partitions_carry_bounds_not_sql() {
+        let mut all = keyset_partitions_from_bounds("id", 1, 10, 3);
+        all.extend(ctid_partitions_from_relpages(100, 4));
+        all.extend(ctid_partitions_from_relpages(2, 4)); // clamped open tail
+        all.extend(single_partition());
+        for p in &all {
+            let json = serde_json::to_string(p).unwrap();
+            assert!(!json.contains("predicate"), "SQL text on the wire: {json}");
+            let decoded: ScanPartition = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.predicate, p.predicate, "{json}");
+            assert_eq!((decoded.lo, decoded.hi), (p.lo, p.hi));
+            assert_eq!(decoded.kind, p.kind);
+        }
+    }
+
+    #[test]
+    fn test_decoded_partitions_never_trust_sql_or_impossible_bounds() {
+        let decode = |json: &str| serde_json::from_str::<ScanPartition>(json);
+        // A smuggled predicate is ignored: the SQL comes from the typed bounds alone.
+        let p = decode(
+            r#"{"partition_id":1,"lo":5,"hi":9,"kind":{"Keyset":{"column":"id"}},
+                "predicate":"TRUE; DROP TABLE t"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.predicate.as_deref(), Some(r#""id" >= 5 AND "id" < 9"#));
+        // A hostile column name is a quoted identifier, never SQL.
+        let p = decode(
+            r#"{"partition_id":1,"lo":5,"hi":null,"kind":{"Keyset":{"column":"x\" OR TRUE --"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.predicate.as_deref(), Some(r#""x"" OR TRUE --" >= 5"#));
+        // Bounds this module never produces are rejected, not scanned.
+        for bad in [
+            r#"{"partition_id":1,"lo":9,"hi":5,"kind":{"Keyset":{"column":"id"}}}"#,
+            r#"{"partition_id":0,"lo":1,"hi":2,"kind":"Whole"}"#,
+            r#"{"partition_id":0,"lo":-1,"hi":2,"kind":{"Ctid":{"open_tail":false}}}"#,
+            r#"{"partition_id":0,"lo":3,"hi":3,"kind":{"Ctid":{"open_tail":false}}}"#,
+            r#"{"partition_id":0,"lo":0,"hi":4294967296,"kind":{"Ctid":{"open_tail":false}}}"#,
+            r#"{"partition_id":0,"lo":null,"hi":2,"kind":{"Ctid":{"open_tail":true}}}"#,
+        ] {
+            assert!(decode(bad).is_err(), "accepted {bad}");
+        }
     }
 
     // --- keyset_partitions_from_bounds: real math, no DB needed ---

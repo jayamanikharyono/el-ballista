@@ -303,13 +303,11 @@ async fn datafusion_filtered_range_simulation() {
 }
 
 #[tokio::test]
-async fn dialect_quote_and_placeholder() {
+async fn dialect_quotes_identifiers() {
     use el_ballista::pushdown::dialect::SqlDialect;
     let d = MysqlDialect;
     assert_eq!(d.quote_ident("order"), "`order`");
     assert_eq!(d.quote_ident("a`b"), "`a``b`");
-    assert_eq!(d.placeholder(1), "?");
-    assert_eq!(d.placeholder(5), "?");
 }
 
 /// Streaming extract: `batch_size` bounds every batch, the tail is included, and the batches

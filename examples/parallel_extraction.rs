@@ -1,279 +1,95 @@
-//! Parallel Extraction Example
+//! Parallel extraction: the job's table split into keyset partitions, scanned concurrently.
 //!
-//! Demonstrates parallel table extraction using keyset-based partitioning.
-//! This pattern extracts ALL data from a table by dividing it into non-overlapping
-//! key ranges and processing each range in parallel across separate connections.
+//! `parallel_scan` (set here in code on top of the job config) splits the table into
+//! `partitions` ranges of `partition_column`, from one `MIN`/`MAX` read. The first range also
+//! holds every row whose key is NULL and the last one is open-ended, so the partitions cover
+//! every row exactly once at the moment they are planned. Partitions are separate statements
+//! with separate snapshots: rows that change their key during the scan can be missed or seen
+//! twice (see the README's isolation notes). At most `pool_max` partitions query the source
+//! at once.
 //!
-//! This example validates:
-//! - Keyset-based partition computation (by primary key)
-//! - Parallel extraction across multiple key ranges
-//! - Multi-connection parallel processing
-//! - Combining results from parallel scans
-//! - Data consistency (no overlaps, no gaps)
-//! - Full table extraction via parallelism
+//! `run_with` hands each partition (split) to the consumer below with its bounds; this
+//! example just counts rows. The checkpoint goes to a fresh temporary directory, so every
+//! run extracts every split.
 //!
-//! Usage:
 //! ```bash
-//! PGPASSWORD=... cargo run --example parallel_extraction
+//! PGPASSWORD=... cargo run --example parallel_extraction -- [config.json] [partitions]
+//! # defaults: examples/configs/full_extract.dvd_rental.json, 4
 //! ```
 
-use el_ballista::connector::postgres::PostgresExtractor;
-use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use el_ballista::config::JobConfig;
+use el_ballista::connector::postgres::{PostgresConnector, SplitInfo, close_pools};
+use futures::TryStreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Route the `log` facade to stderr (+ optional --log-file / EL_BALLISTA_LOG_FILE).
-    // Set RUST_LOG=debug (or --log-level debug) to log every generated SQL query.
     el_ballista::logging::init_from_env_and_args();
 
-    // Never hard-code credentials: the password comes from the environment.
-    let password = std::env::var("PGPASSWORD")
-        .map_err(|_| "set PGPASSWORD to the password of postgres@localhost:5432/test (the dvdrental demo database)")?;
+    let mut args = std::env::args().skip(1);
+    let config_path = args
+        .next()
+        .unwrap_or_else(|| "examples/configs/full_extract.dvd_rental.json".to_string());
+    let partitions: usize = match args.next() {
+        Some(n) => n.parse()?,
+        None => 4,
+    };
 
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  Parallel Extraction Example");
-    println!("  Keyset-Based Parallel Full Table Extraction");
-    println!("═══════════════════════════════════════════════════════════\n");
-
-    // 1. Connect to PostgreSQL using the extraction layer
-    println!("► Step 1: Connect to PostgreSQL");
-
-    let extractor = PostgresExtractor::connect(
-        "localhost",
-        5432,
-        "postgres",
-        &password,
-        "test",
-        10, // Increased pool size for parallel extraction
-        30000,
-        "parallel_extraction_example",
-    )
-    .await?;
-
-    println!("  ✓ Connected to database");
-    println!("  ✓ Extraction layer initialized with pool size 10");
-
-    // 2. Define extraction parameters
-    println!("\n► Step 2: Define extraction parameters");
-    let table_name = "public.payment";
-    let schema_name = "public";
-    let table_name_only = "payment";
-    let columns = Some(vec!["payment_id", "amount", "staff_id", "payment_date"]);
-    let partition_column = "payment_id";
-    let num_partitions = 4;
-
-    println!("  Table: {}", table_name);
-    println!("  Columns: {:?}", columns.as_ref().unwrap());
-    println!("  Partition strategy: Keyset (by primary key)");
-    println!("  Partition column: {}", partition_column);
-    println!("  Number of partitions: {}", num_partitions);
-
-    // 3. Compute keyset partitions (non-overlapping key ranges)
-    println!("\n► Step 3: Compute keyset partitions");
+    let mut config = JobConfig::from_file(&config_path)?;
+    config.parallel_scan.strategy = "keyset".parse()?;
+    config.parallel_scan.partitions = partitions;
+    config.checkpoint.dir = std::env::temp_dir()
+        .join(format!(
+            "el-ballista-parallel-example-{}",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned();
+    let checkpoint_dir = config.checkpoint.dir.clone();
     println!(
-        "  Computing {} non-overlapping key ranges...",
-        num_partitions
+        "► {}.{} in {partitions} keyset partition(s) on {} (at most {} scanning at once)",
+        config.source.schema,
+        config.table,
+        config.parallel_scan.partition_column,
+        config.source.pool_max
     );
 
-    let pool = extractor.pool();
-    let partitions = compute_keyset_partitions(
-        pool,
-        schema_name,
-        table_name_only,
-        partition_column,
-        num_partitions,
-    )
-    .await?;
-
-    println!("  ✓ Computed {} partitions", partitions.len());
-
-    for partition in &partitions {
-        if let Some(predicate) = &partition.predicate {
-            println!("    Partition {}: {}", partition.partition_id, predicate);
-        } else {
-            println!(
-                "    Partition {}: (full table, no partitioning needed)",
-                partition.partition_id
-            );
-        }
-    }
-
-    // 4. Extract data from each partition in parallel
-    println!("\n► Step 4: Extract data from each partition in parallel");
-
-    let mut extraction_tasks = Vec::new();
-
-    for partition in partitions.iter() {
-        let table_name_clone = table_name.to_string();
-        let columns_clone = columns.clone();
-        let partition_column_clone = partition_column.to_string();
-        let partition_id = partition.partition_id;
-        let lo = partition.lo;
-        let hi = partition.hi;
-        let partition = partition.clone();
-
-        let extractor_clone = PostgresExtractor::connect(
-            "localhost",
-            5432,
-            "postgres",
-            &password,
-            "test",
-            5,
-            30000,
-            &format!("parallel_extraction_p{}", partition_id),
-        )
+    let connector = PostgresConnector::from_config(config)?;
+    let total = Arc::new(AtomicUsize::new(0));
+    let outcome = connector
+        .extract()
+        .standalone()
+        .run_with(|split: SplitInfo, mut stream| {
+            let total = Arc::clone(&total);
+            async move {
+                let mut rows = 0usize;
+                while let Some(batch) = stream.try_next().await? {
+                    rows += batch.num_rows();
+                }
+                total.fetch_add(rows, Ordering::Relaxed);
+                let range = match &split.bounds {
+                    Some(b) => format!("lo={:?} hi={:?}", b.lo, b.hi),
+                    None => "whole table".to_string(),
+                };
+                println!(
+                    "  ✓ {} ({}/{}): {rows} rows, {range}",
+                    split.split_id,
+                    split.index + 1,
+                    split.total
+                );
+                Ok(())
+            }
+        })
         .await?;
 
-        // Spawn task for this partition
-        let task = tokio::spawn(async move {
-            // Each computed partition carries its own predicate: the first one also
-            // holds NULL keys and the last one is open-ended, so together they cover
-            // every row exactly once.
-            println!(
-                "  [Partition {}] Extracting {} in [{:?}, {:?}) ({})",
-                partition_id,
-                partition_column_clone,
-                lo,
-                hi,
-                partition.predicate.as_deref().unwrap_or("whole table")
-            );
-            let batch_result = extractor_clone
-                .extract_partition(&table_name_clone, columns_clone, &partition)
-                .await;
-
-            match batch_result {
-                Ok(b) => {
-                    println!(
-                        "  [Partition {}] ✓ Extracted {} rows",
-                        partition_id,
-                        b.num_rows()
-                    );
-                    Ok((partition_id, b))
-                }
-                Err(e) => {
-                    println!("  [Partition {}] ✗ Error: {}", partition_id, e);
-                    Err(e)
-                }
-            }
-        });
-
-        extraction_tasks.push(task);
-    }
-
-    // 5. Wait for all extraction tasks to complete
-    println!("\n► Step 5: Wait for parallel extraction to complete");
-
-    let mut all_batches = Vec::new();
-    let mut total_rows = 0;
-
-    for task in extraction_tasks {
-        match task.await {
-            Ok(Ok((partition_id, batch))) => {
-                total_rows += batch.num_rows();
-                all_batches.push((partition_id, batch));
-            }
-            Ok(Err(e)) => {
-                eprintln!("  ✗ Partition extraction failed: {}", e);
-            }
-            Err(e) => {
-                eprintln!("  ✗ Task failed: {}", e);
-            }
-        }
-    }
-
-    println!("  ✓ All partitions extracted");
-    println!("  ✓ Total rows: {}", total_rows);
-    println!("  ✓ Batches collected: {}", all_batches.len());
-
-    // 6. Display results
-    println!("\n► Step 6: Results summary");
-    println!("  Extraction results by partition:");
-
-    all_batches.sort_by_key(|(partition_id, _)| *partition_id);
-    for (partition_id, batch) in &all_batches {
-        let rows = batch.num_rows();
-        let cols = batch.num_columns();
-        println!(
-            "    Partition {}: {} rows, {} columns",
-            partition_id, rows, cols
-        );
-    }
-
-    // 7. Schema information
-    println!("\n► Step 7: Schema information");
-    if let Some((_, first_batch)) = all_batches.first() {
-        println!("  Arrow Schema: {:?}", first_batch.schema());
-    }
-
-    // 8. Data consistency verification
-    println!("\n► Step 8: Data consistency verification");
-    println!("  ✓ Key ranges are non-overlapping (no duplicate data)");
-    println!("  ✓ Each partition has exclusive key range");
-    println!("  ✓ No gaps between consecutive partitions");
-    println!("  ✓ Keyset predicates ensure: order_id >= lo AND order_id < hi");
-    println!("  ✓ Last partition includes maximum key value");
-
-    // 9. Verification
-    println!("\n► Step 9: Verification");
-    println!("  ✓ Keyset-based partition computation successful");
     println!(
-        "  ✓ Parallel extraction from {} partitions complete",
-        num_partitions
+        "  ✓ {} rows extracted across all partitions ({} split(s))",
+        total.load(Ordering::Relaxed),
+        outcome.splits_total
     );
-    println!("  ✓ {} rows extracted across all partitions", total_rows);
-    println!("  ✓ Data consistency maintained (no overlaps)");
-
-    // 10. Performance metrics
-    println!("\n► Step 10: Performance metrics");
-    println!("  Parallel extraction metrics:");
-    println!("    • Partitioning strategy: Keyset (primary key ranges)");
-    println!("    • Number of partitions: {}", num_partitions);
-    println!("    • Total rows extracted: {}", total_rows);
-    println!(
-        "    • Avg rows per partition: {}",
-        total_rows.checked_div(num_partitions).unwrap_or(0)
-    );
-    println!("    • Partition column: {}", partition_column);
-
-    // 11. Keyset partitioning benefits
-    println!("\n► Step 11: Keyset partitioning benefits");
-    println!("  Why keyset partitioning?");
-    println!("    • Works with any primary key or indexed column");
-    println!("    • No time-based constraints needed");
-    println!("    • Evenly distributes work across partitions");
-    println!("    • Scalable to very large tables");
-    println!("    • Consistent results (repeatable queries)");
-
-    // 12. Use case scenarios
-    println!("\n► Step 12: Use case scenarios");
-    println!("  Parallel extraction patterns:");
-    println!("    1. Large table initial load (full extract)");
-    println!("    2. Data migration across systems");
-    println!("    3. Multi-threaded ETL pipelines");
-    println!("    4. Distributed data processing");
-    println!("    5. Backup/restore operations");
-
-    // 13. Implementation details
-    println!("\n► Step 13: Implementation details");
-    println!("  ✓ Uses extract_partition() per computed partition (NULL keys + open tail covered)");
-    println!("    Keyset partitioning with non-overlapping ranges:");
-    println!("      • Partition 0: WHERE order_id >= 0 AND order_id < 250");
-    println!("      • Partition 1: WHERE order_id >= 250 AND order_id < 500");
-    println!("      • etc...");
-    println!("    Each partition extracted in parallel with no overlapping data.");
-    println!("    Last partition includes the maximum key value.");
-
-    // 14. Status
-    println!("\n► Result");
-    println!("  ✓ Parallel extraction example complete");
-    println!("  ✓ Keyset partition computation working correctly");
-    println!("  ✓ Parallel extraction framework demonstrated");
-    println!("  ✓ Data ready for further processing");
-    println!("  ✓ Extraction layer parallel capabilities validated");
-
-    println!("\n═══════════════════════════════════════════════════════════");
-    println!("  ✓ Parallel extraction example complete");
-    println!("═══════════════════════════════════════════════════════════");
-
+    let _ = std::fs::remove_dir_all(&checkpoint_dir);
+    close_pools().await;
     Ok(())
 }

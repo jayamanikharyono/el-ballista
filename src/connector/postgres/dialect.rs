@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use crate::connector::postgres::arrow_type_mapper::selects_as_text;
 use crate::pushdown::dialect::SqlDialect;
 use crate::pushdown::{CastType, Collation, ColumnKind, ColumnKinds};
 use crate::types::{ColumnMetadata, TableMetadata};
@@ -16,10 +17,6 @@ pub struct PostgresDialect;
 impl SqlDialect for PostgresDialect {
     fn quote_ident(&self, name: &str) -> String {
         format!("\"{}\"", name.replace('"', "\"\""))
-    }
-
-    fn placeholder(&self, param_index: usize) -> String {
-        format!("${}", param_index)
     }
 
     fn cast_type_name(&self, to: CastType) -> &'static str {
@@ -49,20 +46,16 @@ impl SqlDialect for PostgresDialect {
 /// - `uuid`, `json`, `jsonb`, and other `USER-DEFINED` types (incl. `citext`), which the
 ///   extractor emits as their text form: [`ColumnKind::TextCast`];
 /// - everything else (numeric, bytea, arrays, ...): [`ColumnKind::Opaque`].
-///
-/// # Examples
-/// ```
-/// use el_ballista::connector::postgres::dialect::column_kind;
-/// use el_ballista::pushdown::ColumnKind;
-/// use el_ballista::types::ColumnMetadata;
-/// let uuid = ColumnMetadata {
-///     column_name: "u".into(), data_type: "uuid".into(), is_nullable: true,
-///     numeric_precision: None, numeric_scale: None, udt_name: Some("uuid".into()),
-///     collation_name: None,
-/// };
-/// assert_eq!(column_kind(&uuid, false), ColumnKind::TextCast);
-/// ```
 pub fn column_kind(column: &ColumnMetadata, is_enum: bool) -> ColumnKind {
+    // Compared through the text form the scan selects (`selects_as_text`), so a
+    // pushed comparison sees exactly the value Arrow holds.
+    if selects_as_text(column) {
+        return if is_enum && column.data_type == "USER-DEFINED" {
+            ColumnKind::Label
+        } else {
+            ColumnKind::TextCast
+        };
+    }
     match column.data_type.as_str() {
         "smallint" | "integer" | "bigint" => ColumnKind::Integer,
         "boolean" => ColumnKind::Boolean,
@@ -72,8 +65,6 @@ pub fn column_kind(column: &ColumnMetadata, is_enum: bool) -> ColumnKind {
         "text" | "character varying" => ColumnKind::Text {
             bytewise_collation: matches!(column.collation_name.as_deref(), Some("C" | "POSIX")),
         },
-        "USER-DEFINED" if is_enum => ColumnKind::Label,
-        "uuid" | "json" | "jsonb" | "USER-DEFINED" => ColumnKind::TextCast,
         _ => ColumnKind::Opaque,
     }
 }
@@ -85,15 +76,6 @@ pub fn column_kind(column: &ColumnMetadata, is_enum: bool) -> ColumnKind {
 /// other encoding text and enum-label columns are downgraded to [`ColumnKind::TextCast`]
 /// (equality/inequality only — byte equality is encoding-independent), so no ordering
 /// comparison is pushed.
-///
-/// # Examples
-/// ```
-/// use std::collections::HashSet;
-/// use el_ballista::connector::postgres::dialect::column_kinds;
-/// use el_ballista::types::TableMetadata;
-/// let table = TableMetadata { schema_name: "public".into(), table_name: "t".into(), columns: vec![] };
-/// assert!(column_kinds(&table, &HashSet::new(), true).is_empty());
-/// ```
 pub fn column_kinds(
     table: &TableMetadata,
     enum_columns: &HashSet<String>,
@@ -115,6 +97,57 @@ pub fn column_kinds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_form_comparison_matches_text_form_selection() {
+        // A column is compared through its text form exactly when the scan selects it as
+        // text: a cast comparison over a value decoded some other way (or a raw comparison
+        // over a value decoded from text) would push a filter Arrow does not agree with.
+        use crate::connector::postgres::arrow_type_mapper::{ArrowTypeMapper, selects_as_text};
+        use arrow::datatypes::DataType;
+        for data_type in [
+            "smallint",
+            "integer",
+            "bigint",
+            "boolean",
+            "real",
+            "double precision",
+            "text",
+            "character varying",
+            "character",
+            "bytea",
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "numeric",
+            "json",
+            "jsonb",
+            "uuid",
+            "USER-DEFINED",
+            "interval",
+            "tsvector",
+            "point",
+        ] {
+            let c = col(data_type, None);
+            let as_text = selects_as_text(&c);
+            assert_eq!(
+                matches!(column_kind(&c, false), ColumnKind::TextCast),
+                as_text,
+                "{data_type}"
+            );
+            if as_text {
+                assert_eq!(
+                    ArrowTypeMapper::map(&c).ok(),
+                    Some(DataType::Utf8),
+                    "{data_type}"
+                );
+                assert_eq!(
+                    column_kind(&c, true) == ColumnKind::Label,
+                    data_type == "USER-DEFINED"
+                );
+            }
+        }
+    }
 
     #[test]
     fn non_utf8_server_downgrades_text_ordering() {
@@ -159,13 +192,6 @@ mod tests {
         let dialect = PostgresDialect;
         assert_eq!(dialect.quote_ident("simple"), r#""simple""#);
         assert_eq!(dialect.quote_ident(r#"with"quote"#), r#""with""quote""#);
-    }
-
-    #[test]
-    fn test_placeholder() {
-        let dialect = PostgresDialect;
-        assert_eq!(dialect.placeholder(1), "$1");
-        assert_eq!(dialect.placeholder(42), "$42");
     }
 
     #[test]

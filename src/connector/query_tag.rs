@@ -28,17 +28,6 @@ pub struct QuerySession {
 }
 
 impl QuerySession {
-    /// A fresh session with a generated `run_id` — `pipeline` is
-    /// typically the job's `application_name`, which is already threaded through config for
-    /// an unrelated reason (identifying the Postgres connection) and doubles as a stable
-    /// pipeline label here.
-    pub(crate) fn new(pipeline: impl Into<String>) -> Self {
-        Self {
-            pipeline: sanitize(&pipeline.into()),
-            run_id: fresh_run_id(),
-        }
-    }
-
     /// Reconstruct a session from an already-rendered `run_id` string (e.g. read back off
     /// a serialized/deserialized execution plan) — used so a plan built on the scheduler and
     /// executed elsewhere tags every partition's query with the *same* run_id, rather than
@@ -52,22 +41,6 @@ impl QuerySession {
 
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
-    }
-
-    /// The sanitized pipeline label every query tagged by this session carries.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::connector::query_tag::QuerySession;
-    ///
-    /// fn label(session: &QuerySession) -> &str {
-    ///     session.pipeline()
-    /// }
-    /// # let _ = label;
-    /// ```
-    pub fn pipeline(&self) -> &str {
-        &self.pipeline
     }
 
     /// Build the tag for one query: a fresh `query_id`, this session's `pipeline`/`run_id`,
@@ -94,6 +67,11 @@ pub struct QueryTag {
 }
 
 impl QueryTag {
+    /// This query's id (`q_<8 hex>`), as rendered in the comment: the `query_id` log field.
+    pub(crate) fn query_id(&self) -> &str {
+        &self.query_id
+    }
+
     /// Record which partition (1-based) of how many this query covers, for parallel/keyset
     /// or ctid-split scans. Omitted from the rendered comment for unpartitioned queries.
     pub(crate) fn with_partition(mut self, index_one_based: usize, total: usize) -> Self {
@@ -103,7 +81,7 @@ impl QueryTag {
 
     /// Render as a single-line SQL comment, safe to prepend to any generated statement.
     /// Every field is either program-generated (`query_id`, a generated `run_id`) or a
-    /// short config identifier already sanitized in [`QuerySession::new`] — never raw user
+    /// short config identifier already sanitized in [`QuerySession::from_parts`] — never raw user
     /// input — but `sanitize` runs again defensively so a surprising config value (an
     /// `application_name` containing `*/`) can never break out of the comment early.
     pub(crate) fn render(&self) -> String {
@@ -183,7 +161,7 @@ mod tests {
     fn test_sanitize_prevents_early_comment_termination() {
         // Devil's advocate: a pipeline/strategy value that itself contains "*/" must never
         // be able to close the SQL comment early and inject trailing text as live SQL.
-        let session = QuerySession::new("evil*/ DROP TABLE users; --");
+        let session = QuerySession::from_parts("evil*/ DROP TABLE users; --", "r_x");
         let rendered = session.tag("full").render();
         assert!(
             !rendered.contains("*/ DROP"),

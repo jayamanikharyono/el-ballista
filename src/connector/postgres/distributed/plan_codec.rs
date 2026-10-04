@@ -9,6 +9,7 @@
 //! JSON payload from Ballista's own protobuf framing.
 
 use std::sync::Arc;
+use tracing::debug;
 
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -68,10 +69,7 @@ impl PhysicalExtensionCodec for PostgresPhysicalCodec {
 
             buf.extend_from_slice(POSTGRES_SCAN_MAGIC);
             buf.extend_from_slice(&bytes);
-            log::debug!(
-                "encoded PostgresExecutionPlan ({} bytes payload)",
-                bytes.len()
-            );
+            debug!(bytes = bytes.len(), "scan plan encoded");
 
             Ok(())
         } else {

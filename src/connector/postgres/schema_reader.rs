@@ -15,49 +15,10 @@ pub struct PostgresSchemaReader<'a> {
 
 impl<'a> PostgresSchemaReader<'a> {
     /// A reader over `pool`; unqualified table names resolve in the `public` schema.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use el_ballista::connector::errors::ExtractorError;
-    /// # use el_ballista::connector::postgres::PostgresExtractor;
-    /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
-    ///
-    /// let meta = PostgresSchemaReader::new(ex.pool()).get_table_metadata("orders").await?;
-    /// for c in &meta.columns {
-    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
-    /// }
-    /// # Ok(()) }
-    /// ```
     pub fn new(pool: &'a PgPool) -> Self {
         Self {
             pool,
             schema_name: "public".to_string(),
-        }
-    }
-
-    /// A reader over `pool`; unqualified table names resolve in `schema_name`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use el_ballista::connector::errors::ExtractorError;
-    /// # use el_ballista::connector::postgres::PostgresExtractor;
-    /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
-    ///
-    /// let reader = PostgresSchemaReader::with_schema(ex.pool(), "sales");
-    /// let meta = reader.get_table_metadata("orders").await?; // sales.orders
-    /// for c in &meta.columns {
-    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
-    /// }
-    /// # Ok(()) }
-    /// ```
-    pub fn with_schema(pool: &'a PgPool, schema_name: impl Into<String>) -> Self {
-        Self {
-            pool,
-            schema_name: schema_name.into(),
         }
     }
 
@@ -100,21 +61,6 @@ impl<'a> PostgresSchemaReader<'a> {
     /// no rows for it — a missing (or invisible) table must never look like a zero-column
     /// table, or a provider would register an empty schema and every scan would return
     /// zero rows.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use el_ballista::connector::errors::ExtractorError;
-    /// # use el_ballista::connector::postgres::PostgresExtractor;
-    /// # async fn demo(ex: &PostgresExtractor) -> Result<(), ExtractorError> {
-    /// use el_ballista::connector::postgres::schema_reader::PostgresSchemaReader;
-    ///
-    /// let meta = PostgresSchemaReader::new(ex.pool()).get_table_metadata("public.orders").await?;
-    /// for c in &meta.columns {
-    ///     println!("{} {} nullable={}", c.column_name, c.data_type, c.is_nullable);
-    /// }
-    /// # Ok(()) }
-    /// ```
     pub async fn get_table_metadata(
         &self,
         table_name: &str,

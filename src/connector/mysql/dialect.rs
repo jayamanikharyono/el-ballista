@@ -14,11 +14,6 @@ impl SqlDialect for MysqlDialect {
         format!("`{}`", name.replace('`', "``"))
     }
 
-    fn placeholder(&self, _param_index: usize) -> String {
-        // MySQL uses positional `?` placeholders (unlike Postgres `$1`).
-        "?".to_string()
-    }
-
     // TODO(mysql-pushdown): MySQL has no pushdown path yet. Column collations (e.g.
     // `utf8mb4_0900_ai_ci` vs `_bin`) must be compared with DataFusion's byte-wise semantics
     // before any text predicate is ever pushed as `Exact`.
@@ -44,12 +39,5 @@ mod tests {
         let d = MysqlDialect;
         assert_eq!(d.quote_ident("orders"), "`orders`");
         assert_eq!(d.quote_ident("we`ird"), "`we``ird`");
-    }
-
-    #[test]
-    fn placeholder_is_question_mark() {
-        let d = MysqlDialect;
-        assert_eq!(d.placeholder(1), "?");
-        assert_eq!(d.placeholder(9), "?");
     }
 }

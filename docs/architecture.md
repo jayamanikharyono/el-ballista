@@ -35,7 +35,8 @@ Consequences worth stating explicitly: we inherit DataFusion's optimizer rules f
 filter, and limit pushdown for free, and we inherit its release cadence (roughly one major every
 8–10 weeks, with breaking changes each time).
 
-**Version policy.** Pin exact versions in the crate root `Cargo.toml`; upgrade DataFusion
+**Version policy.** Keep the DataFusion / Ballista / Arrow versions together in the crate root
+`Cargo.toml` (Cargo caret requirements, resolved by `Cargo.lock`); upgrade DataFusion
 deliberately as a single dedicated change, never incidentally. Arrow's version must be the one
 DataFusion depends on — two Arrow versions in the graph produce type errors that look like
 nonsense because `arrow::datatypes::Schema` from one version is not the same type as from
@@ -49,7 +50,8 @@ datafusion  = "54.1.0"
 ballista    = "54.1.0"      # scheduler + executor + client, same version as datafusion
 arrow       = "58.4"        # must match datafusion's arrow
 parquet     = "58.4"
-tokio       = { version = "1", features = ["full"] }
+tokio       = { version = "1.53.1", features = ["full"] }
+tracing     = "0.1"         # + tracing-subscriber (env-filter) for the binary's logging
 sqlx        = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "postgres", ...] }
 ```
 
@@ -63,10 +65,10 @@ one obvious surface) stays mechanical.
 
 ```
 el-ballista/
-├── Cargo.toml                  # single crate; exact pins, see §1 version policy
+├── Cargo.toml                  # single crate; see §1 version policy
 ├── src/
 │   ├── lib.rs                  # pub mod checkpoint, config, connector, errors, logging, pushdown,
-│   │                           # telemetry, types
+│   │                           # run_report, telemetry, types
 │   ├── main.rs                 # `el-ballista` binary: bin-only `cli/` + `demo.rs`, everything else from the lib
 │   ├── config/                 # strict JSON job spec (deny_unknown_fields), JobConfig + blocks
 │   ├── types/                  # TableMetadata / ColumnMetadata, JobId newtype, ParallelStrategy
@@ -74,14 +76,15 @@ el-ballista/
 │   │                           # fingerprint, per-job lock (heartbeat + TTL), progress file
 │   ├── run_report.rs           # one JSON record per run (runs/<job>/<run_id>.json)
 │   ├── pushdown/               # connector-agnostic: Predicate IR (ir), Expr→IR translation with
-│   │                           # fidelity (translate), policy, cost_model, SqlDialect trait,
-│   │                           # backend-neutral stats / explain types
+│   │                           # fidelity (translate), policy, SqlDialect trait; crate-private
+│   │                           # cost_model and backend-neutral stats / explain types
 │   ├── connector/
 │   │   ├── mod.rs              # the Source SPI contract (see below)
 │   │   ├── errors.rs           # ExtractorError
 │   │   ├── query_tag.rs        # leading SQL comment tag (pipeline, run_id, query_id) on every query
 │   │   ├── postgres/           # everything Postgres-specific:
-│   │   │   ├── api.rs          #   PostgresConnector builder API (collect/stream/run/run_with)
+│   │   │   ├── api.rs          #   PostgresConnector: builder (collect/stream/run/run_with),
+│   │   │   │                   #   filter_exprs / explain_filters / preview
 │   │   │   ├── pipeline/       #   job pipeline: filters, splits, run (checkpointed run_with)
 │   │   │   ├── engine/         #   ExtractContext: DataFusion session + DataFrame builder
 │   │   │   ├── distributed/    #   Ballista plan/table codecs, connection descriptor, pool
@@ -93,11 +96,11 @@ el-ballista/
 │   │   │   └── dialect.rs, param_sink.rs, inline_sql.rs, stats.rs, explain.rs
 │   │   └── mysql/              # prototype: dialect, error, schema_reader, type_mapper,
 │   │                           # row_adapter, extractor, query_builder
-│   ├── cli/                    # (bin) run, distribute, plan, checkpoint show|reset, scheduler,
-│   │                           # worker, demo
+│   ├── cli/                    # (bin) run, distribute, plan, checkpoint show|reset, runs list|show,
+│   │                           # scheduler, worker, demo
 │   ├── demo.rs                 # (bin) `el-ballista demo` walkthrough
 │   ├── telemetry.rs            # metric names + recording helpers (`metrics` facade, see §7)
-│   ├── logging.rs              # `log` + fern setup (stderr + optional file)
+│   ├── logging.rs              # tracing-subscriber setup (stderr + optional file)
 │   └── errors.rs               # AppError (typed variants, #[source] kept)
 ├── benchmark/                  # Rust vs PySpark load benchmark (benchmark/README.md)
 ├── docs/
@@ -105,9 +108,11 @@ el-ballista/
 └── tests/                      # integration suites + fixtures (docs/testing-plan.md)
 ```
 
-There are no crate-root re-exports of the Postgres modules: import
-`el_ballista::connector::postgres::{PostgresConnector, pipeline, engine,
-distributed, …}` directly.
+There are no crate-root re-exports of the Postgres modules. The public surface of
+`el_ballista::connector::postgres` is `PostgresConnector`, `register_table`,
+`PostgresTableProvider` (`from_config`), `ExtractContext`, `SplitInfo` / `RunOutcome` /
+`FilterDecision` / `parse_filter_expr`, `close_pools()` and `distributed::DistributedContext`;
+scans, decoding, the pipeline, the engine internals and the pushdown dialect are crate-private.
 
 The Source SPI contract lives in `src/connector/mod.rs`: every backend answers four questions
 without the rest of the system knowing which database it is:
@@ -125,7 +130,8 @@ analogous registry over its own pool type following the same pattern.
 Push/keep decisions are made in `PostgresTableProvider::supports_filters_pushdown`, which
 decides the whole filter set at once (`decide_all`): each filter is judged with the others as
 siblings, so the two sides of a range window share one estimate. `explain_decisions` returns
-the same decisions with their reasons (what `el-ballista plan` prints). Pushed filters are rendered with
+the same decisions with their reasons (behind `PostgresConnector::explain_filters`, what
+`el-ballista plan` prints). Pushed filters are rendered with
 `COLLATE "C"` for text and bound parameters for every literal (see [pushdown](pushdown.md)).
 
 ---
@@ -146,7 +152,8 @@ the same decisions with their reasons (what `el-ballista plan` prints). Pushed f
         │                   estimated together as a window
         ▼
   (4) Physical plan         PostgresExecutionPlan: one source query per partition
-        │                   (DECLARE … CURSOR + FETCH, or binary COPY when no bound params)
+        │                   (DECLARE … CURSOR + FETCH, or binary COPY with
+        │                   execution.use_copy and no pushed filter)
         ▼
   (5) Terminal              collect()  — materializes every batch; no checkpoint
         │                   stream()   — one bounded stream over all splits; no checkpoint
@@ -154,10 +161,16 @@ the same decisions with their reasons (what `el-ballista plan` prints). Pushed f
         │                   run_with(consumer) — the operational, checkpointed job:
         ▼
   (6) run_with              take the per-job lock (O_EXCL file + heartbeat, lock_ttl_secs);
+        │                   every later split-state write first re-reads the lock file
+        │                   (ensure_held) and stops if the lock was taken over;
         │                   write the run report stub (runs/<job>/<run_id>.json, `running`);
         │                   begin(plan): new → all splits Pending with their bounds;
         │                              same plan fingerprint → Completed kept, rest Pending;
         │                              different plan → CheckpointError::PlanMismatch
+        │                   (fingerprint: source host:port/database, table, schema,
+        │                   projection, filters, strategy, partitions, partition column,
+        │                   execution mode; resumed splits must match the stored bounds,
+        │                   else SplitPlanMismatch)
         ▼
   (7) Per pending split     mark Running → consumer(split, stream) → consumer returns Ok
         │                   having drained the stream → mark Completed (rows delivered);
@@ -193,9 +206,10 @@ Each partition's scan is one snapshot: a `DECLARE … CURSOR WITHOUT HOLD` insid
 at the server's default isolation (READ COMMITTED) — every `FETCH` of that cursor reads the
 snapshot taken at `DECLARE` — or one `COPY` statement. Different partitions are different
 statements on different connections, so they are **not mutually consistent**: a row updated
-between two partitions' snapshots can be missed or seen twice if the update moves its partition
-key across a bound. No cross-partition snapshot (exported snapshot) is used or claimed. Each
-open partition holds back vacuum's `xmin` horizon while it runs.
+between two partitions' snapshots can be missed or seen twice if the update moves it across a
+bound — under keyset by changing its partition key, under `ctid` by any non-HOT update that
+writes the new row version to another page. No cross-partition snapshot (exported snapshot) is
+used or claimed. Each open partition holds back vacuum's `xmin` horizon while it runs.
 
 ### Worked example
 
@@ -216,7 +230,7 @@ against the demo database (dvdrental `public.payment`, 14,596 rows; see
 ```
 
 `el-ballista plan --config examples/configs/pushdown_showcase.json` prints each filter's decision with
-its reason:
+its reason, then previews at most `--limit` rows (default 20):
 
 ```
 policy: cost_based
@@ -283,6 +297,9 @@ are errors, not silent coercions. That includes values representable in the sour
 Arrow: Postgres `timestamp`/`date` `±infinity`, numeric `NaN`/`±Infinity`, and numeric digits
 beyond the column's `Decimal128` precision/scale fail the scan with
 `ExtractorError::UnsupportedValue` naming the column — never a silent null or truncation.
+A column with no Arrow mapping (`tsvector`, `interval`, …) is left out of the provider when the
+job's `columns` omits it; with `columns` unset, or naming it, it is an `UnsupportedType` error
+naming the column.
 
 **Batch sizing.** The connector produces batches of at most `execution.batch_size` rows
 (default 8192) and flushes early at `execution.max_batch_bytes` (default 16 MiB) so wide rows
@@ -302,8 +319,10 @@ distinct knobs that are easy to conflate:
 - **Source partitions** — how many concurrent queries hit the database. Bounded by connection pool
   size (`pool_max`, divided per worker in distributed mode) and, more importantly, by what the
   source can absorb without hurting production.
-- **DataFusion target partitions** — CPU parallelism for Arrow operators. Currently left at
-  DataFusion defaults (never explicitly configured).
+- **DataFusion target partitions** — CPU parallelism for Arrow operators. The standalone
+  pipeline sets one target partition per split (round-robin repartitioning off), distributed
+  sets `target_partitions = workers`; `register_table` / `ExtractContext` leave DataFusion's
+  defaults.
 - **Consumer concurrency** — `run_with` calls the consumer for up to
   `execution.concurrent_partitions` splits at a time (default: the whole pool size, `pool_max`; an explicit value is capped at it). What the consumer does
   with the batches (write Parquet, upload, …) is the caller's code; examples write one local
@@ -317,11 +336,11 @@ stream stops the source: the cursor is closed and its transaction rolled back, a
 `COPY` is cancelled.
 
 Not every entry point streams. Bounded-memory: the builders' `stream()` and `run_with()`,
-DataFusion's `execute_stream()` over the provider, and the extractor's `*_for_each_batch`
-methods. **Materializing (whole result in memory):** the builders' `collect()`, the
-`ExtractContext` DataFrame `collect()`, `PostgresExtractor::extract_full_table` /
-`extract_keyset_partition` (one concatenated batch — meant for tests and small tables), and
-the MySQL prototype's `extract_full_table`. Use them only when the result fits in memory.
+DataFusion's `execute_stream()` over the provider, `DistributedContext::stream_sql`, and the
+MySQL prototype's `*_for_each_batch` methods. **Materializing (whole result in memory):** the
+builders' `collect()`, the `ExtractContext` DataFrame `collect()`,
+`DistributedContext::collect_sql`, and the MySQL prototype's `extract_full_table`. Use them only
+when the result fits in memory.
 
 DataFusion's `MemoryPool` is not currently configured (no `FairSpillPool`, no `RuntimeEnv`
 tuning) — spills are unbounded by default. Likewise there is no per-connector cap on in-flight
@@ -337,8 +356,10 @@ runtime with one thread per visible CPU and the whole `pool_max` for the one pro
 
 - **Connection budget.** Each process resolves a `SourceDescriptor` to its `pool_max / workers`
   share of source connections through a process-wide pool registry, so a three-worker
-  deployment shows the source the same connection count as one machine. The planning client
-  uses the same per-process share for metadata queries.
+  deployment keeps the workers together within `pool_max` (more `workers` than `pool_max` is
+  refused). The planning client opens its own `pool_max / workers` share on top, for metadata,
+  statistics and partition-bound queries; the scheduler opens none and never connects to the
+  source.
 - **Scan limiter.** Within a process, one permit per budgeted connection
   (`SourcePoolRegistry::scan_slots`) makes partition scans beyond the budget *wait* —
   cancellably, without the pool's acquire timeout — instead of failing. Standalone runs use the
@@ -347,10 +368,13 @@ runtime with one thread per visible CPU and the whole `pool_max` for the one pro
   registered executors through the scheduler's REST API (`GET /api/executors`). More executors
   than `workers` is refused (the source would exceed `pool_max`); fewer executors, or more task
   slots than connections, only warns; an unreachable or disabled REST API means "not verified"
-  (warning).
+  (warning), and then `distributed.job_timeout_secs` must be set or the run is refused, because
+  the job watchdog could not see a worker die either.
 - **Plan serializability.** The scan plan travels as JSON behind a magic prefix, decoded by
-  per-process extension codecs. New code must keep physical plan nodes serializable and never
-  smuggle non-serializable state (pools, passwords) into `ExecutionPlan` implementations.
+  per-process extension codecs. Scan partitions travel as typed bounds (`PartitionKind` +
+  integers), never SQL text; the predicate is re-rendered on decode. New code must keep
+  physical plan nodes serializable and never smuggle non-serializable state (pools,
+  passwords) into `ExecutionPlan` implementations.
 - **Watchdog.** Ballista 54 never re-offers the tasks of a worker that died, so the job would
   stay "Running" forever. The client cancels and re-submits such a job, up to
   `distributed.max_retries` times, as long as it has not delivered rows yet.
@@ -409,7 +433,8 @@ The full spec, with every field and its default, is in [running](running.md#job-
 Points that shape the design:
 
 - `password_env` names the environment variable holding the password (resolved in whichever
-  process opens the pool — scheduler, worker, and client each resolve it independently).
+  process opens the pool — the client and every worker each resolve it independently; the
+  scheduler never connects to the source and needs no password).
   There is no `dsn_env` and no `[sources.*]` catalog.
 - Checkpoints are local-directory JSON split-state only (`JsonCheckpointStore` — one file
   per job recording per-split `Pending`/`Running`/`Completed`/`Failed`, the plan fingerprint and
@@ -430,11 +455,15 @@ Points that shape the design:
 
 ## 7. Observability
 
-Logging is the `log` crate (a `fern` backend in the binary writing to stderr plus an
-optional file, level from `--log-level`/`RUST_LOG`, file from `--log-file`/`EL_BALLISTA_LOG_FILE`) —
-one line per job, split, partition scan, and checkpoint commit, with every generated SQL query
-and one line per Arrow batch (`split=`, `rows=`, `batch_bytes=`) at `debug` level. There is no
-`tracing` and no spans.
+Logging is `tracing`: events with fields inside spans that carry their context — `run`
+(`job_id`, `run_id`) › `split` (`split_id`) › `scan` (`partition`, `query_id`, the id in the
+query's SQL comment tag). `info` is a few lines per run (run started and finished, each split
+completed); `debug` adds every generated SQL statement, partition planning and one line per
+Arrow batch; `trace` adds sqlx's own per-statement lines (each cursor `FETCH`). A split failure
+is logged once, at `error`, by the run driver. The library never installs a subscriber: the
+binary and the examples install `tracing-subscriber` through `logging.rs` (stderr plus an
+optional file; filter from `--log-level`/`RUST_LOG`, file from
+`--log-file`/`EL_BALLISTA_LOG_FILE`), which also carries dependencies' `log` records.
 
 **Run reports** (`<checkpoint.dir>/runs/<job>/<run_id>.json`, see §3) give a durable,
 per-run record that a scheduler or a person can read after the fact (`el-ballista runs list|show`).

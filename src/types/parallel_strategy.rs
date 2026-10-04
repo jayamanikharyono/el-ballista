@@ -22,10 +22,13 @@ pub enum ParallelStrategy {
     None,
     /// Partition by primary key ranges using keyset predicates.
     Keyset,
-    /// Partition by physical tuple ID ranges. No partition column needed; concurrent
-    /// VACUUM can move tuples between pages, so prefer keyset for hot tables. Exported
-    /// snapshots for cross-connection consistency remain deferred
-    /// (see `connector::postgres::parallel`).
+    /// Partition by physical page ranges (`ctid`); no partition column needed. Each partition
+    /// reads its own snapshot, and an `UPDATE` that writes the new row version to another page
+    /// (any update that is not HOT) moves the row into another partition's range, so under
+    /// concurrent updates a row can be read twice or missed (`VACUUM FULL` / `CLUSTER`, which
+    /// rewrite every page, between partitions do the same). Prefer keyset for tables that
+    /// change during the scan. Exported snapshots for cross-connection consistency are not
+    /// implemented (see `connector::postgres::parallel`).
     Ctid,
 }
 

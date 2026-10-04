@@ -43,7 +43,7 @@ use std::future::Future;
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 
-use super::pipeline::{DistributedTarget, Pipeline, RunOutcome, SplitInfo};
+use super::pipeline::{DistributedTarget, FilterDecision, Pipeline, RunOutcome, SplitInfo};
 use crate::config::JobConfig;
 use crate::errors::{AppError, ConsumerError};
 
@@ -107,22 +107,54 @@ impl PostgresConnector {
         self.pipeline.config()
     }
 
-    /// The underlying pipeline — programmatic access to the job's parsed filters
-    /// ([`Pipeline::filter_exprs`]), the per-filter pushdown preview
-    /// ([`Pipeline::explain_filters`]) and a limited row preview ([`Pipeline::preview`]).
+    /// The job's filters as DataFusion expressions (config `filters`: each entry ANDed, an
+    /// inner list ORed), exactly as every run applies them.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// for expr in connector.filter_exprs()? {
+    ///     println!("{expr}");
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn filter_exprs(&self) -> Result<Vec<datafusion::logical_expr::Expr>, AppError> {
+        self.pipeline.filter_exprs()
+    }
+
+    /// Each filter's pushdown decision (pushed to the source, or kept in Arrow, and why),
+    /// decided by the same provider and schema-coerced predicates a run uses — what
+    /// `el-ballista plan` prints.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
     /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
-    /// for decision in connector.pipeline().explain_filters().await? {
+    /// for decision in connector.explain_filters().await? {
     ///     println!("{} -> pushed={}", decision.filter, decision.pushed_to_source);
     /// }
     /// # Ok(()) }
     /// ```
-    pub fn pipeline(&self) -> &Pipeline {
-        &self.pipeline
+    pub async fn explain_filters(&self) -> Result<Vec<FilterDecision>, AppError> {
+        self.pipeline.explain_filters().await
+    }
+
+    /// A DataFrame over the job's table with its filters, projection and `LIMIT limit`:
+    /// unsplit, checkpoint-free, for looking at a few rows before a run.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
+    /// # let connector = el_ballista::connector::postgres::PostgresConnector::from_config_file("job.json")?;
+    /// connector.preview(20).await?.show().await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn preview(&self, limit: usize) -> Result<datafusion::prelude::DataFrame, AppError> {
+        self.pipeline.preview(limit).await
     }
 
     /// Begin an extraction; pick the target with [`ExtractBuilder::standalone`] or
@@ -323,8 +355,7 @@ pub struct DistributedExtraction<'a> {
 
 impl DistributedExtraction<'_> {
     /// Connect to this Ballista scheduler endpoint instead of the default. The registered
-    /// executors are checked against the source budget (see
-    /// [`crate::connector::postgres::distributed::executors`]).
+    /// executors are checked against the source budget through the scheduler's REST API.
     ///
     /// # Examples
     ///
@@ -346,7 +377,8 @@ impl DistributedExtraction<'_> {
     }
 
     /// Override the worker count (defaults to the config's `distributed.workers`). The
-    /// source budget `pool_max` is split across this many executing processes.
+    /// source budget `pool_max` is split across this many executing processes; more workers
+    /// than `pool_max` fails the run before it starts.
     ///
     /// # Examples
     ///

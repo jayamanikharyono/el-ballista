@@ -19,13 +19,6 @@ pub enum AccessMethod {
 
 impl AccessMethod {
     /// Whether this access method uses an index.
-    ///
-    /// # Examples
-    /// ```
-    /// use el_ballista::pushdown::explain::AccessMethod;
-    /// assert!(AccessMethod::IndexScan.is_indexed());
-    /// assert!(!AccessMethod::SequentialScan.is_indexed());
-    /// ```
     pub fn is_indexed(&self) -> bool {
         matches!(
             self,

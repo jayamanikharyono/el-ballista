@@ -4,11 +4,11 @@
 //! - [`translate`] / [`translate_with`]: the allowlist-based `Expr` → [`Predicate`] translator
 //!   (§2), deciding fidelity per node from engine-neutral [`ColumnKind`]s (§3);
 //! - [`Predicate::render_to`]: rendering through a [`dialect::SqlDialect`] into a [`SqlSink`];
-//! - [`cost_model`] and the policy modes (§4.3) in [`decide_translated`].
+//! - the cost model and the policy modes (§4.3), crate-internal.
 //!
 //! Nothing in this module is backend-specific. Each connector supplies its dialect, its
-//! column-kind classification, its statistics ([`stats::TableStatsSource`]) and, optionally,
-//! plan estimates ([`explain::ExplainEstimate`]); the Postgres pieces live under
+//! column-kind classification, its statistics (`stats::TableStatsSource`) and, optionally,
+//! plan estimates (`explain::ExplainEstimate`); the Postgres pieces live under
 //! `connector::postgres` (`dialect`, `param_sink`, `inline_sql`, `stats`, `explain`).
 //!
 //! The guiding rule: docs/roadmap.md names "pushdown that is fast and wrong" as the fatal
@@ -18,19 +18,18 @@
 //! Still deferred: per-predicate hints, `IN`/`BETWEEN`/`LIKE`/arithmetic translation, and
 //! aggregate/join pushdown.
 
-pub mod cost_model;
+pub(crate) mod cost_model;
 pub mod dialect;
-pub mod explain;
+pub(crate) mod explain;
 mod ir;
 mod policy;
-pub mod stats;
+pub(crate) mod stats;
 mod translate;
 
-pub use cost_model::CostInputs;
+pub(crate) use cost_model::CostInputs;
 pub use ir::{CastType, CmpOp, Collation, Literal, Predicate, SqlParam, SqlSink};
-pub use policy::{
-    Decision, PushdownPolicy, UnknownPushdownPolicy, decide_explained, decide_translated,
-};
+pub(crate) use policy::decide_explained;
+pub use policy::{Decision, PushdownPolicy, UnknownPushdownPolicy};
 pub use translate::{ColumnKind, ColumnKinds, translate, translate_with};
 
 /// How faithfully a pushed predicate reproduces Arrow semantics — docs/pushdown.md §1.

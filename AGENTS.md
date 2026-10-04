@@ -57,7 +57,7 @@ A change is **not done** unless it is correct from **all three** at once:
 - **Config vs code:** `batch_size`, partitions, `pool_max` live in `ExecutionConfig` / `SourceConfig` / `ParallelScanConfig` and are validated (`batch_size > 0`).
 - **Dependencies:** `arrow` + `datafusion` + `tokio` cover the pipeline. Do not add `polars` / `rayon` unless it replaces a hand-written `RecordBatch` loop.
 - **Capability boundaries:** DB-specific semantics (collation, `NULL` ordering, timestamp precision) belong in the connector. No scattered `if postgres {}` in generic code.
-- **Isolation semantics:** state the transaction/isolation assumption for extraction under concurrent writes (see the `connector::postgres::extractor` module docs); never imply a snapshot that is not taken.
+- **Isolation semantics:** state the transaction/isolation assumption for extraction under concurrent writes (see the module docs of `src/connector/postgres/extractor.rs`); never imply a snapshot that is not taken.
 
 ## 2. Arrow / Streaming / Schema — Data Contract
 
@@ -72,14 +72,14 @@ Arrow `RecordBatch` is the contract. Preserve schema, types, nullability, column
 **Use DataFusion, don't reimplement it:** `SessionContext` + `TableProvider` / `ExecutionPlan` + `DataFrame`. Filter/project/aggregate/join/window are DataFusion's job. Wrap a `TableProvider`, not `SessionContext` internals.
 
 **DataFusion (54.1.0):**
-- **Construction:** register `PostgresTableProvider` (or `connector::postgres::register_table(&ctx, &config)`), then `ctx.sql()` / `ctx.table()`. Do not build `LogicalPlan`s by hand. Reuse the `SessionContext`.
+- **Construction:** register `PostgresTableProvider::from_config(&config)` (or `connector::postgres::register_table(&ctx, &config)`), then `ctx.sql()` / `ctx.table()`. Do not build `LogicalPlan`s by hand. Reuse the `SessionContext`.
 - **Types:** the provider's schema must match the emitted batches exactly, nullability and timezone included.
 - **Streaming:** `DataFrame::collect()` materializes; prefer `execute_stream()`. Set `target_partitions` / `batch_size` explicitly when changing them.
 - **Pushdown — correctness over performance:** push a filter only when the source returns exactly what Arrow would (null / type / collation / ordering semantics). `Exact` = the provider guarantees the result and DataFusion drops the filter; `Inexact` = the source pre-filters and DataFusion re-checks. The provider decides the whole filter set (`supports_filters_pushdown` → `decide_all`). Never push `ORDER BY` / `LIMIT` without a stable sort.
 - **Physical plan:** `TableProvider::scan` returns a `PostgresExecutionPlan`; its streams are `Send` and report correct partitioning.
 - **Expr / SQL:** prefer `col(..).gt(lit(..))` builders; parse SQL only through `SessionContext::sql`. Keep `ScalarValue::Utf8` NULL and `""` distinct. Log `LogicalPlan::display_indent()` for debugging, never row data.
 
-**Ballista:** `DistributedContext` (`connector::postgres::distributed`) holds a `SessionContext` connected to a remote scheduler. Keep Ballista out of engine-agnostic code. Assume tasks can retry or duplicate: design for idempotence or document the real guarantee. **Never claim exactly-once unless proven.** Bump DataFusion, Ballista and Arrow together and verify compatibility.
+**Ballista:** `DistributedContext` (`connector::postgres::distributed`) holds a private `SessionContext` connected to a remote scheduler; queries run only through `stream_sql` / `collect_sql` (under the watchdog), `explain_sql` only plans. Keep Ballista out of engine-agnostic code. Assume tasks can retry or duplicate: design for idempotence or document the real guarantee. **Never claim exactly-once unless proven.** Bump DataFusion, Ballista and Arrow together and verify compatibility.
 
 ## 4. Database — Correctness First
 
@@ -123,7 +123,18 @@ Assume the table mutates during extraction (concurrent writes, deletes, non-mono
 
 **Dependencies:** check whether an existing crate solves it; mind DataFusion/Ballista/Arrow/sqlx version coupling. Do not bump DataFusion/Ballista/Arrow casually: verify build, tests, examples and APIs.
 
-**Observability:** log source, operation, query context, batch size, rows, duration, partition/task. **Never** passwords, connection strings, tokens or row data.
+**Logging (`tracing`):** logging only. No OpenTelemetry, exporters or metrics backends.
+- **Events with fields, spans for context:** `info!(rows, bytes, elapsed_ms, "split completed")`, not values formatted into the message. Context comes from spans: `run` (`job_id`, `run_id`), `split` (`split_id`), `scan` (`partition`, `query_id`). Tasks spawned for a scan are `.instrument(span)`-ed so their lines keep that context.
+- **The library only emits:** it never installs a subscriber. Binaries and examples set one up through `src/logging.rs` (`RUST_LOG` / `--log-level`, stderr, optional `--log-file`).
+- **Levels:**
+  - `error`: a run or split failed.
+  - `warn`: degraded but continuing (COPY → cursor fallback, missing statistics, stale-lock takeover, retry).
+  - `info`: lifecycle, a few lines per run (run start and finish, split done).
+  - `debug`: generated SQL, pushdown decisions, one line per batch.
+  - `trace`: per-`FETCH` detail.
+- **Fields:** log source, operation, query context, batch size, rows, duration and partition/task, under stable names and units: `job_id`, `run_id`, `split_id`, `query_id`, `rows`, `bytes`, `elapsed_ms`. `run_id` and `query_id` are the ids in the SQL comment tag and the run report, so logs, `pg_stat_activity` and reports line up. Never log per row. **Never** log passwords, connection strings, tokens or row data.
+- **Errors are logged once, where they are handled** (the run driver or the CLI), with the full chain (`error_chain`). Lower layers return the error instead of also logging it.
+- **Migration:** done. All crate code emits through `tracing`; the `log` crate remains only for the level type sqlx's statement logging takes (`log_statements` / `log_slow_statements`). Add no `log::` calls.
 
 **Documentation:** describe what the code actually does. Do not claim `exactly-once / zero-copy / snapshot / unlimited scale / production-ready` unless proven. Mark experimental as experimental.
 
@@ -136,12 +147,12 @@ Assume the table mutates during extraction (concurrent writes, deletes, non-mono
 | | **Standalone** | **Distributed** |
 |---|---|---|
 | Engine | DataFusion only — a plain `SessionContext`, no Ballista | DataFusion planned by the client, executed by Ballista |
-| Entry point | `PostgresConnector::…extract().standalone()`, or `connector::postgres::register_table(&ctx, &config)` into your own `SessionContext` | `…extract().distributed()` (`.scheduler(url)`, `.workers(n)`), or `DistributedContext::remote(&config, url, workers)` + `register_source` |
+| Entry point | `PostgresConnector::…extract().standalone()`, or `connector::postgres::register_table(&ctx, &config)` into your own `SessionContext` | `…extract().distributed()` (`.scheduler(url)`, `.workers(n)`), or `DistributedContext::remote(&config, url, workers)` + `register_source`, queried only through `stream_sql` / `collect_sql` (`explain_sql` only plans) |
 | Processes | 1 (the caller's) | client + 1 `el-ballista scheduler` + `workers` × `el-ballista worker` |
-| Required components | none beyond the calling process | a running `el-ballista scheduler` (push-based scheduling, the default); exactly `distributed.workers` running `el-ballista worker` processes — **this crate's binary**, since stock Ballista executors cannot decode the Postgres scan plans; network paths client → scheduler, scheduler ↔ workers, client and workers → source database; the `source.password_env` variable set in **every worker's** environment |
-| Optional | — | the scheduler REST API (on in `el-ballista scheduler`): verifies the executor count against the budget (unreachable = warning, more executors than `workers` = error) and feeds the job watchdog (without it only `distributed.job_timeout_secs` can catch a hang) |
+| Required components | none beyond the calling process | a running `el-ballista scheduler` (push-based scheduling, the default); exactly `distributed.workers` running `el-ballista worker` processes — **this crate's binary**, since stock Ballista executors cannot decode the Postgres scan plans; network paths client → scheduler, scheduler ↔ workers, client and workers → source database; the `source.password_env` variable set in the client's and **every worker's** environment (the scheduler plans from partition bounds the client computed and never connects to the source); **either** the scheduler REST API (on in `el-ballista scheduler`, at a plain `http://` URL) **or** `distributed.job_timeout_secs` — with neither, nothing could detect a lost worker, so the run is refused |
+| Optional | — | the scheduler REST API, once `distributed.job_timeout_secs` is set: it verifies the executor count against the budget (unreachable = warning, more executors than `workers` = error) and lets the watchdog catch a lost worker before the job timeout |
 | Failure handling | a failed split is recorded; `run_with` re-runs it on the next call | job watchdog: a worker that stops heartbeating (`distributed.executor_timeout_secs`, default 30) or is dropped, or `job_timeout_secs`, marks the job hung; it is cancelled and re-run up to `distributed.max_retries` (default 2), then `DistributedJobAborted`. Workers heartbeat every `--heartbeat-secs` (5); the scheduler drops them after `--executor-timeout-secs` (30) |
-| Source connections | the whole `pool_max` for the one process (planning included) | `pool_max / workers` per executor process, plus the client's planning pool |
+| Source connections | the whole `pool_max` for the one process (planning included) | `pool_max / workers` per executor process (more `workers` than `pool_max` is refused), plus the client's planning pool |
 | Parallelism | DataFusion runs the keyset partitions concurrently on one Tokio runtime (one thread per visible CPU); at most `execution.concurrent_partitions` (default `pool_max`) query the source at once | executor task slots (`el-ballista worker --concurrent-tasks`, default: visible CPUs); at most `pool_max / workers` scans per worker query the source |
 | Checkpoint splits (`run_with`) | one per keyset partition | the whole distributed scan is one split |
 | Benchmark label | `el-ballista-standalone` | `el-ballista-distributed` |
@@ -157,7 +168,7 @@ Rules:
 **Postgres connector modularization (MANDATORY):** all PostgreSQL-specific code lives under `src/connector/postgres/`, so the rest of the crate stays connector-agnostic.
 - New Postgres code (SQL building, cursors, type mapping, pushdown dialect/EXPLAIN, distributed execution, the extraction pipeline) goes under `src/connector/postgres/`, never at the crate root or in a sibling top-level module.
 - **What is extracted is data, never hand-written SQL:** table, filters and projection come from the job config (`table`, structured `filters`, `columns`) or the same fields on `JobConfig` — never from a caller-built SQL string (no `SELECT … WHERE` in examples, benchmark harnesses or extraction tools). SQL over *already extracted* data (`ExtractContext::sql`, DataFusion queries on the result) is processing and stays allowed.
-- Callers use the connector entry point, not its internals: `connector::postgres::PostgresConnector::from_config(cfg)?.extract()`, then `.standalone()` or `.distributed()`, finishing with `.run_with(consumer)` (the checkpointed job: a split is marked completed only after the consumer returns `Ok`), `.stream()` (bounded-memory batches, no checkpoints), `.collect()` (materializes every batch) or `.run()` (count-only diagnostic, never touches checkpoints). Do not reach into `pipeline`, `distributed`, `engine` or `extractor` from outside the connector; there are no crate-root re-exports of them.
+- Callers use the connector entry point, not its internals: `connector::postgres::PostgresConnector::from_config(cfg)?.extract()`, then `.standalone()` or `.distributed()`, finishing with `.run_with(consumer)` (the checkpointed job: a split is marked completed only after the consumer returns `Ok`), `.stream()` (bounded-memory batches, no checkpoints), `.collect()` (materializes every batch) or `.run()` (count-only diagnostic, never touches checkpoints). The public surface is `PostgresConnector` (`from_config` / `from_config_file`, `extract`, `filter_exprs`, `explain_filters`, `preview`), `register_table`, `PostgresTableProvider::from_config`, `ExtractContext`, `distributed::DistributedContext`, `SplitInfo` / `RunOutcome` / `FilterDecision` / `parse_filter_expr` and `close_pools()`; everything else (`pipeline`, `engine`, `extractor`, the rest of `distributed`) is `pub(crate)` (only the Ballista codecs are `pub`, `#[doc(hidden)]`, for the CLI), with no crate-root re-exports. `connector::postgres::internals` (`#[doc(hidden)]`) exists only for this crate's live-DB tests.
 - Standalone vs distributed is one builder-selected path, not two parallel APIs. `.distributed()` defaults to the config's `distributed.scheduler_url`, or `DEFAULT_SCHEDULER_URL` (`http://localhost:50050`) when empty; `.scheduler(url)` / `.workers(n)` override it.
 - `src/pushdown` holds only engine-agnostic pushdown infrastructure (the `SqlDialect` trait, `Predicate` IR, translation, policy, cost model). Postgres specifics (dialect/column kinds, parameter sink, EXPLAIN, statistics) live under `src/connector/postgres/`; a new backend adds its own dialect under its connector.
 
@@ -192,7 +203,7 @@ A differential test compares row sets, e.g. the sorted ids from a context regist
 - **DataFusion:** schema preservation, projection/predicate pushdown, counts — *differential*
 - **Distributed:** multiple partitions, worker loss, retry, serialization — *metamorphic (1 vs 3 workers) + reference*
 
-**Hostile fixture:** DB tests use `tests/data/hostile.sql` (NULL in every nullable column, `''` vs NULL, INT MIN/MAX, `1.0` vs `1.00` decimals, 1970/2038/9999 timestamps, `bytea` `0x00`/`0xFF`, `text[]` with NULL elements, a 5-row timestamp tie). `TestDb` (`tests/common/postgres.rs`) loads it into a private schema `test_<pid>_<n>` on the compose Postgres and drops the schema afterwards. Never `TRUNCATE` a shared table.
+**Hostile fixture:** DB tests use `tests/data/hostile.sql` (NULL in every nullable column except `name`, `''` vs NULL, INT4/INT8 MIN/MAX, `numeric(12,2)` / `numeric(30,15)` values (`1.00`, `1.5`), NaN/±Infinity floats, 1970/2038/9999 timestamps, `bytea` `0x00`/`0xFF`, `text[]` with NULL elements, a 5-row timestamp tie). `TestDb` (`tests/common/postgres.rs`) loads it into a private schema `test_<pid>_<n>` on the compose Postgres and drops the schema afterwards. Never `TRUNCATE` a shared table.
 
 Postgres is the primary live database for SQL/type/transaction/index behavior. Do not put Postgres-specific logic in a generic abstraction unless that abstraction *is* Postgres.
 

@@ -9,7 +9,9 @@
 //! `heartbeat_at` that a background task refreshes every `ttl / 4`. A lock whose heartbeat is
 //! older than `ttl` — or whose owner is a dead process on this same host (Linux) — was left by
 //! a crashed run and may be taken over (logged as a warning). A holder that finds its lock
-//! taken over marks itself lost (`JobLock::ensure_held` then fails), so it stops committing.
+//! taken over marks itself lost, so it stops committing: `JobLock::ensure_held`, checked
+//! before every split-state write, re-reads the lock file rather than waiting for the next
+//! heartbeat.
 //!
 //! [`JobLock`] is an RAII guard: [`JobLock::release`] removes the file; dropping the guard
 //! without releasing (panic, cancellation) stops the heartbeat and removes the file
@@ -22,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tracing::{Instrument, debug, warn};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -185,10 +188,7 @@ impl JobLock {
                 heartbeat_at: now,
             };
             if write_new(&path, &info).await? {
-                log::info!(
-                    "job '{job_id}': acquired run lock {} (owner {owner_id})",
-                    path.display()
-                );
+                debug!(job_id = %job_id, path = %path.display(), owner = %owner_id, "run lock acquired");
                 return Ok(Self::start(job_id.clone(), path, owner_id, ttl));
             }
 
@@ -197,10 +197,7 @@ impl JobLock {
             let Some(existing) = existing else {
                 // Vanished (released) or not fully written yet.
                 if mtime_age(&path).await.is_some_and(|age| age > ttl) {
-                    log::warn!(
-                        "job '{job_id}': removing unreadable stale lock {}",
-                        path.display()
-                    );
+                    warn!(job_id = %job_id, path = %path.display(), "removing an unreadable stale run lock");
                     let _ = tokio::fs::remove_file(&path).await;
                 } else {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -219,12 +216,14 @@ impl JobLock {
                     }),
                 });
             };
-            log::warn!(
-                "job '{job_id}': taking over stale run lock {} from owner {} (host {}, pid {}): {reason}",
-                path.display(),
-                existing.owner_id,
-                existing.host,
-                existing.pid
+            warn!(
+                job_id = %job_id,
+                path = %path.display(),
+                owner = %existing.owner_id,
+                host = %existing.host,
+                pid = existing.pid,
+                reason = %reason,
+                "taking over a stale run lock"
             );
             // Move the stale file aside (atomic), then verify it is the one we judged stale:
             // if another process took it over in between, we moved its fresh lock and must
@@ -275,36 +274,42 @@ impl JobLock {
         let hb_owner = owner_id.clone();
         let hb_lost = lost.clone();
         let hb_job = job_id.clone();
-        let heartbeat = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(every);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await; // the first tick fires immediately
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => return,
-                    _ = ticker.tick() => {}
-                }
-                match read_info(&hb_path).await {
-                    Ok(Some(mut info)) if info.owner_id == hb_owner => {
-                        info.heartbeat_at = Utc::now();
-                        if let Err(e) = rewrite(&hb_path, &info).await {
-                            // Retried next tick; if it keeps failing the lock goes stale and
-                            // a takeover is detected below.
-                            log::warn!("job '{hb_job}': lock heartbeat failed: {e}");
+        let heartbeat = tokio::spawn(
+            async move {
+                let mut ticker = tokio::time::interval(every);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await; // the first tick fires immediately
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => return,
+                        _ = ticker.tick() => {}
+                    }
+                    match read_info(&hb_path).await {
+                        Ok(Some(mut info)) if info.owner_id == hb_owner => {
+                            info.heartbeat_at = Utc::now();
+                            if let Err(e) = rewrite(&hb_path, &info).await {
+                                // Retried next tick; if it keeps failing the lock goes stale and
+                                // a takeover is detected below.
+                                warn!(job_id = %hb_job, error = %e, "lock heartbeat failed");
+                            }
                         }
+                        Ok(_) => {
+                            // The run fails at its next split-state write (`LockLost`), logged
+                            // by the run driver; here the run is only degraded.
+                            warn!(
+                                job_id = %hb_job,
+                                path = %hb_path.display(),
+                                "run lock taken over by another run"
+                            );
+                            hb_lost.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(e) => warn!(job_id = %hb_job, error = %e, "cannot read the run lock"),
                     }
-                    Ok(_) => {
-                        log::error!(
-                            "job '{hb_job}': run lock {} was taken over by another run",
-                            hb_path.display()
-                        );
-                        hb_lost.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                    Err(e) => log::warn!("job '{hb_job}': cannot read run lock: {e}"),
                 }
             }
-        });
+            .instrument(tracing::Span::current()),
+        );
         Self {
             job_id,
             path,
@@ -337,15 +342,22 @@ impl JobLock {
         &self.path
     }
 
-    /// `Err(LockLost)` once another run has taken this lock over.
-    pub(crate) fn ensure_held(&self) -> Result<(), CheckpointError> {
-        if self.lost.load(Ordering::SeqCst) {
-            Err(CheckpointError::LockLost {
-                job_id: self.job_id.to_string(),
-            })
-        } else {
-            Ok(())
+    /// `Err(LockLost)` once another run has taken this lock over. Reads the lock file itself
+    /// rather than trusting only the heartbeat, which notices a takeover up to `ttl / 4` late:
+    /// the run driver calls this before every split-state write, so a run that lost its lock
+    /// does not overwrite the new owner's split states. A missing or unreadable lock counts
+    /// as lost. Not atomic with the write that follows: a takeover in between needs this run
+    /// to stall for a whole `ttl` right there.
+    pub(crate) async fn ensure_held(&self) -> Result<(), CheckpointError> {
+        if !self.lost.load(Ordering::SeqCst) {
+            match read_info(&self.path).await? {
+                Some(info) if info.owner_id == self.owner_id => return Ok(()),
+                _ => self.lost.store(true, Ordering::SeqCst),
+            }
         }
+        Err(CheckpointError::LockLost {
+            job_id: self.job_id.to_string(),
+        })
     }
 
     /// Stop the heartbeat and remove the lock file (only if this run still owns it).
@@ -377,7 +389,7 @@ impl JobLock {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(io_err("remove lock", &self.path, e)),
             }
-            log::info!("job '{}': released run lock", self.job_id);
+            debug!(job_id = %self.job_id, "run lock released");
         }
         Ok(())
     }
@@ -390,7 +402,7 @@ impl JobLock {
             // The task only exits on stop/loss; a join error means it panicked, which only
             // affects liveness of the heartbeat, never lock ownership.
             if let Err(e) = handle.await {
-                log::warn!("job '{}': lock heartbeat task failed: {e}", self.job_id);
+                warn!(job_id = %self.job_id, error = %e, "lock heartbeat task failed");
             }
         }
     }
@@ -469,7 +481,7 @@ mod tests {
             .unwrap();
         let info: LockInfo = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_ne!(info.owner_id, "crashed");
-        lock.ensure_held().unwrap();
+        lock.ensure_held().await.unwrap();
         lock.release().await.unwrap();
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&d);
@@ -516,8 +528,9 @@ mod tests {
         };
         std::fs::write(lock.path(), serde_json::to_vec(&thief).unwrap()).unwrap();
         tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(lock.lost.load(Ordering::SeqCst), "the heartbeat saw it");
         assert!(matches!(
-            lock.ensure_held(),
+            lock.ensure_held().await,
             Err(CheckpointError::LockLost { .. })
         ));
         let path = lock.path().to_path_buf();
@@ -533,6 +546,48 @@ mod tests {
         let path = lock.path().to_path_buf();
         drop(lock);
         assert!(!path.exists(), "dropped guard removes its own lock");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn ensure_held_sees_a_takeover_before_the_next_heartbeat() {
+        // TTL 60 s: the heartbeat ticks every 15 s, so only the file check can notice.
+        let d = dir();
+        let job = JobId::new("j").unwrap();
+        let lock = JobLock::acquire(&d, &job, Duration::from_secs(60))
+            .await
+            .unwrap();
+        lock.ensure_held().await.unwrap();
+
+        let now = Utc::now();
+        let thief = LockInfo {
+            owner_id: "thief".into(),
+            host: "h".into(),
+            pid: 1,
+            acquired_at: now,
+            heartbeat_at: now,
+        };
+        std::fs::write(lock.path(), serde_json::to_vec(&thief).unwrap()).unwrap();
+        assert!(matches!(
+            lock.ensure_held().await,
+            Err(CheckpointError::LockLost { .. })
+        ));
+        // Lost stays lost, even if the file were ours again.
+        assert!(lock.lost.load(Ordering::SeqCst));
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&d);
+
+        // A lock file that vanished (moved aside by a run taking it over) is lost too.
+        let d = dir();
+        let lock = JobLock::acquire(&d, &job, Duration::from_secs(60))
+            .await
+            .unwrap();
+        std::fs::remove_file(lock.path()).unwrap();
+        assert!(matches!(
+            lock.ensure_held().await,
+            Err(CheckpointError::LockLost { .. })
+        ));
+        drop(lock);
         let _ = std::fs::remove_dir_all(&d);
     }
 

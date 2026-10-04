@@ -17,7 +17,8 @@ use crate::errors::AppError;
 
 /// What the extraction layer will do with one caller-provided filter: the parsed
 /// predicate plus the decision whether it executes in the source database.
-/// Returned by [`Pipeline::explain_filters`] — the programmatic form of what
+/// Returned by [`PostgresConnector::explain_filters`](crate::connector::postgres::PostgresConnector::explain_filters)
+/// — the programmatic form of what
 /// `el-ballista plan` prints.
 #[derive(Debug, Clone)]
 pub struct FilterDecision {
@@ -36,33 +37,6 @@ pub struct FilterDecision {
 }
 
 impl Pipeline {
-    /// The job's filters as [`FilterSpec`]s, flattened across OR-groups —
-    /// shorthand strings parsed, structured entries passed through.
-    /// Pure: no I/O, safe to call for validation alone. For the grouped form
-    /// (one entry per AND-conjunct) see `Pipeline::filter_groups`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::config::JobConfig;
-    /// use el_ballista::connector::postgres::pipeline::Pipeline;
-    ///
-    /// let config: JobConfig = serde_json::from_str(r#"{
-    ///     "job_id": "orders", "table": "orders",
-    ///     "filters": ["status=PAID", {"column": "amount", "op": ">", "value": 100}],
-    ///     "source": {"host": "localhost", "port": 5432, "user": "etl",
-    ///                "password_env": "PGPASSWORD", "database": "shop"}
-    /// }"#)?;
-    /// let pipeline = Pipeline::from_config(config)?; // no I/O
-    /// let specs = pipeline.filter_specs()?;
-    /// let columns: Vec<&str> = specs.iter().map(|s| s.column.as_str()).collect();
-    /// assert_eq!(columns, ["status", "amount"]);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn filter_specs(&self) -> Result<Vec<FilterSpec>, AppError> {
-        Ok(self.filter_groups()?.into_iter().flatten().collect())
-    }
-
     /// The job's filters grouped by AND-conjunct: one inner vec per outer
     /// `filters` entry. A `Single` yields one spec; an `OrGroup` yields its
     /// branches in order. Pure: no I/O, safe to call for validation alone.
@@ -91,24 +65,6 @@ impl Pipeline {
     /// lowers to a single `a OR b` expression. Literals follow the JSON value
     /// types; string values stay text (for timestamp/date coercion use
     /// `Pipeline::filter_exprs_with_schema`).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::config::JobConfig;
-    /// use el_ballista::connector::postgres::pipeline::Pipeline;
-    ///
-    /// let config: JobConfig = serde_json::from_str(r#"{
-    ///     "job_id": "orders", "table": "orders",
-    ///     "filters": ["status=PAID", {"column": "amount", "op": ">", "value": 100}],
-    ///     "source": {"host": "localhost", "port": 5432, "user": "etl",
-    ///                "password_env": "PGPASSWORD", "database": "shop"}
-    /// }"#)?;
-    /// let pipeline = Pipeline::from_config(config)?; // no I/O
-    /// let exprs = pipeline.filter_exprs()?; // one predicate per AND-conjunct
-    /// assert_eq!(exprs.len(), 2);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
     pub fn filter_exprs(&self) -> Result<Vec<Expr>, AppError> {
         self.filter_groups()?
             .iter()
@@ -154,19 +110,6 @@ impl Pipeline {
     /// on. Same decision point `scan()` uses, so the preview can never disagree
     /// with execution. Use it to decide — before extracting — which
     /// filters need a source index and which will run in Arrow.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo() -> Result<(), el_ballista::errors::AppError> {
-    /// use el_ballista::connector::postgres::PostgresConnector;
-    ///
-    /// let connector = PostgresConnector::from_config_file("job.json")?;
-    /// for d in connector.pipeline().explain_filters().await? {
-    ///     println!("{} -> pushed={} ({})", d.filter, d.pushed_to_source, d.reason);
-    /// }
-    /// # Ok(()) }
-    /// ```
     pub async fn explain_filters(&self) -> Result<Vec<FilterDecision>, AppError> {
         let provider = self.provider().await?;
         let groups = self.filter_groups()?;
@@ -244,18 +187,6 @@ pub(super) fn describe_group(group: &[FilterSpec]) -> String {
 /// `amount>=100` doesn't get mis-split on the `=`. Shared by the pipeline
 /// (config `filters`) and the CLI (`--filter` flags); both funnel through here
 /// so they can never disagree.
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::connector::postgres::pipeline::parse_filter_shorthand;
-///
-/// let spec = parse_filter_shorthand("amount>=100")?;
-/// assert_eq!(spec.column, "amount");
-/// assert_eq!(spec.value, serde_json::json!(100));
-/// assert!(parse_filter_shorthand("no operator").is_err());
-/// # Ok::<(), el_ballista::errors::AppError>(())
-/// ```
 pub fn parse_filter_shorthand(raw: &str) -> Result<FilterSpec, AppError> {
     const OPS: [(&str, usize, FilterOp); 6] = [
         ("!=", 2, FilterOp::NotEq),
@@ -287,14 +218,14 @@ pub fn parse_filter_shorthand(raw: &str) -> Result<FilterSpec, AppError> {
 }
 
 /// Parse a shorthand filter all the way to a DataFusion predicate (no schema
-/// coercion — string values stay text). Prefer [`Pipeline::filter_exprs`] and
-/// `Pipeline::filter_exprs_with_schema` on the pipeline itself.
+/// coercion — string values stay text). A job's own filters come coerced to the table
+/// schema from `PostgresConnector::filter_exprs` and every run.
 ///
 /// # Examples
 ///
 /// ```
 /// use datafusion::prelude::{ident, lit};
-/// use el_ballista::connector::postgres::pipeline::parse_filter_expr;
+/// use el_ballista::connector::postgres::parse_filter_expr;
 ///
 /// let expr = parse_filter_expr("status='PAID'")?;
 /// assert_eq!(expr, ident("status").eq(lit("PAID")));
@@ -519,7 +450,12 @@ mod tests {
         let pipeline = Pipeline::from_config(config).unwrap();
         assert_eq!(pipeline.config().job_id, "payment_extract");
         // Flat specs: 4 predicates across 4 AND-conjuncts.
-        let specs = pipeline.filter_specs().unwrap();
+        let specs: Vec<FilterSpec> = pipeline
+            .filter_groups()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
         assert_eq!(specs.len(), 4);
         assert_eq!(
             specs[0].describe(),
@@ -793,7 +729,12 @@ mod tests {
             ))),
         ];
         let pipeline = Pipeline::from_config(config).unwrap();
-        let specs = pipeline.filter_specs().unwrap();
+        let specs: Vec<FilterSpec> = pipeline
+            .filter_groups()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].column, "status");
         assert_eq!(specs[0].describe(), "status = 'PAID'");

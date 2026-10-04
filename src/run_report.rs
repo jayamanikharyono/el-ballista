@@ -27,6 +27,7 @@
 //! `totals.rows_delivered` across runs only with that in mind.
 
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -378,12 +379,14 @@ pub async fn list_reports(
             .and_then(|text| serde_json::from_str::<RunReport>(&text).map_err(|e| e.to_string()));
         match parsed {
             Ok(report) if &report.job_id == job_id => reports.push(report),
-            Ok(report) => log::warn!(
-                "skipping run report {}: it belongs to job '{}'",
-                path.display(),
-                report.job_id
+            Ok(report) => warn!(
+                path = %path.display(),
+                job_id = %report.job_id,
+                "skipping a run report of another job"
             ),
-            Err(e) => log::warn!("skipping unreadable run report {}: {e}", path.display()),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "skipping an unreadable run report")
+            }
         }
     }
     reports.sort_by(|a, b| {

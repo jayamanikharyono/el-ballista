@@ -235,9 +235,6 @@ pub(crate) mod test_support {
         fn quote_ident(&self, name: &str) -> String {
             format!("\"{}\"", name.replace('"', "\"\""))
         }
-        fn placeholder(&self, param_index: usize) -> String {
-            format!("${param_index}")
-        }
         fn cast_type_name(&self, to: CastType) -> &'static str {
             match to {
                 CastType::Text => "text",
@@ -262,8 +259,7 @@ pub(crate) mod test_support {
             }
             fn push_param(&mut self, param: SqlParam) {
                 self.params.push(param);
-                self.sql
-                    .push_str(&AnsiDialect.placeholder(self.params.len()));
+                self.sql.push_str(&format!("${}", self.params.len()));
             }
         }
         let mut sink = Collect {

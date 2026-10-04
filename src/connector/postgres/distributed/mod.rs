@@ -7,15 +7,18 @@
 //! with `el-ballista worker` processes; there is no in-process Ballista (single-process extraction is
 //! plain DataFusion: `connector::postgres::register_table` / `.standalone()`).
 
-pub mod connection;
-pub mod context;
-pub mod executors;
-pub mod plan_codec;
-pub mod pool_registry;
-pub mod table_codec;
-pub mod watchdog;
+pub(crate) mod connection;
+pub(crate) mod context;
+pub(crate) mod executors;
+pub(crate) mod plan_codec;
+pub(crate) mod pool_registry;
+pub(crate) mod table_codec;
+pub(crate) mod watchdog;
 
-pub use connection::PostgresConnectionDescriptor;
 pub use context::DistributedContext;
+/// The Ballista extension codecs for Postgres scan plans. Public only so this crate's
+/// `el-ballista scheduler` / `el-ballista worker` binaries can install them.
+#[doc(hidden)]
 pub use plan_codec::PostgresPhysicalCodec;
+#[doc(hidden)]
 pub use table_codec::PostgresLogicalCodec;

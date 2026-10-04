@@ -1,7 +1,8 @@
 //! SQL dialect trait for rendering the pushdown IR.
 //! pushdown/dialect.rs
-//! Abstracts dialect-specific rendering: identifier quoting, placeholder generation, cast
-//! target names, and the name of the dialect's bytewise collation. Connector-agnostic: each
+//! Abstracts dialect-specific rendering: identifier quoting, cast target names, and the name
+//! of the dialect's bytewise collation. (Bind placeholders come from each backend's
+//! [`SqlSink`](crate::pushdown::SqlSink), which numbers them as it binds.) Connector-agnostic: each
 //! backend implements [`SqlDialect`] under its own connector (`PostgresDialect`,
 //! `MysqlDialect`). Fidelity is *not* a dialect question here: it is decided once, during
 //! translation, from the engine-neutral [`ColumnKind`](crate::pushdown::ColumnKind) each
@@ -13,9 +14,6 @@ use crate::pushdown::{CastType, Collation};
 pub trait SqlDialect: Send + Sync {
     /// Render an identifier (table/column name) with dialect-specific quoting.
     fn quote_ident(&self, name: &str) -> String;
-
-    /// Generate a placeholder string for the Nth parameter (1-indexed in most dialects).
-    fn placeholder(&self, param_index: usize) -> String;
 
     /// SQL type name for a `CAST(... AS <name>)` target.
     fn cast_type_name(&self, to: CastType) -> &'static str;

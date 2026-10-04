@@ -34,20 +34,6 @@ pub struct PostgresConnectionDescriptor {
 impl PostgresConnectionDescriptor {
     /// Describe `source` for `expected_workers` processes that share its `pool_max` budget.
     /// Only the password's environment-variable name is copied, never the password.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::config::SourceConfig;
-    /// use el_ballista::connector::postgres::distributed::PostgresConnectionDescriptor;
-    ///
-    /// let source: SourceConfig = serde_json::from_str(
-    ///     r#"{"host": "db", "port": 5432, "user": "etl", "password_env": "PGPASSWORD", "database": "shop"}"#,
-    /// )?;
-    /// let descriptor = PostgresConnectionDescriptor::from_config(&source, 4);
-    /// assert_eq!((descriptor.expected_workers, descriptor.password_env.as_str()), (4, "PGPASSWORD"));
-    /// # Ok::<(), serde_json::Error>(())
-    /// ```
     pub fn from_config(source: &SourceConfig, expected_workers: usize) -> Self {
         Self {
             host: source.host.clone(),
@@ -103,7 +89,7 @@ impl PostgresConnectionDescriptor {
 
     pub(crate) fn resolved_password(&self) -> Result<String, ExtractorError> {
         env::var(&self.password_env).map_err(|_| {
-            ExtractorError::Internal(format!(
+            ExtractorError::InvalidConfig(format!(
                 "environment variable '{}' (source.password_env) is not set",
                 self.password_env
             ))

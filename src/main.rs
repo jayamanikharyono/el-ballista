@@ -8,15 +8,14 @@ mod demo;
 
 use std::process::ExitCode;
 
-use el_ballista::connector::postgres::distributed::pool_registry::registry;
 use el_ballista::errors::error_chain;
 use el_ballista::logging;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Wire the `log` facade to a real backend: always stderr, plus a file when
-    // `--log-file <path>` (or the EL_BALLISTA_LOG_FILE env var) is set. Level comes from
-    // `--log-level` / RUST_LOG (default info). At debug level every generated SQL
+    // Install the tracing subscriber: always stderr, plus a file when
+    // `--log-file <path>` (or the EL_BALLISTA_LOG_FILE env var) is set. Filter comes from
+    // `--log-level` / RUST_LOG directives (default info). At debug level every generated SQL
     // query is logged, so pointing `--log-file` at a path with debug captures each
     // query as it is produced. See src/logging.rs.
     logging::init_from_env_and_args();
@@ -29,7 +28,7 @@ async fn main() -> ExitCode {
 
     let result = cli::dispatch().await;
     // Close pooled source connections gracefully before exit.
-    registry().close_all().await;
+    el_ballista::connector::postgres::close_pools().await;
 
     match result {
         Ok(()) => ExitCode::SUCCESS,

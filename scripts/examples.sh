@@ -75,8 +75,8 @@ CFG="$WORK/configs"
 
 # name | needs cluster (1/0) | expected output (regex) | command...
 declare -a CASES=(
-  "full_extraction|0|Total 14596 rows|$BIN/examples/full_extraction"
-  "parallel_extraction|0|14596 rows extracted across all partitions|$BIN/examples/parallel_extraction"
+  "full_extraction|0|Total 14596 rows|$BIN/examples/full_extraction $CFG/full_extract.dvd_rental.json"
+  "parallel_extraction|0|14596 rows extracted across all partitions|$BIN/examples/parallel_extraction $CFG/full_extract.dvd_rental.json"
   "filtered_extraction|0|Run outcome: 422 row\\(s\\) delivered|$BIN/examples/filtered_extraction $CFG/extract.example.json"
   "dataframe_extraction|0|dataframe extraction: 1000 row\\(s\\)|$BIN/examples/dataframe_extraction $CFG/extract.example.json"
   "pipeline_extraction|0|run_with\\(\\): 14596 row|$BIN/examples/pipeline_extraction $CFG/full_extract.example.json"

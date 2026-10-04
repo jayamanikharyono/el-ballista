@@ -32,8 +32,8 @@ docker compose -f tests/docker/compose.yaml up -d --wait
 export PGPASSWORD=postgres
 ```
 
-Every demo config, every example and `el-ballista demo` read the password from `$PGPASSWORD`; no
-example hard-codes one. The integration tests and CI use the same stack.
+Every demo config, every example (except `bench_full_load` on its default config) and
+`el-ballista demo` read the password from `$PGPASSWORD`; no example hard-codes one. The integration tests and CI use the same stack.
 
 Check it end to end with a diagnostic run (counts rows, delivers nothing, writes no checkpoint):
 
@@ -51,10 +51,10 @@ All of them read `public.payment` on `localhost:5432/test`:
 | `examples/configs/extract.example.json` | Job `payment_extract`: a one-week `payment_date` window, `customer_id >= 300`, `amount > 5` (422 rows) |
 | `examples/configs/full_extract.example.json` | Job `payment_full`: no filters (14,596 rows) |
 | `examples/configs/pushdown_showcase.json` | One filter per pushdown outcome, for `el-ballista plan` |
-| `examples/configs/*.dvd_rental.json` | Extra full / selective / date-range examples |
+| `examples/configs/*.dvd_rental.json` | Extra full / selective / date-range examples; `full_extract.dvd_rental.json` (job `dvd_rental_full`, no filters) is the default of `full_extraction` and `parallel_extraction` |
 
-`full_extraction` and `parallel_extraction` take no config: they connect to
-`localhost:5432 / postgres / test` with the password from `$PGPASSWORD`.
+`full_extraction` and `parallel_extraction` default to
+`examples/configs/full_extract.dvd_rental.json`; pass another config as the first argument.
 
 ---
 
@@ -70,11 +70,11 @@ prints a PASS/FAIL summary (`--no-db` to use a Postgres you already run, `--help
 ### 1. `full_extraction`: the basic contract, DB → Arrow
 
 ```bash
-cargo run --example full_extraction
+cargo run --example full_extraction -- [config.json]   # default: full_extract.dvd_rental.json
 ```
 
-- **Inside:** `PostgresExtractor::connect` → `extract_full_table("public.payment", columns)` → one Arrow `RecordBatch` → prints schema + row/column counts.
-- **Showcases:** whole-table extraction, schema discovery and type mapping, row → Arrow conversion. No filters, no DataFusion, no checkpointing: the minimal end-to-end data contract.
+- **Inside:** `PostgresConnector::from_config_file` → `extract().standalone().stream()` → prints the Arrow schema (types, nullability), then rows, columns, batches and the largest batch vs `execution.batch_size`.
+- **Showcases:** whole-table extraction, schema discovery and type mapping, bounded-memory streaming. No filters, no checkpointing: the minimal end-to-end data contract.
 
 ### 2. `filtered_extraction`: caller-provided predicates + pushdown preview
 
@@ -92,7 +92,7 @@ cargo run --example pipeline_extraction -- [config.json]   # default: full_extra
 ```
 
 - **Inside:** `PostgresConnector::from_config_file` → `extract().standalone().collect()` → `extract().standalone().run_with(consumer)` → `extract().distributed().run()` (diagnostic count on a running cluster; skipped with a note when none is reachable).
-- **Showcases:** the fluent entry point that the CLI (`el-ballista run` / `el-ballista distribute`) also goes through, and its four terminals: `collect()` / `stream()` (data, no checkpoint), `run_with(consumer)` (operational, checkpointed), `run()` (diagnostic count, no checkpoint). To learn the API from one example, read this one.
+- **Showcases:** the fluent entry point that the CLI (`el-ballista run` / `el-ballista distribute`) also goes through, and three of its four terminals: `collect()` (data, no checkpoint), `run_with(consumer)` (operational, checkpointed), `run()` (diagnostic count, no checkpoint); the fourth, `stream()`, is `collect()` without materializing. To learn the API from one example, read this one.
 
 ### 3b. `parquet_export`: a real checkpointed job, with a run report
 
@@ -122,11 +122,11 @@ cargo run --example dataframe_extraction -- [config.json]  # default: extract.ex
 ### 5. `parallel_extraction`: keyset partitioning mechanics
 
 ```bash
-cargo run --example parallel_extraction
+cargo run --example parallel_extraction -- [config.json] [partitions]   # defaults: full_extract.dvd_rental.json, 4
 ```
 
-- **Inside:** `compute_keyset_partitions` (4 ranges over `payment_id`) → one `tokio::spawn` per partition, each with its own extractor and connection → `extract_keyset_partition(lo, hi)` → combined row counts.
-- **Showcases:** non-overlapping `WHERE payment_id >= lo AND payment_id < hi` ranges (keyset, never `LIMIT/OFFSET`), per-partition connections, and why the ranges leave no gaps and no duplicates. Single-node parallelism; distribution is the next example.
+- **Inside:** the config with `parallel_scan` set to keyset × `partitions` (and a temporary `checkpoint.dir`) in code → `extract().standalone().run_with(consumer)`; each split prints its rows and `lo`/`hi` bounds, then the combined count.
+- **Showcases:** non-overlapping `payment_id` ranges (keyset, never `LIMIT/OFFSET`; the first range also holds NULL keys, the last is open-ended), at most `pool_max` scans at once on one shared pool, one checkpointed split per partition. Partitions are separate statements with separate snapshots. Single-node parallelism; distribution is the next example.
 
 ### 6. `distributed_extraction`: the same job spec on Ballista
 
@@ -134,9 +134,9 @@ cargo run --example parallel_extraction
 cargo run --example distributed_extraction -- [config.json] [workers] [output.parquet]  # defaults: extract.example.json, 2
 ```
 
-- **Needs:** a running cluster: `el-ballista scheduler` plus `workers` `el-ballista worker` processes (give each worker on one host its own `--port` / `--grpc-port`).
+- **Needs:** a running cluster: `el-ballista scheduler` plus `workers` `el-ballista worker` processes (give each worker on one host its own `--port` / `--grpc-port`); `workers` at most `source.pool_max`; the scheduler's REST API at a plain `http://` URL (`el-ballista scheduler` serves it), or else `distributed.job_timeout_secs` set, or the run is refused.
 - **Inside:** `PostgresConnector::from_config_file` → `extract().distributed().workers(n).stream()` (the config's filters, coerced to the table schema exactly as in standalone, plus the column projection) → streams into one Parquet file (default `output/distributed_extraction.parquet`).
-- **Showcases:** scaling out without scaling source load (each worker process opens only `pool_max / workers` connections), and that distributed extraction applies the same filter semantics as standalone. `el-ballista plan` on the same config shows which predicates run in Postgres; the rest are filtered in Ballista.
+- **Showcases:** scaling out within one source budget (each worker process opens only `pool_max / workers` connections; the client's planning connections come on top), and that distributed extraction applies the same filter semantics as standalone. `el-ballista plan` on the same config shows which predicates run in Postgres; the rest are filtered in Ballista.
 
 ### 7. `bench_full_load`: the benchmark harness (not a demo)
 
@@ -161,7 +161,9 @@ BENCH_SCHEDULER_URL=http://host:port cargo run --release --example bench_full_lo
 
 `examples/configs/extract.example.json` is what the config-driven examples load:
 
-- `table` / `columns`: what to read (omitted `columns` = all).
+- `table` / `columns`: what to read (omitted `columns` = every column; a table with a type that
+  has no Arrow mapping, such as `tsvector` or `interval`, then errors naming the column — list
+  `columns` without it).
 - `filters`: an ANDed list; an inner array is an OR-group:
   ```json
   "filters": [
@@ -179,7 +181,7 @@ BENCH_SCHEDULER_URL=http://host:port cargo run --release --example bench_full_lo
   Postgres.
 - `source.password_env`: the name of the env var holding the password (never inline one).
 - `pushdown.policy`: `always` / `never` / `cost_based` (default) / `strict` / `hinted`.
-- `parallel_scan` (`strategy`: `none` / `keyset` / `ctid`) / `execution.batch_size` / `distributed.workers`: splitting, fetch size, worker count.
+- `parallel_scan` (`strategy`: `none` / `keyset` / `ctid`) / `execution.batch_size` / `distributed.workers`: splitting, fetch size, worker count. `ctid` applies only to `.distributed()`; standalone warns and scans one split.
 - `checkpoint.dir` / `checkpoint.lock_ttl_secs` (default 1800): where `run_with` keeps split state and its per-job lock, and when a crashed run's lock may be taken over.
 - `checkpoint.run_reports` (default `true`) / `checkpoint.diagnostic_run_reports` (default `false`): write a run report per `run_with` run (and per diagnostic run) under `<checkpoint.dir>/runs/<job>/`.
 - There is no `sink` block (this layer is not a sink): unknown fields anywhere are a load error, and enum values are exact lowercase names.
@@ -242,7 +244,9 @@ in [`docs/testing-plan.md`](docs/testing-plan.md) and
 | `password_env` / `PGPASSWORD` not set | `export PGPASSWORD=postgres` |
 | `batch_size` validation error | Must be ≥ 1 in config |
 | `unknown field \`sink\`` (or another field) | Remove it: the job spec is strict and has no sink block |
-| `the stored checkpoint belongs to a different extraction plan` | The job's filters/table/partitioning changed: use a new `job_id` or `el-ballista checkpoint reset --config …` |
+| `the stored checkpoint belongs to a different extraction plan` | The job's source database, table, columns, filters, partitioning or execution mode changed, or the checkpoint predates the source-aware fingerprint (once, after upgrading): use a new `job_id` or `el-ballista checkpoint reset --config …` |
+| `N distributed workers exceed source.pool_max = M` | Lower `distributed.workers` / `--workers` / `.workers(n)` or raise `pool_max` |
+| `the scheduler REST API at … does not answer` | Run `el-ballista scheduler` at an `http://` URL, or set `distributed.job_timeout_secs` |
 | `job '…' is already running` | Another `run_with` of the same job holds its lock; a crashed run's lock is taken over after `checkpoint.lock_ttl_secs` |
 | `connection refused` on 5432 | Start the demo stack: `docker compose -f tests/docker/compose.yaml up -d --wait` |
 | Linker `__eh_frame` warning on macOS | Toolchain noise, harmless |

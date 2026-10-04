@@ -9,22 +9,28 @@
 //! - **trivial**: hand-written expected values / typed error kinds.
 //!
 //! Self-contained (like `regressions.rs`): each test creates its own schema and drops it with
-//! an explicit async cleanup instead of relying on `Drop`.
+//! an explicit async cleanup instead of relying on `Drop`. Every extraction goes through the
+//! public connector (`PostgresConnector::from_config(cfg)?.extract().standalone()`, or
+//! `register_table` into a plain `SessionContext`); the path under test (cursor vs binary
+//! COPY) is chosen by `execution.use_copy`.
 //! Run: `cargo test --test pg_decode -- --test-threads=1` (needs `tests/docker/compose.yaml`).
+
+mod common;
 
 use arrow::array::TimestampMicrosecondArray;
 use arrow::array::{Array, Date32Array, Decimal128Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use el_ballista::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
-    PushdownConfig, SourceConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
+    ParallelScanConfig, PushdownConfig, SourceConfig,
 };
 use el_ballista::connector::errors::ExtractorError;
-use el_ballista::connector::postgres::extractor::PostgresExtractor;
-use el_ballista::connector::postgres::parallel::compute_keyset_partitions;
-use el_ballista::connector::postgres::register_table;
+use el_ballista::connector::postgres::{PostgresConnector, SplitInfo, register_table};
+use el_ballista::errors::{AppError, error_chain};
+use futures::TryStreamExt;
 use sqlx::postgres::PgPoolOptions;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type R = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -38,7 +44,6 @@ struct Pg {
     host: String,
     port: u16,
     user: String,
-    password: String,
     database: String,
 }
 
@@ -106,7 +111,6 @@ impl Pg {
             host,
             port,
             user,
-            password,
             database,
         }
     }
@@ -121,21 +125,6 @@ impl Pg {
 
     fn table(&self, t: &str) -> String {
         format!("{}.{t}", self.schema)
-    }
-
-    async fn extractor(&self) -> PostgresExtractor {
-        PostgresExtractor::connect(
-            &self.host,
-            self.port,
-            &self.user,
-            &self.password,
-            &self.database,
-            3,
-            60_000,
-            "pg-decode-test",
-        )
-        .await
-        .expect("extractor connect")
     }
 
     fn job(&self, table: &str, application_name: &str) -> JobConfig {
@@ -168,32 +157,42 @@ impl Pg {
     }
 }
 
+/// A full scan of `table` through the public connector (standalone, unsplit, no filters) on
+/// one decode path — cursor `FETCH` (`use_copy` false) or binary COPY (true) — 2-row batches
+/// under a 16 MiB byte cap, every batch kept with its boundaries.
+async fn path_batches(pg: &Pg, table: &str, use_copy: bool) -> Result<Vec<RecordBatch>, AppError> {
+    let mut cfg = pg.job(table, "pg-decode-test");
+    cfg.execution.use_copy = use_copy;
+    cfg.execution.batch_size = 2;
+    cfg.execution.max_batch_bytes = 1 << 24;
+    // Non-vacuous: the requested path is the one the scan takes.
+    common::assert_scan_path(&cfg, if use_copy { "copy" } else { "cursor" }).await;
+    common::extract_batches(&cfg).await
+}
+
 /// Cursor path: every batch of a full scan.
-async fn cursor_batches(
-    ex: &PostgresExtractor,
-    table: &str,
-) -> Result<Vec<RecordBatch>, ExtractorError> {
-    let mut out = Vec::new();
-    ex.extract_full_table_for_each_batch(table, None, 2, 1 << 24, &mut |b| {
-        out.push(b);
-        Ok(())
-    })
-    .await?;
-    Ok(out)
+async fn cursor_batches(pg: &Pg, table: &str) -> Result<Vec<RecordBatch>, AppError> {
+    path_batches(pg, table, false).await
 }
 
 /// Binary COPY path: every batch of a full scan.
-async fn copy_batches(
-    ex: &PostgresExtractor,
-    table: &str,
-) -> Result<Vec<RecordBatch>, ExtractorError> {
-    let mut out = Vec::new();
-    ex.extract_full_table_via_copy_for_each_batch(table, None, 2, 1 << 24, &mut |b| {
-        out.push(b);
-        Ok(())
-    })
-    .await?;
-    Ok(out)
+async fn copy_batches(pg: &Pg, table: &str) -> Result<Vec<RecordBatch>, AppError> {
+    path_batches(pg, table, true).await
+}
+
+/// Every typed [`ExtractorError`] in `err`'s `source()` chain, outermost first. The connector
+/// delivers a scan failure as an `AppError` (e.g. `DataFusion(External(..))`, possibly
+/// nested) whose chain keeps the typed extractor error.
+fn extractor_errors<'a>(err: &'a (dyn std::error::Error + 'static)) -> Vec<&'a ExtractorError> {
+    let mut found = Vec::new();
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if let Some(typed) = e.downcast_ref::<ExtractorError>() {
+            found.push(typed);
+        }
+        current = e.source();
+    }
+    found
 }
 
 fn concat(batches: &[RecordBatch]) -> RecordBatch {
@@ -216,12 +215,21 @@ fn by_id<T>(batch: &RecordBatch, name: &str, get: impl Fn(&dyn Array, usize) -> 
     pairs.into_iter().map(|(_, v)| v).collect()
 }
 
-fn assert_unsupported_value(r: Result<Vec<RecordBatch>, ExtractorError>, column: &str, what: &str) {
+fn assert_unsupported_value(r: Result<Vec<RecordBatch>, AppError>, column: &str, what: &str) {
     match r {
-        Err(ExtractorError::UnsupportedValue { column: c, .. }) => {
-            assert_eq!(c, column, "{what}: error must name the column")
+        Err(e) => {
+            let named = extractor_errors(&e).into_iter().find_map(|x| match x {
+                ExtractorError::UnsupportedValue { column: c, .. } => Some(c.clone()),
+                _ => None,
+            });
+            match named {
+                Some(c) => assert_eq!(c, column, "{what}: error must name the column"),
+                None => panic!(
+                    "{what}: expected UnsupportedValue, got {}",
+                    error_chain(&e).join(": ")
+                ),
+            }
         }
-        Err(e) => panic!("{what}: expected UnsupportedValue, got {e}"),
         Ok(b) => panic!(
             "{what}: expected a typed error, got Ok with {} rows",
             b.iter().map(|b| b.num_rows()).sum::<usize>()
@@ -241,7 +249,6 @@ async fn infinity_is_a_typed_error_on_both_paths() -> R {
         "CREATE TABLE $S.d (id bigint, day date)",
     ])
     .await;
-    let ex = pg.extractor().await;
     for (table, column, values) in [
         ("tz", "ts", ["'infinity'", "'-infinity'"]),
         ("naive", "ts", ["'infinity'", "'-infinity'"]),
@@ -258,12 +265,12 @@ async fn infinity_is_a_typed_error_on_both_paths() -> R {
             }
             let what = format!("{table} {v}");
             assert_unsupported_value(
-                cursor_batches(&ex, &pg.table(table)).await,
+                cursor_batches(&pg, table).await,
                 column,
                 &format!("cursor {what}"),
             );
             assert_unsupported_value(
-                copy_batches(&ex, &pg.table(table)).await,
+                copy_batches(&pg, table).await,
                 column,
                 &format!("copy {what}"),
             );
@@ -286,7 +293,6 @@ async fn extreme_finite_timestamps_match_postgres_on_both_paths() -> R {
            (6, NULL, NULL, NULL)",
     ])
     .await;
-    let ex = pg.extractor().await;
     // Reference oracle: Postgres computes the Unix-epoch values itself.
     let reference: Vec<(Option<i64>, Option<i64>, Option<i32>)> =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -299,8 +305,8 @@ async fn extreme_finite_timestamps_match_postgres_on_both_paths() -> R {
         .fetch_all(&pg.pool)
         .await?;
     for (path, batches) in [
-        ("cursor", cursor_batches(&ex, &pg.table("t")).await?),
-        ("copy", copy_batches(&ex, &pg.table("t")).await?),
+        ("cursor", cursor_batches(&pg, "t").await?),
+        ("copy", copy_batches(&pg, "t").await?),
     ] {
         let b = concat(&batches);
         let ts = |a: &dyn Array, i: usize| {
@@ -343,7 +349,6 @@ async fn unconstrained_numeric_is_exact_or_a_typed_error_on_both_paths() -> R {
         "INSERT INTO $S.constrained VALUES (1, 123.45), (2, -7.5), (3, 9999999999.99)",
     ])
     .await;
-    let ex = pg.extractor().await;
     let dec = |a: &dyn Array, i: usize| {
         let a = a
             .as_any()
@@ -352,8 +357,8 @@ async fn unconstrained_numeric_is_exact_or_a_typed_error_on_both_paths() -> R {
         a.is_valid(i).then(|| a.value(i))
     };
     for (path, batches) in [
-        ("cursor", cursor_batches(&ex, &pg.table("ok")).await?),
-        ("copy", copy_batches(&ex, &pg.table("ok")).await?),
+        ("cursor", cursor_batches(&pg, "ok").await?),
+        ("copy", copy_batches(&pg, "ok").await?),
     ] {
         let b = concat(&batches);
         assert_eq!(
@@ -375,22 +380,19 @@ async fn unconstrained_numeric_is_exact_or_a_typed_error_on_both_paths() -> R {
     }
     for table in ["overscale", "nan", "big"] {
         assert_unsupported_value(
-            cursor_batches(&ex, &pg.table(table)).await,
+            cursor_batches(&pg, table).await,
             "n",
             &format!("cursor {table}"),
         );
         assert_unsupported_value(
-            copy_batches(&ex, &pg.table(table)).await,
+            copy_batches(&pg, table).await,
             "n",
             &format!("copy {table}"),
         );
     }
     for (path, batches) in [
-        (
-            "cursor",
-            cursor_batches(&ex, &pg.table("constrained")).await?,
-        ),
-        ("copy", copy_batches(&ex, &pg.table("constrained")).await?),
+        ("cursor", cursor_batches(&pg, "constrained").await?),
+        ("copy", copy_batches(&pg, "constrained").await?),
     ] {
         let b = concat(&batches);
         assert_eq!(
@@ -418,7 +420,6 @@ async fn json_jsonb_uuid_match_postgres_text_on_both_paths() -> R {
            (3, NULL, NULL, '00000000-0000-0000-0000-000000000000')"#,
     ])
     .await;
-    let ex = pg.extractor().await;
     let reference: Vec<(Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT j::text, jb::text, u::text FROM {} ORDER BY id",
@@ -431,8 +432,8 @@ async fn json_jsonb_uuid_match_postgres_text_on_both_paths() -> R {
         a.is_valid(i).then(|| a.value(i).to_string())
     };
     for (path, batches) in [
-        ("cursor", cursor_batches(&ex, &pg.table("t")).await?),
-        ("copy", copy_batches(&ex, &pg.table("t")).await?),
+        ("cursor", cursor_batches(&pg, "t").await?),
+        ("copy", copy_batches(&pg, "t").await?),
     ] {
         let b = concat(&batches);
         let (j, jb, u) = (
@@ -453,33 +454,61 @@ async fn json_jsonb_uuid_match_postgres_text_on_both_paths() -> R {
 // Computed keyset partitions cover every row exactly once
 // ---------------------------------------------------------------------------------------
 
+/// Ids extracted by a planned keyset split of `t` on `column` into `n` partitions (NULL keys
+/// included), through the checkpointed `run_with` on one decode path (`use_copy`), 3-row
+/// batches; every split's rows are collected and sorted. Also returns the number of splits
+/// the run planned and the number the consumer was handed.
 async fn partitioned_ids(
     pg: &Pg,
-    ex: &PostgresExtractor,
     column: &str,
     n: usize,
     use_copy: bool,
-) -> Result<Vec<i64>, ExtractorError> {
-    let parts = compute_keyset_partitions(ex.pool(), &pg.schema, "t", column, n).await?;
-    let mut ids = Vec::new();
-    for part in &parts {
-        ex.extract_partition_for_each_batch(
-            &pg.table("t"),
-            Some(vec!["id"]),
-            Some(part),
-            use_copy,
-            3,
-            1 << 24,
-            &mut |b| {
-                let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                ids.extend(a.values().iter().copied());
-                Ok(())
-            },
-        )
-        .await?;
-    }
+) -> Result<(Vec<i64>, usize, usize), AppError> {
+    let mut cfg = pg.job("t", "pg-decode-keyset");
+    cfg.columns = Some(vec!["id".to_string()]);
+    cfg.execution.use_copy = use_copy;
+    cfg.execution.batch_size = 3;
+    cfg.execution.max_batch_bytes = 1 << 24;
+    cfg.parallel_scan = ParallelScanConfig {
+        strategy: "keyset".parse().unwrap(),
+        partitions: n,
+        partition_column: column.to_string(),
+    };
+    // A fresh checkpoint directory per run: a reused one would skip the splits an earlier
+    // iteration completed (or refuse the changed plan).
+    let dir = std::env::temp_dir().join(format!(
+        "pgdecode_ckpt_{}_{column}_{n}_{use_copy}",
+        pg.schema
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    cfg.checkpoint.dir = dir.to_string_lossy().into_owned();
+    common::assert_scan_path(&cfg, if use_copy { "copy" } else { "cursor" }).await;
+
+    let ids = Mutex::new(Vec::new());
+    let splits_seen = Mutex::new(0usize);
+    let (ids_ref, seen_ref) = (&ids, &splits_seen);
+    let outcome = PostgresConnector::from_config(cfg)?
+        .extract()
+        .standalone()
+        .run_with(move |_split: SplitInfo, mut stream| async move {
+            *seen_ref.lock().unwrap() += 1;
+            while let Some(b) = stream.try_next().await? {
+                let a = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("id is not bigint")?;
+                ids_ref.lock().unwrap().extend(a.values().iter().copied());
+            }
+            Ok(())
+        })
+        .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let outcome = outcome?;
+    let mut ids = ids.into_inner().unwrap();
     ids.sort_unstable();
-    Ok(ids)
+    let seen = splits_seen.into_inner().unwrap();
+    Ok((ids, outcome.splits_total, seen))
 }
 
 #[tokio::test]
@@ -491,15 +520,24 @@ async fn keyset_partitions_cover_nulls_and_extreme_keys_once() -> R {
         "INSERT INTO $S.t VALUES (41, -9223372036854775808, NULL), (42, 9223372036854775807, -5)",
     ])
     .await;
-    let ex = pg.extractor().await;
     let expected: Vec<i64> = (1..=42).collect();
     for column in ["k", "small", "id"] {
         for n in [2, 3, 7] {
             for use_copy in [false, true] {
-                let got = partitioned_ids(&pg, &ex, column, n, use_copy).await?;
+                let (got, planned, seen) = partitioned_ids(&pg, column, n, use_copy).await?;
                 assert_eq!(
                     got, expected,
                     "column {column}, {n} partitions, copy={use_copy}: rows lost or duplicated"
+                );
+                // Non-vacuous: the rows really came from several planned splits, each
+                // handed to the consumer once.
+                assert!(
+                    planned > 1,
+                    "column {column}, {n} partitions: only {planned} split planned"
+                );
+                assert_eq!(
+                    seen, planned,
+                    "column {column}, {n} partitions, copy={use_copy}"
                 );
             }
         }
@@ -559,48 +597,71 @@ async fn strict_inputs_are_typed_errors() -> R {
         "INSERT INTO $S.t VALUES (1, 'x')",
     ])
     .await;
-    let ex = pg.extractor().await;
-    let table = pg.table("t");
+    for use_copy in [false, true] {
+        let path = if use_copy { "copy" } else { "cursor" };
 
-    // Unknown projection column, named.
-    let err = ex
-        .extract_full_table(&table, Some(vec!["id", "nmae"]))
-        .await
-        .expect_err("typo must error");
+        // Unknown projection column, named.
+        let mut cfg = pg.job("t", "pg-decode-strict");
+        cfg.execution.use_copy = use_copy;
+        cfg.columns = Some(vec!["id".to_string(), "nmae".to_string()]);
+        let err = common::extract_batches(&cfg)
+            .await
+            .expect_err("typo must error");
+        let projection = extractor_errors(&err)
+            .into_iter()
+            .find(|x| matches!(x, ExtractorError::Projection(_)));
+        assert!(
+            projection.is_some_and(|x| x.to_string().contains("nmae")),
+            "{path}: {}",
+            error_chain(&err).join(": ")
+        );
+
+        // Missing table.
+        let mut cfg = pg.job("nope", "pg-decode-strict");
+        cfg.execution.use_copy = use_copy;
+        let missing = common::extract_batches(&cfg).await;
+        let typed = missing.as_ref().err().is_some_and(|e| {
+            extractor_errors(e)
+                .into_iter()
+                .any(|x| matches!(x, ExtractorError::TableNotFound(_)))
+        });
+        assert!(typed, "{path}: {missing:?}");
+    }
+
+    // `batch_size` 0 on every extraction path (cursor, binary COPY, an explicit keyset range
+    // [0, 9) on `id`) and on the provider path: refused by config validation, typed and
+    // naming the field, before any source statement runs.
+    let zero_batch = |use_copy: bool, range: bool| {
+        let mut cfg = pg.job("t", "pg-decode-strict");
+        cfg.execution.batch_size = 0;
+        cfg.execution.max_batch_bytes = 1024;
+        cfg.execution.use_copy = use_copy;
+        if range {
+            cfg.filters = vec![
+                FilterEntry::Single(FilterInput::Shorthand("id>=0".into())),
+                FilterEntry::Single(FilterInput::Shorthand("id<9".into())),
+            ];
+        }
+        cfg
+    };
+    for (what, cfg) in [
+        ("cursor", zero_batch(false, false)),
+        ("copy", zero_batch(true, false)),
+        ("keyset range", zero_batch(false, true)),
+    ] {
+        let zero = PostgresConnector::from_config(cfg).map(|_| ());
+        assert!(
+            matches!(&zero, Err(AppError::Config(m)) if m.contains("batch_size")),
+            "{what}: {zero:?}"
+        );
+    }
+    let zero = register_table(&SessionContext::new(), &zero_batch(false, false)).await;
     assert!(
-        matches!(err, ExtractorError::Projection(_)) && err.to_string().contains("nmae"),
-        "{err}"
+        matches!(&zero, Err(AppError::Config(m)) if m.contains("batch_size")),
+        "provider: {zero:?}"
     );
 
-    // `batch_size` 0 on every extractor path.
-    let zero = ex
-        .extract_full_table_for_each_batch(&table, None, 0, 1024, &mut |_| Ok(()))
-        .await;
-    assert!(
-        matches!(zero, Err(ExtractorError::InvalidConfig(_))),
-        "{zero:?}"
-    );
-    let zero = ex
-        .extract_full_table_via_copy_for_each_batch(&table, None, 0, 1024, &mut |_| Ok(()))
-        .await;
-    assert!(
-        matches!(zero, Err(ExtractorError::InvalidConfig(_))),
-        "{zero:?}"
-    );
-    let zero = ex
-        .extract_keyset_partition_for_each_batch(&table, None, "id", 0, 9, 0, 1024, &mut |_| Ok(()))
-        .await;
-    assert!(
-        matches!(zero, Err(ExtractorError::InvalidConfig(_))),
-        "{zero:?}"
-    );
-
-    // Missing table, extractor path and provider path.
-    let missing = ex.extract_full_table(&pg.table("nope"), None).await;
-    assert!(
-        matches!(missing, Err(ExtractorError::TableNotFound(_))),
-        "{missing:?}"
-    );
+    // Missing table, provider path.
     let cfg = pg.job("nope", "pg-decode-missing");
     let ctx = SessionContext::new();
     let registered = register_table(&ctx, &cfg).await;

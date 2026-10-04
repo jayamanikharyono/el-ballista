@@ -8,7 +8,8 @@
 //!      identical in both engines.
 //!   3. (in `dvdrental_cross_engine.rs`) absolute row counts.
 //!
-//! Plus the Postgres-only methods vs direct SQL: filtered extraction and keyset partitioning.
+//! Plus Postgres-only checks: filtered extraction vs direct SQL, and two `[lo, hi)` key ranges
+//! (job filters) whose union equals the full scan.
 //!
 //! Comparison method: every cell — from Arrow and from the DB's `CAST(... AS text)` — is reduced to
 //! ONE canonical string by [`canon`], then per-column value multisets are sorted and compared. The
@@ -31,7 +32,12 @@
 //!
 //! Everything else on all 15 tables is compared cell-for-cell.
 //!
+//! The Postgres side is extracted through the public connector (`PostgresConnector` →
+//! `standalone().stream()`, via `tests/common`'s `extract_one`), cursor path, one unsplit scan.
+//!
 //! Requires the compose stack up (`docker compose -f tests/docker/compose.yaml up -d --wait`).
+
+mod common;
 
 use arrow::array::ArrayRef;
 use arrow::array::{
@@ -41,8 +47,11 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::DateTime;
+use el_ballista::config::{
+    CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
+    ParallelScanConfig, PushdownConfig, PushdownPolicy, SourceConfig,
+};
 use el_ballista::connector::mysql::MysqlExtractor;
-use el_ballista::connector::postgres::PostgresExtractor;
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{MySqlPool, PgPool, Row};
@@ -212,7 +221,7 @@ fn parse(url: &str, default_port: u16) -> (String, u16, String, String, String) 
         database.to_string(),
     )
 }
-/// Name of the env var the filtered-extraction `JobConfig` reads its password from.
+/// Name of the env var every Postgres `JobConfig` in this file reads its password from.
 const MATRIX_PASSWORD_ENV: &str = "MATRIX_PG_PASSWORD";
 static MATRIX_PASSWORD_ONCE: std::sync::Once = std::sync::Once::new();
 
@@ -240,11 +249,44 @@ async fn my_pool() -> MySqlPool {
         panic!("cannot connect to MySQL ({e}). Is the compose stack up? `docker compose -f tests/docker/compose.yaml up -d --wait`.")
     })
 }
-async fn pg_extractor() -> PostgresExtractor {
-    let (h, p, u, pw, db) = parse(&pg_url(), 5432);
-    PostgresExtractor::connect(&h, p, &u, &pw, &db, 4, 30_000, "el-ballista-matrix")
+/// A connector job over the dvdrental `public.<table>` on Postgres: `columns` (`None` = all),
+/// the cursor path (`use_copy = false`), the default batch size and byte cap, one unsplit scan,
+/// no filters. Callers add `filters` / `pushdown` for the case under test.
+fn pg_job(table: &str, columns: Option<&[&str]>) -> JobConfig {
+    let env_var = matrix_password_env();
+    let (h, p, u, _pw, db) = parse(&pg_url(), 5432);
+    JobConfig {
+        job_id: format!("matrix-{table}").parse().unwrap(),
+        table: table.to_string(),
+        columns: columns.map(|c| c.iter().map(|s| s.to_string()).collect()),
+        filters: Vec::new(),
+        source: SourceConfig {
+            host: h,
+            port: p,
+            user: u,
+            password_env: env_var.to_string(),
+            database: db,
+            pool_max: 4,
+            statement_timeout_ms: 30_000,
+            application_name: "el-ballista-matrix".to_string(),
+            schema: "public".to_string(),
+        },
+        checkpoint: CheckpointConfig::default(),
+        pushdown: PushdownConfig::default(),
+        parallel_scan: ParallelScanConfig::default(),
+        execution: ExecutionConfig {
+            use_copy: false,
+            ..ExecutionConfig::default()
+        },
+        distributed: DistributedConfig::default(),
+    }
+}
+
+/// `public.<table>` extracted through the Postgres connector, concatenated into one batch.
+async fn pg_extract(table: &str, columns: &[&str]) -> RecordBatch {
+    common::extract_one(&pg_job(table, Some(columns)))
         .await
-        .unwrap_or_else(|e| panic!("PostgresExtractor::connect: {e}"))
+        .unwrap_or_else(|e| panic!("PG extract {table}: {e}"))
 }
 async fn my_extractor() -> (MysqlExtractor, String) {
     let (h, p, u, pw, db) = parse(&my_url(), 3306);
@@ -500,15 +542,11 @@ async fn full_extraction_matches_direct_sql_on_both_engines_and_cross_engine() {
     matrix_password_env();
     let pgp = pg_pool().await;
     let myp = my_pool().await;
-    let pgx = pg_extractor().await;
     let (myx, db) = my_extractor().await;
 
     for t in MATRIX {
         let cols: Vec<&str> = t.cols.to_vec();
-        let pg_batch = pgx
-            .extract_full_table(&format!("public.{}", t.name), Some(cols.clone()))
-            .await
-            .unwrap_or_else(|e| panic!("PG extract {}: {e}", t.name));
+        let pg_batch = pg_extract(t.name, t.cols).await;
         let my_batch = myx
             .extract_full_table(&format!("{db}.{}", t.name), Some(cols.clone()))
             .await
@@ -540,41 +578,17 @@ async fn full_extraction_matches_direct_sql_on_both_engines_and_cross_engine() {
 
 #[tokio::test]
 async fn pg_filtered_extraction_matches_direct_sql() {
-    let env_var = matrix_password_env();
-    use el_ballista::config::{
-        CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
-        ParallelScanConfig, PushdownConfig, SourceConfig,
-    };
+    matrix_password_env();
     use el_ballista::connector::postgres::PostgresConnector;
 
     // Differential oracle: a caller-provided id-range predicate pushed to the source
     // must return exactly what the same predicate returns over direct SQL.
-    let (h, p, u, _pw, db) = parse(&pg_url(), 5432);
-    let config = JobConfig {
-        job_id: "matrix-filtered".to_string().parse().unwrap(),
-        table: "public.rental".to_string(),
-        columns: Some(vec!["rental_id".to_string()]),
-        filters: vec![
-            FilterEntry::Single(FilterInput::Shorthand("rental_id>100".to_string())),
-            FilterEntry::Single(FilterInput::Shorthand("rental_id<=200".to_string())),
-        ],
-        source: SourceConfig {
-            host: h,
-            port: p,
-            user: u,
-            password_env: env_var.to_string(),
-            database: db,
-            pool_max: 4,
-            statement_timeout_ms: 30_000,
-            application_name: "el-ballista-matrix".to_string(),
-            schema: "public".to_string(),
-        },
-        checkpoint: CheckpointConfig::default(),
-        pushdown: PushdownConfig::default(),
-        parallel_scan: ParallelScanConfig::default(),
-        execution: ExecutionConfig::default(),
-        distributed: DistributedConfig::default(),
-    };
+    let mut config = pg_job("rental", Some(&["rental_id"]));
+    config.job_id = "matrix-filtered".to_string().parse().unwrap();
+    config.filters = vec![
+        FilterEntry::Single(FilterInput::Shorthand("rental_id>100".to_string())),
+        FilterEntry::Single(FilterInput::Shorthand("rental_id<=200".to_string())),
+    ];
     let batches = PostgresConnector::from_config(config)
         .expect("valid job config")
         .extract()
@@ -618,26 +632,24 @@ async fn pg_filtered_extraction_matches_direct_sql() {
 #[tokio::test]
 async fn pg_keyset_partitions_union_equals_full() {
     matrix_password_env();
-    let pgx = pg_extractor().await;
 
-    // Metamorphic oracle: two keyset partitions tiling the id space must union to the full scan
-    // (exercises the keyset predicate without hand-reproducing its exact boundary).
-    let full = pgx
-        .extract_full_table("public.actor", Some(vec!["actor_id"]))
-        .await
-        .expect("full actor");
-    let a = pgx
-        .extract_keyset_partition("public.actor", Some(vec!["actor_id"]), "actor_id", 0, 100)
-        .await
-        .expect("keyset a");
-    let b = pgx
-        .extract_keyset_partition(
-            "public.actor",
-            Some(vec!["actor_id"]),
-            "actor_id",
-            100,
-            1_000_000,
-        )
+    // Metamorphic oracle: two key ranges `[lo, hi)` tiling the id space must union to the full
+    // scan (exercises the range predicate without hand-reproducing its exact boundary). Each
+    // range is `actor_id >= lo AND actor_id < hi` as job filters, pushed to the source
+    // (policy `always`), like the keyset predicate of a partition scan.
+    let range = |lo: i64, hi: i64| {
+        let mut c = pg_job("actor", Some(&["actor_id"]));
+        c.job_id = format!("matrix-actor-{lo}-{hi}").parse().unwrap();
+        c.pushdown.policy = PushdownPolicy::Always;
+        c.filters = vec![
+            FilterEntry::Single(FilterInput::Shorthand(format!("actor_id>={lo}"))),
+            FilterEntry::Single(FilterInput::Shorthand(format!("actor_id<{hi}"))),
+        ];
+        c
+    };
+    let full = pg_extract("actor", &["actor_id"]).await;
+    let a = common::extract_one(&range(0, 100)).await.expect("keyset a");
+    let b = common::extract_one(&range(100, 1_000_000))
         .await
         .expect("keyset b");
 

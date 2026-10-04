@@ -23,7 +23,7 @@ mod common;
 
 use common::{TEST_PASSWORD_ENV, TestCluster, TestDb};
 use el_ballista::checkpoint::{CheckpointStore, SplitState, json_store::JsonCheckpointStore};
-use el_ballista::connector::postgres::pipeline::SplitInfo;
+use el_ballista::connector::postgres::SplitInfo;
 use el_ballista::errors::{AppError, ConsumerError};
 use futures::TryStreamExt;
 use std::sync::Mutex;
@@ -121,7 +121,7 @@ impl E2E {
         ctx: &DistributedContext,
         select: &str,
     ) -> Result<Vec<i64>, Box<dyn std::error::Error>> {
-        let batches = ctx.session.sql(select).await?.collect().await?;
+        let batches = ctx.collect_sql(select).await?;
         let mut ids = Vec::new();
         for b in &batches {
             ids.extend(common::int64_col(b, "id"));

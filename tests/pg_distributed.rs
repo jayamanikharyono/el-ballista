@@ -61,21 +61,13 @@ async fn cluster_collects_hostile_table() -> Result<(), Box<dyn std::error::Erro
     ctx.register_source(&config).await?;
 
     // Full collect: every fixture row across 4 keyset partitions.
-    let batches = ctx
-        .session
-        .sql("SELECT id FROM hostile")
-        .await?
-        .collect()
-        .await?;
+    let batches = ctx.collect_sql("SELECT id FROM hostile").await?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, common::HOSTILE_ROWS);
 
     // Exact decimals survive the distributed path (P0-1 cover).
     let batches = ctx
-        .session
-        .sql("SELECT amount FROM hostile ORDER BY id")
-        .await?
-        .collect()
+        .collect_sql("SELECT amount FROM hostile ORDER BY id")
         .await?;
     let mut amounts = Vec::new();
     for b in &batches {

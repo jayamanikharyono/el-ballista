@@ -66,7 +66,6 @@ through a per-connector dialect:
 /// Per-connector rendering (`src/pushdown/dialect.rs`; implemented per backend)
 pub trait SqlDialect: Send + Sync {
     fn quote_ident(&self, name: &str) -> String;
-    fn placeholder(&self, param_index: usize) -> String;           // "$1" for Postgres
     fn cast_type_name(&self, to: CastType) -> &'static str;         // CastType::Text -> "text"
     fn collation_name(&self, collation: Collation) -> &'static str; // Binary -> "\"C\""
 }
@@ -94,7 +93,7 @@ byte strings) out of our hands.
 | Column-to-column comparison | same-kind integer / boolean / timestamp / date / text only | Text sides both `COLLATE "C"` |
 | `AND` / `OR` | yes | Fidelity is the *minimum* of the children's |
 | `NOT`, `IS [NOT] NULL` over a predicate | only over an `Exact` child | The negation of a superset is a subset |
-| `IS NULL` / `IS NOT NULL` on a column | yes, any known column | `Exact` |
+| `IS NULL` / `IS NOT NULL` on a column | yes, any known column | `Exact`. A TextCast column (uuid, json, jsonb, non-enum `USER-DEFINED` such as a composite or `citext`) is tested as `CAST(col AS text) IS [NOT] NULL`: a composite row of NULL fields is NULL to SQL's row test but `(,)` in Arrow |
 | `IN (list)`, `BETWEEN`, `LIKE`, `CAST`, arithmetic `+ - * /` | **no** | Kept in Arrow (deliberate for arithmetic — see §3.4) |
 | Regex, JSON path, string functions | **no** | Kept in Arrow; usually much faster there anyway |
 | UDFs | **no** | By definition not expressible in the source |
@@ -104,7 +103,7 @@ byte strings) out of our hands.
 | Integer (`smallint`/`integer`/`bigint`), Boolean, Timestamp (`timestamp[tz]`) | all six | `Exact` |
 | Text (`text`, `varchar`) | all six, as `("col" COLLATE "C") op $n` | `Exact` |
 | Label (true enums from `pg_enum`) | all six, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
-| TextCast (`uuid`, `json`, `jsonb`, other `USER-DEFINED` incl. `citext`) | `=` and `<>` only, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
+| TextCast (`uuid`, `json`, `jsonb`, other `USER-DEFINED` incl. `citext`; enums when `pg_enum` is unreadable) | `=` and `<>` only, as `(CAST("col" AS text) COLLATE "C") op $n` | `Exact` |
 | Date (`date`) | all six, as a plain `"col" op $n` against a bound `date` (a plain index on the column serves it) | `Exact` |
 | Float (`real`, `double precision`) | `=` only | `Inexact` |
 | `character(n)`, numeric, bytea, arrays, other | none (only `IS [NOT] NULL`) | — |
@@ -168,7 +167,8 @@ push all six operators (label order, byte-wise — which is what Arrow compares,
 declaration order). For `uuid`/`json`/`jsonb`/other user-defined types only `=` and `<>` push;
 ordering comparisons stay in Arrow. A non-text literal against any of these has no pushable form
 and stays in Arrow. (`jsonb` equality is `Exact` because extraction selects `jsonb` as `::text` too, so Arrow
-holds exactly the text the source compared — keep the two in sync.)
+holds exactly the text the source compared. Both come from `arrow_type_mapper::selects_as_text`, the one
+definition of the columns selected as `::text`, so selection, Arrow type and pushdown kind cannot drift.)
 
 ### 3.2 NULL semantics
 
@@ -185,8 +185,9 @@ translation unless the equivalence holds under three-valued logic. Specifically,
 - Postgres `NUMERIC` has effectively unbounded precision. If we map it to `Decimal128(38, s)` and a
   row exceeds that, the *scan* fails — but a *pushed comparison* against a literal that exceeds
   our declared precision would be evaluated at full precision in the database and at truncated
-  precision in Arrow. **Rule:** comparisons on `NUMERIC` columns whose declared precision exceeds
-  38 digits are `Unsupported`, not `Inexact`, because the scan itself is already in trouble.
+  precision in Arrow. **Rule:** no comparison on a `NUMERIC` column is pushed (decimal literals are
+  not translated), and a `numeric(p,s)` with p > 38 has no Arrow type, so the column is left out of
+  the table.
 - Floats: Arrow compares with IEEE total order (`-0.0 < +0.0`, `NaN = NaN`); Postgres treats
   `-0 = 0` and orders `NaN` above everything. So `x < 0.0` or `x <> 0.0` pushed to Postgres would
   drop `-0.0` rows. **Rule:** float `=` is `Inexact` (the source returns a superset); every other
@@ -242,7 +243,10 @@ plan (Ballista scheduler/executors) carry no statistics and never refresh.
 
 `EXPLAIN` is the highest-fidelity signal and the one we lean on for the decisive cases: it tells us
 whether the candidate predicate produces an index scan or a sequential scan, and at what estimated
-cost. It is one cheap round trip and the result is cached per (table, predicate shape). A plan
+cost. It is one cheap round trip and the result is cached per (table, predicate with its literals)
+for `statistics_ttl_secs`, at most 1024 estimates (expired ones are dropped on insert, then the
+oldest). Planning only reads the cache: `el-ballista plan` warms it first and each `scan` warms it
+for later plans, so a cold cache means statistics alone. A plan
 without `Total Cost` is treated as *unknown* (the statistics estimate is used), never as free.
 
 ### Range selectivity and windows
@@ -299,7 +303,9 @@ Equality still uses `1 / n_distinct`, and `OR` / `NOT` trees keep the per-predic
 
 "Index available" means: EXPLAIN chose an index path, or a catalog index is **plain** (not
 partial, no expression keys), **btree** (hash for `=` only), and has the compared column as its
-**leading** key. `<>`, `NOT`, `IS NOT NULL` and column-to-column comparisons never count; `OR`
+**leading** key. `<>`, `NOT`, `IS NOT NULL`, column-to-column comparisons and cast operands (enum
+labels, uuid/json text, the cast null test of a TextCast column) never count; a binary-collated
+text comparison counts only on a `C`/`POSIX` column; `OR`
 counts only when every branch does; `AND` when either side does.
 
 Two guardrails override the arithmetic:
@@ -308,9 +314,10 @@ Two guardrails override the arithmetic:
   set low: we would rather move bytes than steal CPU from the application. On a dedicated read
   replica it is set high. This single knob encodes "the DB *can* do it, but it *shouldn't*", which
   is the whole motivating insight.
-- **Denylist.** Some expressions are never pushed regardless of estimated cost, because the estimate
-  is unreliable. Regex evaluation is the canonical example: `EXPLAIN` costs it as if it were a cheap
-  function, and it is not.
+- **Allowlist and column denylist.** Expressions outside the §2 allowlist are never translated,
+  whatever their estimated cost. Regex evaluation is the canonical example: `EXPLAIN` costs it as if
+  it were a cheap function, and it is not. `deny` additionally keeps any predicate that touches a
+  listed column, under every policy.
 
 ### 4.3 Policy modes
 
@@ -319,12 +326,13 @@ Two guardrails override the arithmetic:
 | `always` | Push everything expressible and safe | Dedicated replica, no production impact |
 | `never` | Keep everything in Arrow | Emergency: source is under pressure |
 | `cost_based` | The model above (default) | Normal operation |
-| `strict` | Push a filter only if every referenced column leads a plain index, selectivity is below `keep_threshold`, and every literal/column involved is primitive (bool/int/timestamp/date); keeps everything without statistics; never pushes `LIMIT`; `push` hints ignored, `deny` still applies. Pushed fidelity is the translated one | Source under pressure |
-| `hinted` | Per-column and per-predicate overrides in the job spec | When you know something the stats do not |
+| `strict` | Push a filter only if every referenced column leads a plain index, selectivity is below `keep_threshold`, the estimated cost is within `max_source_cost`, and every literal/column involved is primitive (bool/int/timestamp/date); keeps everything without statistics; never pushes `LIMIT`; `push` hints ignored, `deny` still applies. Pushed fidelity is the translated one | Source under pressure |
+| `hinted` | Per-column overrides in the job spec: predicates on a `push` column (exact name) are pushed when translatable, `deny` wins, the rest uses the cost model | When you know something the stats do not |
 
-Policy names are case-insensitive; an unknown name is a configuration error (it never falls
-back to a default, so a mistyped emergency `never` cannot fail open). `deny` matches column names
-case-insensitively. Configured per source, overridable per job (JSON job spec):
+In the job spec, policy names are exact lowercase (`"NEVER"` is a load error); `el-ballista plan
+--policy` accepts any case. An unknown name is always an error (it never falls back to a default,
+so a mistyped emergency `never` cannot fail open). `deny` matches column names
+case-insensitively. Configured per job (the job spec's `pushdown` section):
 
 ```json
 {
@@ -361,8 +369,8 @@ indices the plan needs, and narrowing `SELECT *` to four columns on a 27-column 
 larger win than any filter — it reduces bytes on the wire, decode CPU, and Arrow memory
 simultaneously.
 
-**Limit** is pushed when no `Inexact` filter is present (per DataFusion's rule) and no sort is
-being applied at the source. A `LIMIT` without `ORDER BY` returns an arbitrary subset, which is
+**Limit** is pushed when no `Inexact` filter is present (per DataFusion's rule), the policy is not
+`strict`, and no sort is being applied at the source. Each partition's query carries its own `LIMIT`. A `LIMIT` without `ORDER BY` returns an arbitrary subset, which is
 fine for sampling but must never be relied on for deterministic extraction.
 
 ---
@@ -375,10 +383,10 @@ example-based.
 1. **Differential correctness tests (implemented, `tests/pg_pushdown.rs`).** Postgres only so far:
    a table of hazards (ICU-collated text ranges, `NOT` under a nondeterministic collation, `-0.0`
    and `NaN` floats, `(NOT flag) IS NULL`, enum `OR`, `uuid`/`jsonb` equality, `IS NULL`, backslash
-   text) run with `policy = "always"` and `"never"`; the result sets must be identical, and each
+   text, dates, `IS NULL` on a composite column) run with `policy = "always"` and `"never"`; the result sets must be identical, and each
    case also asserts whether it was actually pushed, so the differential cannot pass vacuously.
-2. **Property tests (planned).** Generate random predicate trees with `proptest`, then assert the same
-   equality. Random trees find the `NOT`/`OR`/NULL interactions that hand-written tests miss.
+2. **Property tests (implemented, `tests/pg_pushdown_prop.rs`).** Generate random predicate trees
+   with `proptest` (fixed seed), then assert the same equality. Random trees find the `NOT`/`OR`/NULL interactions that hand-written tests miss.
 3. **Plan snapshot tests.** Assert the *decisions*, not just the results, so a stats or cost-model
    change that quietly disables all pushdown shows up as a diff.
 4. **Fidelity assertion (planned).** In debug builds, every predicate marked `Exact` is re-evaluated in Arrow

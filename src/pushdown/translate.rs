@@ -52,9 +52,10 @@ pub enum ColumnKind {
     /// Enumerated type whose Arrow value is its label: compared as
     /// `CAST(col AS text) COLLATE <binary>`, so every comparison is `Exact`.
     Label,
-    /// A non-string type the extractor emits as its canonical text form (uuid, json, ...):
-    /// only `=` / `<>` push, as `CAST(col AS text) COLLATE <binary>`, `Exact`. Ordering
-    /// comparisons are not pushable.
+    /// A non-string type the extractor emits as its canonical text form (uuid, json, a
+    /// composite row, ...): only `=` / `<>` push, as `CAST(col AS text) COLLATE <binary>`,
+    /// `Exact`, and `IS [NOT] NULL` tests `CAST(col AS text)`. Ordering comparisons are not
+    /// pushable.
     TextCast,
     /// Anything else: only `IS [NOT] NULL` pushes.
     Opaque,
@@ -149,15 +150,22 @@ fn exact_predicate(expr: &Expr, schema: Schema<'_>) -> Option<Predicate> {
     }
 }
 
-/// Operand of `IS [NOT] NULL`: any known column (nullness does not depend on type), or an
-/// `Exact` boolean predicate.
+/// Operand of `IS [NOT] NULL`: any known column, or an `Exact` boolean predicate.
+///
+/// A [`ColumnKind::TextCast`] column is tested through its text form, the value Arrow holds:
+/// the column itself can be row-valued (a Postgres composite type), and SQL's row `IS NULL` is
+/// true when every *field* is NULL, while the text form `(,)` of such a row is not NULL. Every
+/// other kind is a scalar, whose nullness does not depend on its type.
 fn null_test_operand(expr: &Expr, schema: Schema<'_>) -> Option<Predicate> {
     if let Expr::Column(col) = expr {
-        let known = match schema {
-            Schema::Inferred => true,
-            Schema::Known(kinds) => kinds.contains_key(&col.name),
+        let column = || Predicate::Column(col.name.clone());
+        return match schema {
+            Schema::Inferred => Some(column()),
+            Schema::Known(kinds) => match kinds.get(&col.name)? {
+                ColumnKind::TextCast => Some(as_text(column())),
+                _ => Some(column()),
+            },
         };
-        return known.then(|| Predicate::Column(col.name.clone()));
     }
     exact_predicate(expr, schema)
 }
@@ -487,8 +495,27 @@ mod tests {
     #[test]
     fn test_null_tests_on_any_known_column() {
         assert_eq!(t(col("blob").is_null()), exact(r#"("blob" IS NULL)"#));
-        assert_eq!(t(col("u").is_not_null()), exact(r#"("u" IS NOT NULL)"#));
+        assert_eq!(t(col("m").is_null()), exact(r#"("m" IS NULL)"#));
         assert_eq!(t(col("nope").is_null()), None);
+    }
+
+    #[test]
+    fn test_null_tests_on_text_cast_columns_use_the_text_form() {
+        // A text-cast column may be row-valued (a composite type), where `IS NULL` is true for
+        // a row of NULL fields and `IS NOT NULL` false for a row with any NULL field. Arrow
+        // holds the text form (`(,)`, `(1,)`): test that, in both directions and under NOT.
+        assert_eq!(
+            t(col("u").is_null()),
+            exact(r#"(CAST("u" AS text) IS NULL)"#)
+        );
+        assert_eq!(
+            t(col("u").is_not_null()),
+            exact(r#"(CAST("u" AS text) IS NOT NULL)"#)
+        );
+        assert_eq!(
+            t(Expr::Not(Box::new(col("u").is_null()))),
+            exact(r#"(NOT (CAST("u" AS text) IS NULL))"#)
+        );
     }
 
     fn ts_literal() -> ScalarValue {

@@ -41,6 +41,7 @@ use datafusion::prelude::{DataFrame, SessionConfig, SessionContext, ident};
 use datafusion::sql::TableReference;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use tracing::{Instrument, error, info, info_span, warn};
 
 use super::Pipeline;
 use super::filters::describe_group;
@@ -51,7 +52,7 @@ use super::splits::{
 use crate::checkpoint::json_store::JsonCheckpointStore;
 use crate::checkpoint::lock::JobLock;
 use crate::checkpoint::progress::{PartitionStatus, ProgressFlusher, ProgressReporter};
-use crate::checkpoint::{CheckpointStore, PlanIdentity, PlannedSplit, SplitPlan};
+use crate::checkpoint::{CheckpointError, CheckpointStore, PlanIdentity, PlannedSplit, SplitPlan};
 use crate::connector::errors::ExtractorError;
 use crate::connector::postgres::PostgresTableProvider;
 use crate::connector::postgres::distributed::DistributedContext;
@@ -255,11 +256,7 @@ impl RunRecorder {
         }
         match write_report(&self.dir, &self.report).await {
             Ok(path) => self.path = Some(path),
-            Err(e) => log::warn!(
-                "job '{}': cannot write run report for {}: {e}",
-                self.report.job_id,
-                self.report.run_id
-            ),
+            Err(e) => warn!(error = %e, "cannot write the run report"),
         }
     }
 
@@ -528,7 +525,7 @@ impl Pipeline {
             &filters,
             ExecutionMode::Distributed,
         );
-        let watch = WatchSettings::new(&self.config.distributed, &ctx.scheduler_url, &ctx.job_name);
+        let watch = ctx.watch.clone();
         Ok(DistributedPrep {
             df,
             identity,
@@ -655,31 +652,43 @@ impl Pipeline {
         target: Option<&DistributedTarget>,
     ) -> Result<RunOutcome, AppError> {
         let run_id = fresh_run_id();
-        let mut recorder = RunRecorder::new(
-            self,
-            RunKind::Diagnostic,
-            run_mode(target),
-            &run_id,
-            self.config.checkpoint.diagnostic_run_reports,
-        );
-        recorder.write().await;
-        let result = async {
-            let run = self.prepare_fresh(target, Some(&run_id)).await?;
-            recorder.record_prepared(&run);
-            let all: Vec<usize> = (0..run.splits.len()).collect();
-            let counter = |_: SplitInfo, mut stream: SendableRecordBatchStream| async move {
-                while let Some(batch) = stream.next().await {
-                    batch?;
-                }
-                Ok::<(), ConsumerError>(())
-            };
-            let done = self.execute_splits(&run, all, &counter, None, None).await;
-            recorder.record_splits(&run, &done, &[]);
-            self.outcome(&run, done, 0, 0)
+        let span = info_span!("run", job_id = %self.config.job_id, run_id = %run_id);
+        async {
+            let started = Instant::now();
+            let mut recorder = RunRecorder::new(
+                self,
+                RunKind::Diagnostic,
+                run_mode(target),
+                &run_id,
+                self.config.checkpoint.diagnostic_run_reports,
+            );
+            recorder.write().await;
+            let result = async {
+                let run = self.prepare_fresh(target, Some(&run_id)).await?;
+                recorder.record_prepared(&run);
+                info!(
+                    splits_total = run.splits.len(),
+                    concurrency = run.concurrency,
+                    "run started (diagnostic)"
+                );
+                let all: Vec<usize> = (0..run.splits.len()).collect();
+                let counter = |_: SplitInfo, mut stream: SendableRecordBatchStream| async move {
+                    while let Some(batch) = stream.next().await {
+                        batch?;
+                    }
+                    Ok::<(), ConsumerError>(())
+                };
+                let done = self.execute_splits(&run, all, &counter, None, None).await;
+                recorder.record_splits(&run, &done, &[]);
+                self.outcome(&run, done, 0, 0)
+            }
+            .await;
+            recorder.finish(result.as_ref().err()).await;
+            log_run_end(&result, started);
+            conclude(result, recorder)
         }
-        .await;
-        recorder.finish(result.as_ref().err()).await;
-        conclude(result, recorder)
+        .instrument(span)
+        .await
     }
 
     // ----- checkpointed terminal -----
@@ -695,44 +704,44 @@ impl Pipeline {
         F: Fn(SplitInfo, SendableRecordBatchStream) -> Fut,
         Fut: Future<Output = Result<(), ConsumerError>>,
     {
-        let store = JsonCheckpointStore::new(&self.config.checkpoint.dir)?;
-        let ttl = Duration::from_secs(self.config.checkpoint.lock_ttl_secs);
-        // A run that cannot take the job lock never started: no report.
-        let lock = store.lock(&self.config.job_id, ttl).await?;
         let run_id = fresh_run_id();
-        let mut recorder = RunRecorder::new(
-            self,
-            RunKind::Checkpointed,
-            run_mode(target),
-            &run_id,
-            self.config.checkpoint.run_reports,
-        );
-        recorder.write().await;
-        let result = self
-            .run_locked(target, &store, &lock, &consumer, &run_id, &mut recorder)
-            .await;
-        let released = lock.release().await;
-        let result = match (result, released) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Ok(_), Err(e)) => Err(e.into()),
-            (Err(e), Err(release_err)) => {
-                log::warn!(
-                    "job '{}': releasing the run lock failed: {release_err}",
-                    self.config.job_id
-                );
-                Err(e)
-            }
-            (Err(e), Ok(())) => Err(e),
-        };
-        recorder.finish(result.as_ref().err()).await;
-        if let Some(path) = &recorder.path {
-            log::info!(
-                "job '{}': run report {}",
-                self.config.job_id,
-                path.display()
+        let span = info_span!("run", job_id = %self.config.job_id, run_id = %run_id);
+        async {
+            let started = Instant::now();
+            let store = JsonCheckpointStore::new(&self.config.checkpoint.dir)?;
+            let ttl = Duration::from_secs(self.config.checkpoint.lock_ttl_secs);
+            // A run that cannot take the job lock never started: no report.
+            let lock = store.lock(&self.config.job_id, ttl).await?;
+            let mut recorder = RunRecorder::new(
+                self,
+                RunKind::Checkpointed,
+                run_mode(target),
+                &run_id,
+                self.config.checkpoint.run_reports,
             );
+            recorder.write().await;
+            let result = self
+                .run_locked(target, &store, &lock, &consumer, &run_id, &mut recorder)
+                .await;
+            let released = lock.release().await;
+            let result = match (result, released) {
+                (Ok(outcome), Ok(())) => Ok(outcome),
+                (Ok(_), Err(e)) => Err(e.into()),
+                (Err(e), Err(release_err)) => {
+                    warn!(error = %release_err, "releasing the run lock failed");
+                    Err(e)
+                }
+                (Err(e), Ok(())) => Err(e),
+            };
+            recorder.finish(result.as_ref().err()).await;
+            if let Some(path) = &recorder.path {
+                info!(path = %path.display(), "run report written");
+            }
+            log_run_end(&result, started);
+            conclude(result, recorder)
         }
-        conclude(result, recorder)
+        .instrument(span)
+        .await
     }
 
     async fn run_locked<F, Fut>(
@@ -754,9 +763,9 @@ impl Pipeline {
         let splits = match store.read(job_id).await? {
             Some(existing) => {
                 existing.check_plan(prep.identity())?;
-                log::info!(
-                    "job '{job_id}': resuming checkpoint {} with its stored split bounds",
-                    prep.identity().fingerprint()
+                info!(
+                    fingerprint = %prep.identity().fingerprint(),
+                    "resuming the checkpoint's stored splits"
                 );
                 existing.stored_splits()
             }
@@ -781,11 +790,12 @@ impl Pipeline {
             .map(|(index, s)| (index, s.rows_extracted))
             .collect();
         recorder.record_prepared(&run);
-        log::info!(
-            "job '{job_id}': {} split(s), {} pending, {skipped} already completed (concurrency {})",
-            run.splits.len(),
-            pending.len(),
-            run.concurrency
+        info!(
+            splits_total = run.splits.len(),
+            pending = pending.len(),
+            completed = skipped,
+            concurrency = run.concurrency,
+            "run started"
         );
 
         let flusher = ProgressFlusher::start(
@@ -826,9 +836,10 @@ impl Pipeline {
         Fut: Future<Output = Result<(), ConsumerError>>,
     {
         futures::stream::iter(targets)
-            .map(|index| async move {
+            .map(|index| {
+                let span = info_span!("split", split_id = %run.splits[index].split_id);
                 self.execute_split(run, index, consumer, commit, reporter)
-                    .await
+                    .instrument(span)
             })
             .buffer_unordered(run.concurrency.max(1))
             .collect()
@@ -857,8 +868,8 @@ impl Pipeline {
             bytes: 0,
             elapsed_ms: 0,
         };
-        if let Some((store, _)) = commit
-            && let Err(e) = store.mark_running(job_id, &split.split_id).await
+        if let Some((store, lock)) = commit
+            && let Err(e) = fenced(lock, store.mark_running(job_id, &split.split_id)).await
         {
             return failed_early(e.into());
         }
@@ -890,24 +901,18 @@ impl Pipeline {
 
         match (&result, commit) {
             (Ok(rows), Some((store, lock))) => {
-                let committed = match lock.ensure_held() {
-                    Ok(()) => store
-                        .mark_completed(job_id, &split.split_id, *rows)
-                        .await
-                        .map_err(AppError::from),
-                    Err(e) => Err(AppError::from(e)),
-                };
+                let committed =
+                    fenced(lock, store.mark_completed(job_id, &split.split_id, *rows)).await;
                 if let Err(e) = committed {
-                    result = Err(e);
+                    result = Err(e.into());
                 }
             }
-            (Err(e), Some((store, _))) => {
+            (Err(e), Some((store, lock))) => {
                 let message = error_chain(e).join(": ");
-                if let Err(mark_err) = store.mark_failed(job_id, &split.split_id, &message).await {
-                    log::error!(
-                        "job '{job_id}': cannot record {} as failed: {mark_err}",
-                        split.split_id
-                    );
+                let recorded =
+                    fenced(lock, store.mark_failed(job_id, &split.split_id, &message)).await;
+                if let Err(mark_err) = recorded {
+                    warn!(error = %mark_err, "cannot record the split as failed");
                 }
             }
             (_, None) => {}
@@ -918,20 +923,18 @@ impl Pipeline {
                 Err(e) => PartitionStatus::failed(index, split.split_id.clone(), 0, e.to_string()),
             });
         }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
-            Ok(rows) => log::info!(
-                "job '{job_id}' split={} done rows={rows} elapsed_ms={}",
-                split.split_id,
-                started.elapsed().as_millis()
-            ),
-            Err(e) => log::warn!("job '{job_id}' split={} failed: {e}", split.split_id),
+            Ok(rows) => info!(rows, batches, bytes, elapsed_ms, "split completed"),
+            // The one place a split failure is logged (lower layers only return it).
+            Err(e) => error!(error = %error_chain(e).join(": "), elapsed_ms, "split failed"),
         }
         SplitRun {
             index,
             result,
             batches,
             bytes,
-            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms,
         }
     }
 
@@ -980,6 +983,43 @@ impl Pipeline {
     }
 }
 
+/// The run's last line: `info` when it succeeded; `error`, once, when it failed — with the full
+/// chain, except for `SplitsFailed`, whose splits each logged their own failure already.
+fn log_run_end(result: &Result<RunCounts, AppError>, started: Instant) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(counts) => info!(
+            rows = counts.rows_delivered,
+            splits_completed = counts.splits_completed,
+            splits_skipped = counts.splits_skipped,
+            splits_total = counts.splits_total,
+            elapsed_ms,
+            "run finished"
+        ),
+        Err(AppError::SplitsFailed {
+            total, failures, ..
+        }) => error!(
+            failed = failures.len(),
+            splits_total = *total,
+            elapsed_ms,
+            "run failed: split(s) failed"
+        ),
+        Err(e) => error!(error = %error_chain(e).join(": "), elapsed_ms, "run failed"),
+    }
+}
+
+/// A split-state write (running, completed, failed), made only while this run still owns the
+/// job's lock. A run whose lock was taken over must leave the new owner's split states alone:
+/// flipping a split the new owner completed back to `Failed` or `Running` would deliver its
+/// rows again. `write` is lazy, so a refused write never starts.
+async fn fenced(
+    lock: &JobLock,
+    write: impl Future<Output = Result<(), CheckpointError>>,
+) -> Result<(), CheckpointError> {
+    lock.ensure_held().await?;
+    write.await
+}
+
 /// Decide what a consumer's return means for its split.
 fn settle(
     split_id: &str,
@@ -1007,14 +1047,54 @@ fn settle(
             split_id: split_id.to_string(),
             reason: "the stream was not read to the end",
         }),
-        Ok(()) => {
-            log::debug!(
-                "split={split_id} delivered rows={} batches={} bytes={}",
-                progress.rows(),
-                progress.batches(),
-                progress.bytes()
-            );
-            Ok(progress.rows())
-        }
+        Ok(()) => Ok(progress.rows()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::checkpoint::lock::LockInfo;
+    use crate::types::JobId;
+
+    #[tokio::test]
+    async fn fenced_writes_only_while_the_lock_is_held() {
+        let dir =
+            std::env::temp_dir().join(format!("el_ballista_run_fenced_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = JsonCheckpointStore::new(&dir).unwrap();
+        let lock = store
+            .lock(&JobId::new("j").unwrap(), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        let wrote = AtomicBool::new(false);
+        let write = || async {
+            wrote.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        fenced(&lock, write()).await.unwrap();
+        assert!(wrote.swap(false, Ordering::SeqCst), "held: the write runs");
+
+        // Another run takes the lock over: the write must not even start.
+        let now = chrono::Utc::now();
+        let thief = LockInfo {
+            owner_id: "thief".into(),
+            host: "h".into(),
+            pid: 1,
+            acquired_at: now,
+            heartbeat_at: now,
+        };
+        std::fs::write(lock.path(), serde_json::to_vec(&thief).unwrap()).unwrap();
+        assert!(matches!(
+            fenced(&lock, write()).await,
+            Err(CheckpointError::LockLost { .. })
+        ));
+        assert!(!wrote.load(Ordering::SeqCst), "lost: the write never ran");
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

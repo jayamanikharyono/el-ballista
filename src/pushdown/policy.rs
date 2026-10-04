@@ -79,36 +79,9 @@ pub enum Decision {
     Keep,
 }
 
-/// Decision over an already-translated predicate: policy × denylist × push hints × cost model.
-/// The pushed fidelity is always the translated one.
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::pushdown::decide_translated;
-/// use std::collections::HashMap;
-/// use datafusion::prelude::{col, lit};
-/// use el_ballista::pushdown::cost_model::CostParams;
-/// use el_ballista::pushdown::stats::SourceStatistics;
-/// use el_ballista::pushdown::{ColumnKinds, CostInputs, Decision, PushdownPolicy, translate};
-///
-/// let stats = SourceStatistics {
-///     table_name: "orders".into(), row_count_estimate: 1e6, table_size_bytes: 0,
-///     columns: HashMap::new(), fetched_at: chrono::Utc::now(),
-/// };
-/// let (params, kinds) = (CostParams::default(), ColumnKinds::new());
-/// let inputs = CostInputs {
-///     stats: &stats, params: &params, indexes: &[], explain: None, column_kinds: &kinds,
-///     siblings: &[],
-/// };
-/// let (fidelity, predicate) = translate(&col("id").eq(lit(7i64))).unwrap();
-/// let deny = ["id".to_string()];
-/// let pushed = decide_translated(fidelity, predicate.clone(), PushdownPolicy::Always, &[], &[], &inputs);
-/// assert!(matches!(pushed, Decision::Push { .. }));
-/// let kept = decide_translated(fidelity, predicate, PushdownPolicy::Always, &deny, &[], &inputs);
-/// assert!(matches!(kept, Decision::Keep));
-/// ```
-pub fn decide_translated(
+/// [`decide_explained`]'s verdict alone (tests).
+#[cfg(test)]
+pub(crate) fn decide_translated(
     fidelity: Fidelity,
     predicate: Predicate,
     policy: PushdownPolicy,
@@ -119,35 +92,9 @@ pub fn decide_translated(
     decide_explained(fidelity, predicate, policy, deny, push, inputs).0
 }
 
-/// [`decide_translated`] plus a human-readable reason for the verdict (for `el-ballista plan
+/// The pushdown verdict for one translated filter, with a human-readable reason (for `el-ballista plan
 /// --explain`). One function computes both, so the explanation can never describe a different
 /// decision than the one taken.
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::pushdown::decide_explained;
-/// use std::collections::HashMap;
-/// use datafusion::prelude::{col, lit};
-/// use el_ballista::pushdown::cost_model::CostParams;
-/// use el_ballista::pushdown::stats::SourceStatistics;
-/// use el_ballista::pushdown::{ColumnKinds, CostInputs, Decision, PushdownPolicy, translate};
-///
-/// let stats = SourceStatistics {
-///     table_name: "orders".into(), row_count_estimate: 1e6, table_size_bytes: 0,
-///     columns: HashMap::new(), fetched_at: chrono::Utc::now(),
-/// };
-/// let (params, kinds) = (CostParams::default(), ColumnKinds::new());
-/// let inputs = CostInputs {
-///     stats: &stats, params: &params, indexes: &[], explain: None, column_kinds: &kinds,
-///     siblings: &[],
-/// };
-/// let (fidelity, predicate) = translate(&col("id").eq(lit(7i64))).unwrap();
-/// let (decision, reason) =
-///     decide_explained(fidelity, predicate, PushdownPolicy::Never, &[], &[], &inputs);
-/// assert!(matches!(decision, Decision::Keep));
-/// assert_eq!(reason, "policy=never");
-/// ```
 pub fn decide_explained(
     fidelity: Fidelity,
     predicate: Predicate,

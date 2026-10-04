@@ -36,7 +36,8 @@ Everything here is implemented in `src/connector/mysql/` and exercised by `tests
   used (marked `TODO(mysql-pushdown)` in the code).
 - **Extraction** — full table only, optionally projected; an unknown projection column is
   `MysqlError::UnknownColumns`. One plain `` SELECT `c1`, … FROM `db`.`t` `` (no casts, no
-  `ORDER BY` — row order is unspecified) over a sqlx prepared statement (binary protocol).
+  `ORDER BY` — row order is unspecified), plus one `` (`col` = 0) `` zero-date marker per temporal
+  column (§3), over a sqlx prepared statement (binary protocol).
   - `extract_full_table_for_each_batch(table, columns, batch_size, on_batch)` streams rows with
     sqlx `fetch` and calls `on_batch` with one `RecordBatch` per `batch_size` rows (the tail
     batch may be smaller): at most one batch of rows is resident. Returns the Arrow schema (also
@@ -47,7 +48,8 @@ Everything here is implemented in `src/connector/mysql/` and exercised by `tests
     table into one `RecordBatch` — for small tables and tests.
 - **Errors** — typed `MysqlError` (`Source`, `Arrow`, `Extractor`, `TableNotFound`,
   `UnknownColumns`, `InvalidBatchSize`, `Decode { column }`, `OutOfRange { column, target }`,
-  `NotBoolean { column }`), each keeping its cause as `#[source]`; messages name tables and
+  `NotBoolean { column }`, `ZeroDate { column }`); variants that wrap a lower-level failure keep it
+  as `#[source]`; messages name tables and
   columns, never row values or credentials. A decode failure fails the extraction — it is never
   turned into NULL or zero rows.
 - **Consistency** — a single statement on one connection: whatever that statement sees under the
@@ -140,7 +142,7 @@ The table below is **what ships** (`type_mapper::arrow_type_for`, decoded by `ro
 | `BINARY` / `VARBINARY` / `BLOB` family | `Binary` | Chosen from `DATA_TYPE`, not the protocol type |
 | `ENUM` | `Utf8` | `Dictionary(Int32, Utf8)` is *(design, not implemented)* |
 | `SET` | `Utf8` | Comma-joined as stored |
-| `JSON` | `Utf8` | Parsed and re-serialized by `serde_json` (key order / whitespace normalized) |
+| `JSON` | `Utf8` | Parsed and re-serialized by `serde_json` (keys sorted, whitespace normalized; without its `arbitrary_precision` feature, numbers beyond `i64`/`u64` become `f64` and can lose precision) |
 | spatial and any other type | `Utf8` | Decoded as a string; a type sqlx cannot decode as a string fails with `MysqlError::Decode` |
 
 ---
@@ -173,8 +175,9 @@ visible.
 **Case-insensitive collation.** MySQL 8.0's default `utf8mb4_0900_ai_ci` is accent- and
 case-insensitive, so `WHERE status = 'PAID'` matches `'paid'` in MySQL and not in Arrow. In the
 design, every string predicate on a `_ci` or `_ai` column is pushed as **`Inexact`**, never
-`Exact`. *(Pushdown is not implemented for MySQL; `MysqlDialect` currently rates every text or
-float comparison `Inexact` without looking at the collation.)*
+`Exact`. *(Pushdown is not implemented for MySQL: `MysqlDialect` only renders identifiers, casts and
+the binary collation, and no MySQL column-kind classification exists, so nothing decides
+fidelity yet.)*
 This is covered in full in [pushdown §3.1](../pushdown.md#31-string-collation) and it
 is the single most likely way to get silently wrong results from this connector.
 

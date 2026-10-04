@@ -16,7 +16,7 @@ pub trait PredicateInlineSql {
     /// # Examples
     /// ```
     /// use datafusion::prelude::{col, lit};
-    /// use el_ballista::connector::postgres::inline_sql::PredicateInlineSql;
+    /// use el_ballista::connector::postgres::internals::PredicateInlineSql;
     /// use el_ballista::pushdown::translate;
     /// let (_, p) = translate(&col("id").eq(lit(7i64))).unwrap();
     /// assert_eq!(p.render_inline(), r#"("id" = 7)"#);

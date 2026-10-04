@@ -1,94 +1,17 @@
 //! Postgres statistics collection. The backend-agnostic types and the [`TableStatsSource`] trait
 //! live in [`crate::pushdown::stats`]; this is the Postgres implementation (`pg_class`,
-//! `pg_stats`, `pg_index`, `pg_enum`) plus the TTL-caching [`StatisticsCollector`].
+//! `pg_stats`, `pg_index`, `pg_enum`).
 //!
 //! [`TableStatsSource`]: crate::pushdown::stats::TableStatsSource
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::connector::errors::ExtractorError;
 use crate::pushdown::stats::{ColumnStats, IndexInfo, SourceStatistics, TableStatsSource};
-
-/// TTL cache over a [`TableStatsSource`] so the catalog is not hit on every plan.
-pub struct StatisticsCollector {
-    pool: Arc<PgPool>,
-    cache: Arc<RwLock<HashMap<String, SourceStatistics>>>,
-    ttl_secs: u64,
-}
-
-impl StatisticsCollector {
-    /// A collector over `pool` whose cached statistics expire after `ttl_secs`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
-    /// use std::sync::Arc;
-    /// use el_ballista::connector::postgres::stats::StatisticsCollector;
-    ///
-    /// let collector = StatisticsCollector::new(Arc::new(ex.pool().clone()), 900);
-    /// let stats = collector.get_statistics("public", "orders").await?; // cached for 15 min
-    /// println!("~{} rows, {} bytes", stats.row_count_estimate, stats.table_size_bytes);
-    /// # Ok(()) }
-    /// ```
-    pub fn new(pool: Arc<PgPool>, ttl_secs: u64) -> Self {
-        Self {
-            pool,
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            ttl_secs,
-        }
-    }
-
-    /// Fetch or cached table statistics. If cached and fresh, returns the cached version;
-    /// otherwise fetches from pg_stats and pg_class and updates the cache.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn demo(ex: &el_ballista::connector::postgres::PostgresExtractor)
-    /// # -> Result<(), el_ballista::connector::errors::ExtractorError> {
-    /// use std::sync::Arc;
-    /// use el_ballista::connector::postgres::stats::StatisticsCollector;
-    ///
-    /// let collector = StatisticsCollector::new(Arc::new(ex.pool().clone()), 900);
-    /// let stats = collector.get_statistics("public", "orders").await?; // cached for 15 min
-    /// println!("~{} rows, {} bytes", stats.row_count_estimate, stats.table_size_bytes);
-    /// # Ok(()) }
-    /// ```
-    pub async fn get_statistics(
-        &self,
-        schema_name: &str,
-        table_name: &str,
-    ) -> Result<SourceStatistics, ExtractorError> {
-        let cache_key = format!("{}.{}", schema_name, table_name);
-        let ttl = Duration::seconds(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX));
-
-        {
-            let cache = self.cache.read().await;
-            if let Some(stats) = cache.get(&cache_key) {
-                let age = Utc::now().signed_duration_since(stats.fetched_at);
-                if age < ttl {
-                    return Ok(stats.clone());
-                }
-            }
-        }
-
-        let stats = self.pool.table_statistics(schema_name, table_name).await?;
-
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(cache_key, stats.clone());
-        }
-
-        Ok(stats)
-    }
-}
 
 /// Postgres encodes `pg_stats.n_distinct < 0` as a negated *fraction* of the row count
 /// (`-1` = every row distinct). Convert to the absolute count [`ColumnStats`] expects; with no
@@ -291,9 +214,10 @@ impl TableStatsSource for PgPool {
                     }
                 }
             }
-            Err(e) => log::warn!(
-                "histogram statistics unavailable for {schema_name}.{table_name}: {e}; range \
-                 estimates use defaults"
+            Err(e) => warn!(
+                table = %format!("{schema_name}.{table_name}"),
+                error = %e,
+                "histogram statistics unavailable; range estimates use defaults"
             ),
         }
 

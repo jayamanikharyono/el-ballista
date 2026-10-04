@@ -83,7 +83,8 @@ The reason to write this document now rather than later — these are cheap to m
 to retrofit:
 
 - **Keep the public API on owned, `Send + Sync` types.** Lifetimes on public structs are painful to
-  express through PyO3.
+  express through PyO3. Not met today: the extraction builders borrow the connector
+  (`ExtractBuilder<'a>`, `StandaloneExtraction<'a>`, `DistributedExtraction<'a>`).
 - **Errors carry structured context**, not just strings, so they can map onto a Python exception
   hierarchy (`ExtractError`, `SourceError`, `SchemaError`, `CheckpointError`) instead of collapsing
   into one opaque `RuntimeError`.
@@ -94,8 +95,9 @@ to retrofit:
 - **Async boundaries stay inside the Rust library** (the `connector::postgres` builders /
   `ExtractContext`). The binding layer should call synchronous
   wrappers that own a Tokio runtime, rather than exposing Rust futures to Python's event loop.
-- **`ExtractContext` owns its runtime and is cheap to construct**, so a Python object can hold one
-  without lifetime gymnastics.
+- **A bindable `ExtractContext` would own its runtime and be cheap to construct**, so a Python
+  object can hold one without lifetime gymnastics. Today it holds only a DataFusion
+  `SessionContext` and the job config, and `from_config` is async on the caller's runtime.
 
 ## Open questions to answer before starting
 

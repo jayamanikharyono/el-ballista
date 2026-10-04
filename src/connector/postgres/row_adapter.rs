@@ -24,7 +24,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use sqlx::postgres::{PgRow, PgValueFormat};
+use sqlx::postgres::{PgColumn, PgRow, PgValueFormat};
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _};
 use std::sync::Arc;
 
@@ -39,28 +39,6 @@ impl PostgresRowAdapter {
     /// The Arrow schema for a projection: one field per column, in metadata order, with the
     /// mapped type and the catalog nullability. The single schema source for the provider,
     /// the execution plan and both decoders.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use arrow::datatypes::DataType;
-    /// use el_ballista::connector::postgres::row_adapter::PostgresRowAdapter;
-    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
-    ///
-    /// let col = |name: &str, data_type: &str, is_nullable| ColumnMetadata {
-    ///     column_name: name.into(), data_type: data_type.into(), is_nullable,
-    ///     numeric_precision: None, numeric_scale: None, udt_name: None, collation_name: None,
-    /// };
-    /// let meta = TableMetadata {
-    ///     schema_name: "public".into(),
-    ///     table_name: "orders".into(),
-    ///     columns: vec![col("id", "bigint", false), col("status", "text", true)],
-    /// };
-    /// let schema = PostgresRowAdapter::build_arrow_schema(&meta)?;
-    /// assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-    /// assert!(!schema.field(0).is_nullable() && schema.field(1).is_nullable());
-    /// # Ok::<(), el_ballista::connector::errors::ExtractorError>(())
-    /// ```
     pub fn build_arrow_schema(
         table_metadata: &TableMetadata,
     ) -> Result<Arc<Schema>, ExtractorError> {
@@ -319,16 +297,6 @@ fn unsupported(column: &str, arrow_type: &str, reason: &str) -> ExtractorError {
 /// Postgres binary `timestamp[tz]` (µs since 2000-01-01, `i64::MAX`/`i64::MIN` =
 /// `±infinity`) → Arrow µs since 1970-01-01. Infinity and out-of-range values are typed
 /// errors, never a fabricated timestamp.
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::connector::postgres::row_adapter::pg_timestamp_to_arrow;
-///
-/// assert_eq!(pg_timestamp_to_arrow(0, "ts").unwrap(), 946_684_800_000_000);
-/// assert!(pg_timestamp_to_arrow(i64::MAX, "ts").is_err());
-/// assert!(pg_timestamp_to_arrow(i64::MIN, "ts").is_err());
-/// ```
 pub fn pg_timestamp_to_arrow(pg_micros: i64, column: &str) -> Result<i64, ExtractorError> {
     const TS: &str = "Timestamp(Microsecond)";
     match pg_micros {
@@ -342,15 +310,6 @@ pub fn pg_timestamp_to_arrow(pg_micros: i64, column: &str) -> Result<i64, Extrac
 
 /// Postgres binary `date` (days since 2000-01-01, `i32::MAX`/`i32::MIN` = `±infinity`)
 /// → Arrow `Date32` (days since 1970-01-01). Infinity and overflow are typed errors.
-///
-/// # Examples
-///
-/// ```
-/// use el_ballista::connector::postgres::row_adapter::pg_date_to_arrow;
-///
-/// assert_eq!(pg_date_to_arrow(0, "d").unwrap(), 10_957);
-/// assert!(pg_date_to_arrow(i32::MAX, "d").is_err());
-/// ```
 pub fn pg_date_to_arrow(pg_days: i32, column: &str) -> Result<i32, ExtractorError> {
     match pg_days {
         i32::MAX => Err(unsupported(column, "Date32", "date 'infinity'")),
@@ -510,32 +469,14 @@ pub struct RowBatchBuilder {
 }
 
 impl RowBatchBuilder {
-    /// Create a builder pre-sized for 1024 rows.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::connector::postgres::row_adapter::RowBatchBuilder;
-    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
-    ///
-    /// let col = |name: &str, data_type: &str, is_nullable| ColumnMetadata {
-    ///     column_name: name.into(), data_type: data_type.into(), is_nullable,
-    ///     numeric_precision: None, numeric_scale: None, udt_name: None, collation_name: None,
-    /// };
-    /// let meta = TableMetadata {
-    ///     schema_name: "public".into(),
-    ///     table_name: "orders".into(),
-    ///     columns: vec![col("id", "bigint", false), col("status", "text", true)],
-    /// };
-    /// let builder = RowBatchBuilder::new(&meta)?;
-    /// assert_eq!(builder.row_count(), 0);
-    /// # Ok::<(), el_ballista::connector::errors::ExtractorError>(())
-    /// ```
-    pub fn new(table_metadata: &TableMetadata) -> Result<Self, ExtractorError> {
+    /// Create a builder pre-sized for 1024 rows (tests).
+    #[cfg(test)]
+    pub(crate) fn new(table_metadata: &TableMetadata) -> Result<Self, ExtractorError> {
         Self::with_capacity(table_metadata, 1024)
     }
 
-    /// Create a builder pre-sized for `capacity` rows, with no byte cap.
+    /// Create a builder pre-sized for `capacity` rows, with no byte cap (tests).
+    #[cfg(test)]
     pub(crate) fn with_capacity(
         table_metadata: &TableMetadata,
         capacity: usize,
@@ -596,7 +537,7 @@ impl RowBatchBuilder {
     /// `String`/`Vec`.
     pub(crate) fn append_row(&mut self, row: &PgRow) -> Result<(), ExtractorError> {
         if !self.row_types_checked {
-            self.check_row_types(row)?;
+            self.check_column_types(row.columns())?;
             self.row_types_checked = true;
         }
         let mut bytes = 0usize;
@@ -624,9 +565,9 @@ impl RowBatchBuilder {
 
     /// Verify, once per scan, that the server sends what each decoder expects: a
     /// mismatch (e.g. a concurrent `ALTER TABLE … TYPE`) is an error, never a
-    /// misinterpreted byte pattern.
-    fn check_row_types(&self, row: &PgRow) -> Result<(), ExtractorError> {
-        let described = row.columns();
+    /// misinterpreted byte pattern. The cursor path checks its first row's description; the
+    /// COPY path (whose binary rows carry no types) a `Describe` of its inner SELECT.
+    pub(crate) fn check_column_types(&self, described: &[PgColumn]) -> Result<(), ExtractorError> {
         if self.columns.is_empty() {
             return Ok(()); // `SELECT 1` for a zero-column projection: nothing decoded.
         }
@@ -677,31 +618,6 @@ impl RowBatchBuilder {
     /// Check if the builder is empty.
     pub(crate) fn is_empty(&self) -> bool {
         self.row_count == 0
-    }
-
-    /// Get the current row count.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use el_ballista::connector::postgres::row_adapter::RowBatchBuilder;
-    /// use el_ballista::types::{ColumnMetadata, TableMetadata};
-    ///
-    /// let col = |name: &str, data_type: &str, is_nullable| ColumnMetadata {
-    ///     column_name: name.into(), data_type: data_type.into(), is_nullable,
-    ///     numeric_precision: None, numeric_scale: None, udt_name: None, collation_name: None,
-    /// };
-    /// let meta = TableMetadata {
-    ///     schema_name: "public".into(),
-    ///     table_name: "orders".into(),
-    ///     columns: vec![col("id", "bigint", false), col("status", "text", true)],
-    /// };
-    /// let builder = RowBatchBuilder::new(&meta)?;
-    /// assert_eq!(builder.row_count(), 0);
-    /// # Ok::<(), el_ballista::connector::errors::ExtractorError>(())
-    /// ```
-    pub fn row_count(&self) -> usize {
-        self.row_count
     }
 
     /// Count one row appended through [`Self::append_copy_field`]. Split out because the

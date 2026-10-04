@@ -11,11 +11,10 @@ mod common;
 
 use common::{TEST_PASSWORD_ENV, TestDb};
 use el_ballista::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
-    PushdownConfig, SourceConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
+    ParallelScanConfig, PushdownConfig, PushdownPolicy, SourceConfig,
 };
 use el_ballista::connector::postgres::PostgresConnector;
-use el_ballista::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
@@ -25,8 +24,40 @@ macro_rules! live {
     };
 }
 
+/// The explicit keyset range `[lo, hi)` on `column` of `hostile`, as job filters
+/// (`column>=lo`, `column<hi`) pushed to the source (policy `always`), so the range is part
+/// of the source query (bound literals in the cursor's `DECLARE … FOR`) as in a keyset
+/// partition scan; cursor path, `batch_size` rows per FETCH.
+fn keyset_range_job(db: &TestDb, column: &str, lo: i64, hi: i64, batch_size: usize) -> JobConfig {
+    let mut config = db.extraction_job("hostile", None);
+    config.filters = vec![
+        FilterEntry::Single(FilterInput::Shorthand(format!("{column}>={lo}"))),
+        FilterEntry::Single(FilterInput::Shorthand(format!("{column}<{hi}"))),
+    ];
+    config.pushdown.policy = PushdownPolicy::Always;
+    config.execution.use_copy = false;
+    config.execution.batch_size = batch_size;
+    config
+}
+
+/// Both range bounds of a [`keyset_range_job`] execute in the source, not in Arrow — so the
+/// keyset comparison below is not vacuously the full scan filtered in Arrow.
+async fn assert_range_pushed(config: &JobConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let decisions = PostgresConnector::from_config(config.clone())?
+        .explain_filters()
+        .await?;
+    assert_eq!(decisions.len(), 2, "both range bounds decided");
+    for d in &decisions {
+        assert!(
+            d.pushed_to_source,
+            "range bound {} must run in the source: {}",
+            d.filter, d.reason
+        );
+    }
+    Ok(())
+}
+
 fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
-    use el_ballista::config::{FilterEntry, FilterInput};
     let filters = filters
         .into_iter()
         .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))
@@ -68,37 +99,28 @@ fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
 #[tokio::test]
 async fn full_keyset_and_filtered_agree() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
-    let ex = PostgresExtractor::connect(
-        &db.host,
-        db.port,
-        &db.user,
-        &db.password,
-        &db.database,
-        4,
-        300_000,
-        "relex-test",
-    )
-    .await?;
 
-    let full = ex.extract_full_table(&db.table(), None).await?;
+    // Full scan: cursor path, default batch size, unsplit, no filters.
+    let full = common::extract_one(&db.extraction_job("hostile", None)).await?;
     assert_eq!(full.num_rows(), common::HOSTILE_ROWS);
 
     // Keyset partitions tiling the id space union to the full scan (metamorphic oracle).
-    let a = ex
-        .extract_keyset_partition(&db.table(), None, "id", 0, 5)
-        .await?;
-    let b = ex
-        .extract_keyset_partition(&db.table(), None, "id", 5, 1_000_000)
-        .await?;
+    let default_batch = db.extraction_job("hostile", None).execution.batch_size;
+    let range_a = keyset_range_job(&db, "id", 0, 5, default_batch);
+    let range_b = keyset_range_job(&db, "id", 5, 1_000_000, default_batch);
+    assert_range_pushed(&range_a).await?;
+    assert_range_pushed(&range_b).await?;
+    let a = common::extract_one(&range_a).await?;
+    let b = common::extract_one(&range_b).await?;
     let mut union_ids = common::int64_col(&a, "id");
     union_ids.extend(common::int64_col(&b, "id"));
     union_ids.sort_unstable();
     assert_eq!(union_ids, sorted(common::int64_col(&full, "id")));
 
     // Cursor path with a tiny batch size: exercises DECLARE/FETCH batching.
-    let cursor_batches = ex
-        .extract_keyset_partition_via_cursor(&db.table(), None, "id", 0, 1_000_000, 3)
-        .await?;
+    let tiny = keyset_range_job(&db, "id", 0, 1_000_000, 3);
+    assert_range_pushed(&tiny).await?;
+    let cursor_batches = common::extract_batches(&tiny).await?;
     let cursor_rows: usize = cursor_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(cursor_rows, common::HOSTILE_ROWS);
 

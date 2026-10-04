@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Preview pushdown decisions before extracting.
     println!("\n► Step 2: Preview pushdown decisions");
     let connector = PostgresConnector::from_config(config)?;
-    for decision in connector.pipeline().explain_filters().await? {
+    for decision in connector.explain_filters().await? {
         println!(
             "  filter {:<12} -> pushed_to_source={} ({})",
             decision.filter, decision.pushed_to_source, decision.reason

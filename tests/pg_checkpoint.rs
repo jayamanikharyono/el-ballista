@@ -27,7 +27,7 @@ use el_ballista::config::{
     ParallelScanConfig, ParallelStrategy, PushdownConfig, SourceConfig,
 };
 use el_ballista::connector::postgres::PostgresConnector;
-use el_ballista::connector::postgres::pipeline::SplitInfo;
+use el_ballista::connector::postgres::SplitInfo;
 use el_ballista::errors::{AppError, ConsumerError};
 use futures::TryStreamExt;
 

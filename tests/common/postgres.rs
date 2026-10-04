@@ -20,6 +20,10 @@
 //! timeout, failures logged) or via the explicit `TestDb::cleanup().await`. Tests can run in
 //! parallel.
 
+use el_ballista::config::{
+    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
+    PushdownConfig, PushdownPolicy, SourceConfig,
+};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
 use std::str::FromStr;
@@ -303,4 +307,108 @@ pub fn sorted_by(
     let indices =
         arrow::compute::sort_to_indices(batch.column(idx), None, None).expect("sort_to_indices");
     arrow::compute::take_record_batch(batch, &indices).expect("take_record_batch")
+}
+
+impl TestDb {
+    /// A job extracting `table` (this database's private schema) through the public connector:
+    /// every row, `columns` (`None` = all), the cursor path, the default batch size, unsplit,
+    /// pushdown `never` (filters, if a test adds any, evaluated in Arrow). Tests adjust
+    /// `execution` / `parallel_scan` / `filters` / `pushdown` for the path under test.
+    pub fn extraction_job(&self, table: &str, columns: Option<&[&str]>) -> JobConfig {
+        JobConfig {
+            job_id: format!("x-{}-{table}", self.schema).parse().unwrap(),
+            table: table.to_string(),
+            columns: columns.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            filters: Vec::new(),
+            source: SourceConfig {
+                host: self.host.clone(),
+                port: self.port,
+                user: self.user.clone(),
+                password_env: TEST_PASSWORD_ENV.to_string(),
+                database: self.database.clone(),
+                pool_max: 4,
+                statement_timeout_ms: 300_000,
+                application_name: "relex-test".to_string(),
+                schema: self.schema.clone(),
+            },
+            checkpoint: CheckpointConfig {
+                dir: std::env::temp_dir()
+                    .join(format!("relex_x_{}", self.schema))
+                    .to_string_lossy()
+                    .to_string(),
+                ..CheckpointConfig::default()
+            },
+            pushdown: PushdownConfig {
+                policy: PushdownPolicy::Never,
+                ..PushdownConfig::default()
+            },
+            parallel_scan: ParallelScanConfig::default(),
+            execution: ExecutionConfig {
+                use_copy: false,
+                ..ExecutionConfig::default()
+            },
+            distributed: DistributedConfig::default(),
+        }
+    }
+}
+
+/// Every batch of `config`'s standalone extraction, in delivery order, batch boundaries kept
+/// (the public `stream()` terminal, read to the end).
+pub async fn extract_batches(
+    config: &JobConfig,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, el_ballista::errors::AppError> {
+    use futures::TryStreamExt;
+    let connector =
+        el_ballista::connector::postgres::PostgresConnector::from_config(config.clone())?;
+    let stream = connector.extract().standalone().stream().await?;
+    Ok(stream.try_collect().await?)
+}
+
+/// [`extract_batches`] concatenated into one batch that carries the extraction's schema, also
+/// for zero rows.
+pub async fn extract_one(
+    config: &JobConfig,
+) -> Result<arrow::record_batch::RecordBatch, el_ballista::errors::AppError> {
+    use futures::TryStreamExt;
+    let connector =
+        el_ballista::connector::postgres::PostgresConnector::from_config(config.clone())?;
+    let stream = connector.extract().standalone().stream().await?;
+    let schema = stream.schema();
+    let batches: Vec<_> = stream.try_collect().await?;
+    Ok(arrow::compute::concat_batches(&schema, &batches)
+        .map_err(datafusion::error::DataFusionError::from)?)
+}
+
+/// Assert which path `config`'s scan takes — `"copy"` or `"cursor"` — as the physical plan of
+/// the same provider shows it (`scan=…`). Non-vacuity for tests that compare the two paths:
+/// a COPY request whose shape does not allow COPY silently scans with the cursor.
+pub async fn assert_scan_path(config: &JobConfig, expected: &str) {
+    use datafusion::physical_plan::displayable;
+    let provider = el_ballista::connector::postgres::PostgresTableProvider::from_config(config)
+        .await
+        .expect("provider");
+    let ctx = datafusion::prelude::SessionContext::new();
+    ctx.register_table("scan_path_probe", std::sync::Arc::new(provider))
+        .expect("register");
+    let columns = config.columns.as_ref().map_or_else(
+        || "*".to_string(),
+        |c| {
+            c.iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    let plan = ctx
+        .sql(&format!("SELECT {columns} FROM scan_path_probe"))
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let text = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        text.contains(&format!("scan={expected}")),
+        "expected the {expected} path:\n{text}"
+    );
 }

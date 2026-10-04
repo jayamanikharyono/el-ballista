@@ -18,7 +18,7 @@ services:
   postgres:
     image: postgres:17
     # Hardcoded budget: a 2-CPU quota + 2g RAM (a quota, not a pin — benchmark/run.sh
-    # pins its own bench-pg container to cores 4-5 + 2g; this compose service is not it).
+    # pins its own bench-pg container to cores 4-7 + 2g; this compose service is not it).
     # A shared fixture must never change shape between runs.
     #cpuset: '4-5' enable when benchmark
     cpus: 2

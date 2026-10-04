@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::connector::errors::ExtractorError;
+use crate::connector::postgres::arrow_type_mapper::ArrowTypeMapper;
 use crate::connector::postgres::dialect::column_kinds;
 use crate::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
 use crate::connector::postgres::distributed::pool_registry::{SourcePool, registry};
@@ -28,7 +30,7 @@ use crate::pushdown::stats::{IndexInfo, SourceStatistics, TableStatsSource};
 use crate::pushdown::{
     self, ColumnKinds, CostInputs, Decision, Fidelity, Predicate, PushdownPolicy,
 };
-use crate::types::TableMetadata;
+use crate::types::{ColumnMetadata, TableMetadata};
 
 use super::{row_adapter::PostgresRowAdapter, schema_reader::PostgresSchemaReader};
 
@@ -144,7 +146,8 @@ pub struct PostgresTableProvider {
     strategy: ParallelStrategy,
     /// When set, `scan()` uses exactly these partitions (one output partition each) instead
     /// of computing bounds from the live table — how a resumed job re-scans the splits its
-    /// checkpoint stored.
+    /// checkpoint stored, and how a distributed client hands the scheduler a plan it needs no
+    /// source access to plan.
     fixed_partitions: Option<Vec<ScanPartition>>,
     /// When set, every `scan()` tags its queries with this run id (the run report's), so a
     /// run's queries and its report share one id. `None`: a fresh id per `scan()`.
@@ -162,9 +165,10 @@ async fn fetch_cost_state(
     let stats = match pool.table_statistics(schema, table).await {
         Ok(stats) => stats,
         Err(e) => {
-            log::warn!(
-                "cost statistics unavailable for {schema}.{table} ({e}); \
-                 cost_based decisions will keep non-indexed filters"
+            warn!(
+                table = %format!("{schema}.{table}"),
+                error = %e,
+                "cost statistics unavailable; cost_based keeps non-indexed filters"
             );
             previous
                 .map(|p| p.stats.clone())
@@ -174,7 +178,7 @@ async fn fetch_cost_state(
     let indexes = match pool.table_indexes(schema, table).await {
         Ok(indexes) => indexes,
         Err(e) => {
-            log::warn!("index metadata unavailable for {schema}.{table} ({e})");
+            warn!(table = %format!("{schema}.{table}"), error = %e, "index metadata unavailable");
             previous.map(|p| p.indexes.clone()).unwrap_or_default()
         }
     };
@@ -194,17 +198,19 @@ async fn server_encoding_is_utf8(pool: &PgPool) -> bool {
     {
         Ok(enc) => enc.eq_ignore_ascii_case("UTF8"),
         Err(e) => {
-            log::warn!("cannot read server_encoding ({e}); text ordering pushdown disabled");
+            warn!(error = %e, "cannot read server_encoding; text ordering pushdown disabled");
             false
         }
     }
 }
 
 impl PostgresTableProvider {
-    /// Discovers the table schema (through the process-shared, budgeted pool), fetches cost
-    /// statistics and index metadata (best-effort: missing stats only make `cost_based`
-    /// conservative, never wrong), and builds a provider ready for local or distributed use.
-    /// Statistics are refreshed lazily once older than `statistics_ttl_secs`.
+    /// The provider for a job's table, built from its config exactly as [`register_table`]
+    /// registers it: the whole `pool_max` budget for this process, the job's pushdown policy,
+    /// batch size and COPY/cursor choice, and `parallel_scan.partitions` keyset (or ctid)
+    /// partitions computed from the live table at scan time. Discovers the schema and fetches
+    /// cost statistics (best-effort: missing statistics only make `cost_based` conservative).
+    /// The config is validated first.
     ///
     /// # Examples
     ///
@@ -214,25 +220,71 @@ impl PostgresTableProvider {
     /// use datafusion::prelude::SessionContext;
     /// use el_ballista::config::JobConfig;
     /// use el_ballista::connector::postgres::PostgresTableProvider;
-    /// use el_ballista::connector::postgres::distributed::PostgresConnectionDescriptor;
-    /// use el_ballista::pushdown::cost_model::CostParams;
     ///
-    /// let cfg = JobConfig::from_file("job.json")?;
-    /// let provider = PostgresTableProvider::new(
-    ///     PostgresConnectionDescriptor::from_config(&cfg.source, 1),
-    ///     &cfg.resolved_table(),
-    ///     cfg.pushdown.policy, cfg.pushdown.deny.clone(), cfg.pushdown.push.clone(),
-    ///     CostParams::default(), cfg.pushdown.statistics_ttl_secs, cfg.execution.batch_size,
-    /// ).await?;
+    /// let config = JobConfig::from_file("job.json")?;
+    /// let provider = PostgresTableProvider::from_config(&config).await?;
     /// let ctx = SessionContext::new();
     /// ctx.register_table("orders", Arc::new(provider))?;
     /// ctx.sql("SELECT id FROM orders WHERE status = 'PAID'").await?.show().await?;
     /// # Ok(()) }
     /// ```
-    #[allow(clippy::too_many_arguments)] // mirrors the config sections one-to-one; builder later
-    pub async fn new(
+    pub async fn from_config(
+        config: &crate::config::JobConfig,
+    ) -> Result<Self, crate::errors::AppError> {
+        config.validate()?;
+        job_provider(
+            config,
+            PostgresConnectionDescriptor::from_config(&config.source, 1),
+            &config.resolved_table(),
+            1,
+            Some(config.parallel_scan.partition_column.clone()),
+            None,
+        )
+        .await
+    }
+
+    /// Where every config-built provider starts: `table` with the job's pushdown settings,
+    /// batch size and scan options, unsplit (callers add partitioning).
+    pub(crate) async fn configured(
+        config: &crate::config::JobConfig,
+        descriptor: PostgresConnectionDescriptor,
+        table: &str,
+    ) -> Result<Self, ExtractorError> {
+        let pushdown = &config.pushdown;
+        let execution = &config.execution;
+        Ok(Self::new(
+            descriptor,
+            table,
+            config.columns.as_deref(),
+            pushdown.policy,
+            pushdown.deny.clone(),
+            pushdown.push.clone(),
+            CostParams {
+                max_source_cost: pushdown.max_source_cost,
+                keep_threshold: pushdown.keep_threshold,
+            },
+            pushdown.statistics_ttl_secs,
+            execution.batch_size,
+        )
+        .await?
+        .with_parallel_strategy(config.parallel_scan.strategy)
+        .with_max_batch_bytes(execution.max_batch_bytes)
+        .with_use_copy(execution.use_copy)
+        .with_copy_statement_timeout_ms(execution.copy_statement_timeout_ms))
+    }
+
+    /// Discovers the table schema (through the process-shared, budgeted pool), fetches cost
+    /// statistics and index metadata (best-effort: missing statistics only make `cost_based`
+    /// conservative, never wrong), and builds a provider ready for local or distributed use.
+    /// Statistics are refreshed lazily once older than `statistics_ttl_secs`.
+    /// Columns with no Arrow mapping (`tsvector`, `interval`, ...) are left out of the
+    /// provider, so the rest of the table stays extractable; `requested` (the job's `columns`,
+    /// `None` = every column) naming one is an error that names the column.
+    #[allow(clippy::too_many_arguments)] // one argument per config field; callers use `configured`
+    pub(crate) async fn new(
         descriptor: PostgresConnectionDescriptor,
         table_name: &str,
+        requested: Option<&[String]>,
         policy: PushdownPolicy,
         deny: Vec<String>,
         push: Vec<String>,
@@ -242,9 +294,10 @@ impl PostgresTableProvider {
     ) -> Result<Self, ExtractorError> {
         let pool = registry().pool(&descriptor)?;
 
-        let table_metadata = PostgresSchemaReader::new(&pool)
+        let mut table_metadata = PostgresSchemaReader::new(&pool)
             .get_table_metadata(table_name)
             .await?;
+        drop_unmapped_columns(&mut table_metadata, requested)?;
 
         let table_schema = PostgresRowAdapter::build_arrow_schema(&table_metadata)?;
 
@@ -258,7 +311,7 @@ impl PostgresTableProvider {
             .unwrap_or_else(|e| {
                 // Without enum metadata, enum columns classify as text-cast: only `=`/`<>`
                 // translate, through the label text, which is still exact.
-                log::warn!("enum metadata unavailable for {table_name} ({e})");
+                warn!(table = %table_name, error = %e, "enum metadata unavailable");
                 HashSet::new()
             });
         let server_utf8 = server_encoding_is_utf8(&pool).await;
@@ -296,10 +349,10 @@ impl PostgresTableProvider {
     }
 
     /// Reconstructs a provider from a serialized model — the decoder path on the scheduler
-    /// (which plans, and computes partition bounds, but must not open catalog connections) and
-    /// on each executor (which resolves the shared pool on first scan). Carries no statistics:
-    /// filters the planning client already pushed arrive in `scan` and are pushed as-is; any
-    /// filter offered anew is kept unless the policy is `always` or a `push` hint.
+    /// (which plans the scan from the partitions the client fixed, and never touches the
+    /// source) and on each executor (which resolves the shared pool on first scan). Carries no
+    /// statistics: filters the planning client already pushed arrive in `scan` and are pushed
+    /// as-is; any filter offered anew is kept unless the policy is `always` or a `push` hint.
     pub(crate) fn from_model(schema: Arc<Schema>, model: PostgresTableProviderModel) -> Self {
         let table_name = format!(
             "{}.{}",
@@ -445,6 +498,56 @@ impl PostgresTableProvider {
     pub(crate) fn with_fixed_partitions(mut self, partitions: Vec<ScanPartition>) -> Self {
         self.fixed_partitions = Some(partitions);
         self
+    }
+
+    /// Compute the scan partitions now, in this process, and fix them (see
+    /// [`Self::with_fixed_partitions`]). A distributed client does this before submitting:
+    /// the plan the Ballista scheduler decodes then carries its partitions, so the scheduler
+    /// never queries the source (nor needs its password) to plan the scan, and every re-run
+    /// of the job scans the same ranges.
+    pub(crate) async fn with_partitions_planned(self) -> Result<Self, ExtractorError> {
+        if self.fixed_partitions.is_some() {
+            return Ok(self);
+        }
+        let partitions = self.compute_partitions().await?;
+        Ok(self.with_fixed_partitions(partitions))
+    }
+
+    /// The scan partitions from the live table: keyset ranges on the partition column, or
+    /// ctid page ranges; empty for one unsplit scan. Only a split scan touches the source.
+    async fn compute_partitions(&self) -> Result<Vec<ScanPartition>, ExtractorError> {
+        if self.parallel_workers <= 1 {
+            return Ok(Vec::new());
+        }
+        let (schema, table) = (
+            &self.table_metadata.schema_name,
+            &self.table_metadata.table_name,
+        );
+        let computed = match (self.strategy, &self.partition_column) {
+            (ParallelStrategy::Keyset, Some(column)) => {
+                let pool = self.pool.get()?;
+                crate::connector::postgres::parallel::compute_keyset_partitions(
+                    &pool,
+                    schema,
+                    table,
+                    column,
+                    self.parallel_workers,
+                )
+                .await?
+            }
+            (ParallelStrategy::Ctid, _) => {
+                let pool = self.pool.get()?;
+                crate::connector::postgres::parallel::compute_ctid_partitions(
+                    &pool,
+                    schema,
+                    table,
+                    self.parallel_workers,
+                )
+                .await?
+            }
+            _ => Vec::new(),
+        };
+        Ok(unsplit_if_whole(computed))
     }
 
     /// Tag every query this provider's scans issue with `run_id` instead of a fresh id per
@@ -640,7 +743,7 @@ impl PostgresTableProvider {
                 )
                 .await
             {
-                log::debug!("EXPLAIN warm-up failed for {inline}: {e}");
+                debug!(predicate = %inline, error = %e, "EXPLAIN warm-up failed");
             }
         }
     }
@@ -663,7 +766,7 @@ impl PostgresTableProvider {
         let pool = match self.pool.get() {
             Ok(pool) => pool,
             Err(e) => {
-                log::warn!("statistics refresh skipped for {}: {e}", self.table_name);
+                warn!(table = %self.table_name, error = %e, "statistics refresh skipped");
                 return;
             }
         };
@@ -673,8 +776,44 @@ impl PostgresTableProvider {
             Ok(mut guard) => *guard = fresh,
             Err(poisoned) => *poisoned.into_inner() = fresh,
         }
-        log::debug!("refreshed cost statistics for {}", self.table_name);
+        debug!(table = %self.table_name, "cost statistics refreshed");
     }
+}
+
+/// A single bound-less partition (empty table, or min >= max) means "scan everything":
+/// collapse it to one unsplit scan, so rows are never doubled.
+fn unsplit_if_whole(partitions: Vec<ScanPartition>) -> Vec<ScanPartition> {
+    if partitions.len() == 1 && partitions[0].predicate.is_none() {
+        Vec::new()
+    } else {
+        partitions
+    }
+}
+
+/// Remove the columns that have no Arrow mapping, so one `tsvector` or `interval` column does
+/// not make the whole table unextractable. An error, naming the column, when `requested`
+/// needs one: `None` (every column) or a list that names it. A table's every column then
+/// either decodes or is refused up front, never silently dropped from a requested result.
+fn drop_unmapped_columns(
+    table: &mut TableMetadata,
+    requested: Option<&[String]>,
+) -> Result<(), ExtractorError> {
+    let unmapped: Vec<&ColumnMetadata> = table
+        .columns
+        .iter()
+        .filter(|c| ArrowTypeMapper::map(c).is_err())
+        .collect();
+    let needed = unmapped
+        .iter()
+        .find(|c| requested.is_none_or(|names| names.contains(&c.column_name)));
+    if let Some(column) = needed {
+        return Err(ExtractorError::UnsupportedType(format!(
+            "{} in column {}.{}.{}; list `columns` without it to extract the rest of the table",
+            column.data_type, table.schema_name, table.table_name, column.column_name
+        )));
+    }
+    table.columns.retain(|c| ArrowTypeMapper::map(c).is_ok());
+    Ok(())
 }
 
 /// `PUSH (<fidelity>; <reason>; <sql>)` or `KEEP (<reason>)` — the `el-ballista plan` wording.
@@ -778,60 +917,14 @@ impl TableProvider for PostgresTableProvider {
             limit
         };
 
-        // Partition bounds, computed here so they ship inside the serialized plan and every
-        // executor scans only its own range. Keyset needs a partition column; ctid splits by
-        // physical pages and needs none; anything else scans unsplit.
-        let pool = self
-            .pool
-            .get()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let partitions = if let Some(fixed) = &self.fixed_partitions {
-            if fixed.len() == 1 && fixed[0].predicate.is_none() {
-                Vec::new()
-            } else {
-                fixed.clone()
-            }
-        } else if self.parallel_workers > 1 {
-            match self.strategy {
-                ParallelStrategy::Keyset => match &self.partition_column {
-                    Some(partition_column) => {
-                        let bounds =
-                            crate::connector::postgres::parallel::compute_keyset_partitions(
-                                &pool,
-                                &self.table_metadata.schema_name,
-                                &self.table_metadata.table_name,
-                                partition_column,
-                                self.parallel_workers,
-                            )
-                            .await
-                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                        // A single, bound-less partition (empty table, or min >= max) means
-                        // "scan everything" — collapse it to one unsplit task so rows are
-                        // never doubled.
-                        if bounds.len() == 1 && bounds[0].predicate.is_none() {
-                            Vec::new()
-                        } else {
-                            bounds
-                        }
-                    }
-                    None => Vec::new(),
-                },
-                ParallelStrategy::Ctid => {
-                    crate::connector::postgres::parallel::compute_ctid_partitions(
-                        &pool,
-                        &self.table_metadata.schema_name,
-                        &self.table_metadata.table_name,
-                        self.parallel_workers,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                }
-                ParallelStrategy::None => Vec::new(),
-            }
-        } else {
-            Vec::new()
+        // Partition bounds ship inside the serialized plan, so every executor scans only its
+        // own range: fixed ones as given, otherwise computed from the live table here.
+        let partitions = match &self.fixed_partitions {
+            Some(fixed) => unsplit_if_whole(fixed.clone()),
+            None => self
+                .compute_partitions()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
         };
 
         // Opportunistic EXPLAIN warming and TTL statistics refresh for *future* queries only:
@@ -889,70 +982,45 @@ pub async fn register_table(
     ctx: &datafusion::prelude::SessionContext,
     config: &crate::config::JobConfig,
 ) -> Result<(), crate::errors::AppError> {
-    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
-    register_job_table(
-        ctx,
-        config,
-        descriptor,
-        1,
-        Some(config.parallel_scan.partition_column.clone()),
-        None,
-    )
-    .await
+    let provider = PostgresTableProvider::from_config(config).await?;
+    ctx.register_table(&config.table, Arc::new(provider))?;
+    Ok(())
 }
 
-/// Shared by [`register_table`] (this process uses the whole budget) and the distributed
-/// context (`descriptor` budgets `pool_max / workers` per executor process).
-/// `default_partitions` is the partition count when `parallel_scan.partitions <= 1`.
-pub(crate) async fn register_job_table(
-    ctx: &datafusion::prelude::SessionContext,
+/// The provider for `table` as a job registers it: [`PostgresTableProvider::configured`] split
+/// into `parallel_scan.partitions` partitions on `partition_column` (or `default_partitions`
+/// when `parallel_scan.partitions <= 1`). Shared by [`PostgresTableProvider::from_config`]
+/// (`descriptor` gives this process the whole budget), the distributed context (`pool_max /
+/// workers` per executor process) and `ExtractContext`.
+pub(crate) async fn job_provider(
     config: &crate::config::JobConfig,
     descriptor: PostgresConnectionDescriptor,
+    table: &str,
     default_partitions: usize,
     partition_column: Option<String>,
     run_id: Option<&str>,
-) -> Result<(), crate::errors::AppError> {
+) -> Result<PostgresTableProvider, crate::errors::AppError> {
     let configured = config.parallel_scan.partitions;
     let partitions = if configured > 1 {
         configured
     } else {
         default_partitions.max(1)
     };
-    log::info!(
-        "registering {}.{}: {} source connection(s) for this process ({} process(es) share \
-         pool_max = {}), {} scan partition(s)",
-        config.source.schema,
-        config.table,
-        descriptor.budgeted_max_connections(),
-        descriptor.expected_workers,
-        config.source.pool_max,
+    info!(
+        table = %format!("{}.{}", config.source.schema, config.table),
+        connections = descriptor.budgeted_max_connections(),
+        processes = descriptor.expected_workers,
+        pool_max = config.source.pool_max,
         partitions,
+        "table registered"
     );
-    let provider = PostgresTableProvider::new(
-        descriptor,
-        &config.resolved_table(),
-        config.pushdown.policy,
-        config.pushdown.deny.clone(),
-        config.pushdown.push.clone(),
-        CostParams {
-            max_source_cost: config.pushdown.max_source_cost,
-            keep_threshold: config.pushdown.keep_threshold,
-        },
-        config.pushdown.statistics_ttl_secs,
-        config.execution.batch_size,
-    )
-    .await?
-    .with_parallel_workers(partitions, partition_column)
-    .with_max_batch_bytes(config.execution.max_batch_bytes)
-    .with_use_copy(config.execution.use_copy)
-    .with_copy_statement_timeout_ms(config.execution.copy_statement_timeout_ms)
-    .with_parallel_strategy(config.parallel_scan.strategy);
-    let provider = match run_id {
+    let provider = PostgresTableProvider::configured(config, descriptor, table)
+        .await?
+        .with_parallel_workers(partitions, partition_column);
+    Ok(match run_id {
         Some(run_id) => provider.with_run_id(run_id),
         None => provider,
-    };
-    ctx.register_table(&config.table, Arc::new(provider))?;
-    Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1116,6 +1184,37 @@ mod tests {
         assert!(reason.starts_with("KEEP"), "{reason}");
         let reason = always.explain_decision(&col("id").eq(lit(1i64)));
         assert_eq!(reason, r#"PUSH (Exact; policy=always; ("id" = 1))"#);
+    }
+
+    #[test]
+    fn unmapped_columns_are_left_out_unless_requested() {
+        let table = || TableMetadata {
+            schema_name: "public".to_string(),
+            table_name: "film".to_string(),
+            columns: vec![column("id", "integer"), column("fulltext", "tsvector")],
+        };
+        let names = |t: &TableMetadata| -> Vec<String> {
+            t.columns.iter().map(|c| c.column_name.clone()).collect()
+        };
+        // `columns` without it: the rest of the table stays extractable.
+        let mut t = table();
+        drop_unmapped_columns(&mut t, Some(&["id".to_string()])).unwrap();
+        assert_eq!(names(&t), ["id"]);
+        // Every column requested, or the column named: an error naming it.
+        for requested in [None, Some(vec!["id".to_string(), "fulltext".to_string()])] {
+            let err = drop_unmapped_columns(&mut table(), requested.as_deref())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("public.film.fulltext") && err.contains("tsvector"),
+                "{err}"
+            );
+        }
+        // Nothing unmapped: unchanged, whatever is requested.
+        let mut t = table();
+        t.columns.truncate(1);
+        drop_unmapped_columns(&mut t, None).unwrap();
+        assert_eq!(names(&t), ["id"]);
     }
 
     #[test]

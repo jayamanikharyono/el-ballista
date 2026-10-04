@@ -44,16 +44,18 @@ COMMIT;                                                                -- ROLLBA
 
 Rows of each `FETCH` stream into Arrow builders (no intermediate `Vec<PgRow>`); sqlx requests
 binary results, and each value is read as a borrowed byte slice. Every `FETCH` is its own
-statement, so `statement_timeout` applies per window, not to the whole partition. The cursor is
+statement, so `statement_timeout` applies per window, not to the whole partition. Every statement
+starts with a `/* el-ballista query_id=… run_id=… strategy=… */` tag, so it can be found in
+`pg_stat_activity`. The cursor is
 `WITHOUT HOLD` (a `WITH HOLD` cursor would make the server materialize the result). A stall
 longer than `idle_in_transaction_session_timeout` between `FETCH`es aborts the scan. The
 DataFusion/Ballista `PostgresExecutionPlan` uses this same path per partition; dropping its
 output stream stops fetching (the cursor is closed and the transaction rolled back after at
-most one in-flight window).
+most one in-flight window); a partition still waiting for a scan slot never opens its query.
 
 ### 2.2 Binary COPY (`execution.use_copy`)
 
-Full/keyset scans can instead run `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` when
+Unfiltered scans (whole table, keyset or ctid partitions) can instead run `COPY (SELECT …) TO STDOUT (FORMAT BINARY)` when
 `execution.use_copy` is true (default false): one statement streams the whole result in binary
 framing — no per-`FETCH` round trips — decoded incrementally by `connector::postgres::copy`.
 
@@ -64,14 +66,21 @@ Limits, by construction of `COPY` and of the decoder set:
   override never leaks into a pooled session; `0` disables it); cursor scans are unaffected;
 - only scans **without pushed filters** use COPY (it accepts no bind parameters); anything
   with bound literals falls back to the cursor path with a loud warn log (never silent);
-- keyset bounds inline as `i64` literals (no quoting surface);
+- partition bounds (keyset `i64`s, ctid page numbers) and a pushed `LIMIT` inline as integer
+  literals rendered from typed bounds (no quoting surface);
+- the physical plan display (`EXPLAIN`) shows `scan=copy` or `scan=cursor`;
 - types mirror the cursor decoder exactly (`ArrowTypeMapper` gates both); anything else is
-  `UnsupportedType`, never silently wrong data;
+  `UnsupportedType`, never silently wrong data. Binary COPY rows carry no types, so the scan
+  first describes its inner `SELECT` in the same transaction and checks the reported column
+  types against the decoders, as the cursor path checks its first row: a column whose type
+  changed since planning (`ALTER … TYPE`) is an error, and describing takes the table's lock,
+  so the types cannot change again before the COPY reads them;
 - a COPY that does not finish (decode error, consumer error, dropped stream) closes its
   connection instead of returning it to the pool, and a background task sends
   `pg_cancel_backend(pid)` over another connection **of the same pool** (so the cancel stays
   inside `pool_max`; if none frees up within 5 s the cancel is skipped and the server aborts the
-  COPY on its next write to the closed socket).
+  COPY on its next write to the closed socket); the cancel only hits a backend still running
+  the statement carrying this scan's tag.
 
 ### 2.3 Isolation semantics
 
@@ -93,11 +102,12 @@ snapshot guarantee is claimed (exported snapshots are not implemented).
 | `int2` / `int4` / `int8` | `Int16` / `Int32` / `Int64` | Implemented | Big-endian |
 | `float4` / `float8` | `Float32` / `Float64` | Implemented | IEEE-754; `NaN` ordering differs from Arrow — see [pushdown §3.3](../pushdown.md#33-numeric-type-width-and-precision) |
 | `numeric(p,s)`, p ≤ 38 | `Decimal128(p, s)` | Implemented | Binary base-10000 digits, exact integer arithmetic. `NaN` / `±Infinity` → typed error (`UnsupportedValue`, names the column). Comparisons never push |
+| `numeric(p,s)`, p > 38 | — | Not implemented | Column left out of the table (see below) |
 | `numeric`, unconstrained | `Decimal128(38, 10)` | Implemented | A value with non-zero digits beyond 10 fractional places, or more than 28 integer digits, → typed error naming the column (never truncated). `NaN` / `±Infinity` → typed error |
 | `text`, `varchar` | `Utf8` | Implemented | Borrowed UTF-8 decode. Comparisons push `Exact` under `COLLATE "C"`, whatever the column collation, when `server_encoding = UTF8`; on other encodings only `=` / `<>` push ([pushdown §2](../pushdown.md#2-expression-translation)) |
 | `char(n)` | `Utf8` | Implemented | No comparison pushes (`bpchar` ignores trailing blanks, Arrow does not) |
 | `bytea` | `Binary` | Implemented | |
-| `uuid` | `Utf8` | Implemented | Selected as `::text` (canonical 36-char form); not `FixedSizeBinary(16)`. `=` / `<>` push `Exact` |
+| `uuid` | `Utf8` | Implemented | Selected as `::text` (canonical 36-char form); not `FixedSizeBinary(16)`. `=` / `<>` push `Exact`; `IS [NOT] NULL` tests `CAST(col AS text)` |
 | `date` | `Date32` | Implemented | Binary `i32` days since 2000-01-01, shifted to 1970. `±infinity` / overflow → typed error. Comparisons against date literals push `Exact` |
 | `timestamp` | `Timestamp(Microsecond, None)` | Implemented | Binary `i64` µs since 2000-01-01, shifted with checked arithmetic. `±infinity` / overflow → typed error |
 | `timestamptz` | `Timestamp(Microsecond, "UTC")` | Implemented | As `timestamp` (session `TIME ZONE 'UTC'`). `±infinity` / overflow → typed error |
@@ -106,17 +116,21 @@ snapshot guarantee is claimed (exported snapshots are not implemented).
 | `interval` | — | Not implemented | |
 | `json` | `Utf8` | Implemented | Selected as `::text`: Postgres' own rendering, byte for byte, on both paths |
 | `jsonb` | `Utf8` | Implemented | Selected as `::text` (Postgres' normalized jsonb rendering; big numbers preserved exactly) |
-| enum types | `Utf8` | Implemented | `::text` label cast; not `Dictionary(Int32, Utf8)`. All six comparisons push `Exact` on the label text |
-| other `USER-DEFINED` types (`citext`, `hstore`, PostGIS `geometry`, …) | `Utf8` | Implemented | Selected as `::text`; `=` / `<>` push `Exact` against the text form |
-| `text[]` | `List(Utf8)` | Implemented | 1-D (or empty) arrays; NULL elements kept |
+| enum types | `Utf8` | Implemented | `::text` label cast; not `Dictionary(Int32, Utf8)`. All six comparisons push `Exact` on the label text when `server_encoding = UTF8` and `pg_enum` is readable; otherwise only `=` / `<>` |
+| other `USER-DEFINED` types (`citext`, `hstore`, PostGIS `geometry`, …) | `Utf8` | Implemented | Selected as `::text`; `=` / `<>` push `Exact` against the text form. `IS [NOT] NULL` tests `CAST(col AS text)`: a composite of NULL fields is `(,)` in Arrow, not NULL |
+| `text[]` | `List(Utf8)` | Implemented | 1-D (or empty) arrays; NULL elements kept; multi-dimensional → typed error (`UnsupportedValue`) |
 | other `T[]` | — | Not implemented | |
-| `money` | — | Not implemented | No `cast_to` config |
-| built-in range types, `tsvector` | — | Not implemented | No `cast_to` config |
+| `money` | — | Not implemented | Column left out of the table (see below) |
+| built-in range types, `tsvector` | — | Not implemented | Column left out of the table (see below) |
 | `oid`, `xid`, `cid` | — | Not implemented | |
 
 A type is `USER-DEFINED` when `information_schema.columns` reports it so — types defined
-outside `pg_catalog`, which includes extension types. Built-in types not listed above fail
-with `UnsupportedType` before the scan starts.
+outside `pg_catalog`, which includes extension types. `json`, `jsonb`, `uuid` and `USER-DEFINED`
+columns are the ones selected as `::text`; `arrow_type_mapper::selects_as_text` defines that set
+once, for the query builder, the type mapper and pushdown. A column with no mapping (every
+"Not implemented" row above, and any built-in type not listed) is left out of the table: a job whose `columns` omit it
+extracts the rest, and one that requests it, or every column (`columns` unset), fails with
+`UnsupportedType` naming the column before the scan starts.
 
 Two encodings deserve extra care in review because they are the ones most likely to be subtly wrong:
 
@@ -168,10 +182,12 @@ distribution data without asking anyone to run maintenance commands. How it is u
   that `EXPLAIN` prices an open-ended half-range, not the window (details in
   [pushdown](../pushdown.md#range-selectivity-and-windows)).
 
-`EXPLAIN` is otherwise the decisive input: its plan node type tells us whether the predicate
+`EXPLAIN`, when a cached estimate exists, is otherwise the decisive input: its plan node type tells us whether the predicate
 produces an `Index Scan`, `Bitmap Heap Scan`, or `Seq Scan`, and its cost estimate feeds
 directly into the `max_source_cost` budget from
-[pushdown §4](../pushdown.md#4-the-cost-model). Never `EXPLAIN ANALYZE` — that runs the query.
+[pushdown §4](../pushdown.md#4-the-cost-model). Planning only reads cached estimates: `el-ballista
+plan` warms them first, and each `scan` warms them for later plans, so a provider's first plan
+decides from `pg_stats` and the index catalog alone. Never `EXPLAIN ANALYZE` — that runs the query.
 
 Keyset partition bounds come from `MIN`/`MAX` on the raw partition column (index probes), not
 from `histogram_bounds`.
@@ -193,8 +209,8 @@ Timestamp-based incremental protocols (commit-skew mitigation via
 
 ## 6. Session configuration
 
-Applied on every connection the pool opens, before any query (`PostgresExtractor::connect`
-and the distributed pool registry):
+Applied on every connection the pool opens, before any query (the process-wide source pool
+registry, `SourcePoolRegistry`, which every scan path uses):
 
 ```sql
 -- application_name is set as a connection option (source.application_name)
@@ -204,7 +220,7 @@ SET idle_in_transaction_session_timeout = '60s';
 SET lock_timeout = '5s';
 ```
 
-`lock_timeout` guarantees we never queue behind a DDL lock. Not applied by the connector (recommended for
+`lock_timeout` bounds any wait behind a conflicting (e.g. DDL) lock to 5 s; the statement then fails. Not applied by the connector (recommended for
 production roles, e.g. via `ALTER ROLE … SET`): `default_transaction_read_only = on` and
 `jit = off` (JIT costs more than it saves on the short, high-row-count queries an extractor
 issues, and adds plan-time variance that confuses the cost model).
@@ -225,14 +241,16 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO el_ballista;
 
 | Strategy | Predicate | Status | When |
 | --- | --- | --- | --- |
-| `ctid` | `ctid >= '(a,0)' AND ctid < '(b,0)'` | Implemented | Evenly sized physical page ranges; bounds from `relpages`. See the note below |
+| `ctid` | `ctid >= '(a,1)'::tid AND ctid < '(b,1)'::tid` (the last range has no upper bound) | Implemented | Evenly sized physical page ranges; bounds from `relpages`. See the note below |
 | `keyset` | first: `k < b1 OR k IS NULL`; middle: `k >= bᵢ AND k < bᵢ₊₁`; last: `k >= bₙ₋₁` | Implemented | Even split of `[MIN(k), MAX(k)]` (one index probe each on the raw column), bound math in `i128`. NULL keys go to the first partition exactly once; both ends are open (the first partition has no lower bound, the last no upper bound), so the partitions cover every key — including `i64::MIN`/`i64::MAX` and rows inserted outside `[MIN, MAX]` before a resumed run reuses its stored bounds. Not `histogram_bounds`-based: skewed keys give uneven partitions |
 | `native` | one partition per child table of a declarative partitioned table | Not implemented | Aligns with source's own pruning |
 | `modulo` | `hashint8(pk) % n = i` | Not implemented | Last resort; forces a full scan per partition |
 
 `ctid` ranges are only exact within a single snapshot: each partition takes its own, so a row
-that a concurrent update moves to another page can be missed or read twice. Closing that gap
-needs an exported snapshot shared by all partitions, which is not implemented.
+that a concurrent update moves to another page can be missed or read twice. Any update that is
+not HOT can move a row, whatever columns it changes, and `VACUUM FULL` or `CLUSTER` between
+partitions rewrites every page (plain `VACUUM` moves no rows). Closing that gap needs an
+exported snapshot shared by all partitions, which is not implemented.
 
 ---
 

@@ -13,11 +13,10 @@ mod common;
 use chrono::{NaiveDate, TimeZone, Utc};
 use common::{TEST_PASSWORD_ENV, TestDb};
 use el_ballista::config::{
-    CheckpointConfig, DistributedConfig, ExecutionConfig, JobConfig, ParallelScanConfig,
-    PushdownConfig, SourceConfig,
+    CheckpointConfig, DistributedConfig, ExecutionConfig, FilterEntry, FilterInput, JobConfig,
+    ParallelScanConfig, PushdownConfig, PushdownPolicy, SourceConfig,
 };
 use el_ballista::connector::postgres::PostgresConnector;
-use el_ballista::connector::postgres::extractor::PostgresExtractor;
 
 /// Always uses a real database (the compose stack, unless `DATABASE_URL` is set) — never
 /// skips. Kept as a macro only so call sites (`let db = live!();`) didn't need to change.
@@ -27,22 +26,38 @@ macro_rules! live {
     };
 }
 
-async fn extractor(db: &TestDb) -> Result<PostgresExtractor, sqlx::Error> {
-    PostgresExtractor::connect(
-        &db.host,
-        db.port,
-        &db.user,
-        &db.password,
-        &db.database,
-        4,
-        300_000,
-        "relex-test",
-    )
-    .await
+/// The explicit keyset range `[lo, hi)` on `column` of `hostile`, as job filters
+/// (`column>=lo`, `column<hi`) pushed to the source (policy `always`), so the range is part
+/// of the source query as in a keyset partition scan; cursor path, `batch_size` rows per FETCH.
+fn keyset_range_job(db: &TestDb, column: &str, lo: i64, hi: i64, batch_size: usize) -> JobConfig {
+    let mut config = db.extraction_job("hostile", None);
+    config.filters = vec![
+        FilterEntry::Single(FilterInput::Shorthand(format!("{column}>={lo}"))),
+        FilterEntry::Single(FilterInput::Shorthand(format!("{column}<{hi}"))),
+    ];
+    config.pushdown.policy = PushdownPolicy::Always;
+    config.execution.use_copy = false;
+    config.execution.batch_size = batch_size;
+    config
+}
+
+/// Both range bounds of a [`keyset_range_job`] execute in the source, not in Arrow.
+async fn assert_range_pushed(config: &JobConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let decisions = PostgresConnector::from_config(config.clone())?
+        .explain_filters()
+        .await?;
+    assert_eq!(decisions.len(), 2, "both range bounds decided");
+    for d in &decisions {
+        assert!(
+            d.pushed_to_source,
+            "range bound {} must run in the source: {}",
+            d.filter, d.reason
+        );
+    }
+    Ok(())
 }
 
 fn filtered_job(db: &TestDb, filters: Vec<String>) -> JobConfig {
-    use el_ballista::config::{FilterEntry, FilterInput};
     let filters = filters
         .into_iter()
         .map(|s| FilterEntry::Single(FilterInput::Shorthand(s)))
@@ -167,7 +182,6 @@ fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
 async fn bytea_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::{Array, BinaryArray};
     let db = live!();
-    let ex = extractor(&db).await?;
     // bytea -> Binary: 0x00 / 0xFF bytes, empty ('' vs NULL) and NULL survive unchanged.
     // Oracle: reference (Postgres' own hex encoding of each value).
     let reference: Vec<(i64, Option<String>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -177,8 +191,7 @@ async fn bytea_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
     .fetch_all(&db.pool)
     .await?;
     let batch = common::sorted_by(
-        &ex.extract_full_table(&db.table(), Some(vec!["id", "bin"]))
-            .await?,
+        &common::extract_one(&db.extraction_job("hostile", Some(&["id", "bin"]))).await?,
         "id",
     );
     let bin = batch
@@ -212,9 +225,7 @@ async fn bytea_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
 async fn empty_filter_returns_empty_stream_with_schema() -> Result<(), Box<dyn std::error::Error>> {
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::prelude::{SessionContext, col, lit};
-    use el_ballista::connector::postgres::distributed::connection::PostgresConnectionDescriptor;
-    use el_ballista::connector::postgres::table_provider::PostgresTableProvider;
-    use el_ballista::pushdown::cost_model::CostParams;
+    use el_ballista::connector::postgres::PostgresTableProvider;
     use futures::StreamExt;
     use std::sync::Arc;
 
@@ -225,22 +236,9 @@ async fn empty_filter_returns_empty_stream_with_schema() -> Result<(), Box<dyn s
     let config = filtered_job(&db, vec![]);
     let state = SessionStateBuilder::new().with_default_features().build();
     let ctx = SessionContext::new_with_state(state);
-    let descriptor = PostgresConnectionDescriptor::from_config(&config.source, 1);
-    let provider = PostgresTableProvider::new(
-        descriptor,
-        &config.resolved_table(),
-        config.pushdown.policy,
-        config.pushdown.deny.clone(),
-        config.pushdown.push.clone(),
-        CostParams {
-            max_source_cost: config.pushdown.max_source_cost,
-            keep_threshold: config.pushdown.keep_threshold,
-        },
-        config.pushdown.statistics_ttl_secs,
-        config.execution.batch_size,
-    )
-    .await
-    .map_err(|e| format!("provider: {e}"))?;
+    let provider = PostgresTableProvider::from_config(&config)
+        .await
+        .map_err(|e| format!("provider: {e}"))?;
     ctx.register_table("hostile", Arc::new(provider))
         .map_err(|e| format!("register: {e}"))?;
     let df = ctx
@@ -269,12 +267,12 @@ async fn empty_filter_returns_empty_stream_with_schema() -> Result<(), Box<dyn s
 #[tokio::test]
 async fn cursor_respects_batch_boundaries() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
-    let ex = extractor(&db).await?;
     // 13 rows at batch 3 -> [3, 3, 3, 3, 1]: batching cuts where it should, tail included.
-    // Keyset partition scan over the whole id space exercises the cursor/FETCH batching.
-    let batches = ex
-        .extract_keyset_partition_via_cursor(&db.table(), None, "id", 0, 1_000_000, 3)
-        .await?;
+    // Keyset range scan over the whole id space exercises the cursor/FETCH batching.
+    // Oracle: trivial (13 fixture rows cut at 3).
+    let config = keyset_range_job(&db, "id", 0, 1_000_000, 3);
+    assert_range_pushed(&config).await?;
+    let batches = common::extract_batches(&config).await?;
     let sizes: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
     assert_eq!(sizes, vec![3, 3, 3, 3, 1]);
     assert_eq!(sizes.iter().sum::<usize>(), common::HOSTILE_ROWS);
@@ -284,11 +282,9 @@ async fn cursor_respects_batch_boundaries() -> Result<(), Box<dyn std::error::Er
 #[tokio::test]
 async fn projection_returns_requested_columns() -> Result<(), Box<dyn std::error::Error>> {
     let db = live!();
-    let ex = extractor(&db).await?;
     // No ORDER BY in extraction: sort by id before asserting per-row positions.
     let batch = common::sorted_by(
-        &ex.extract_full_table(&db.table(), Some(vec!["id", "amount"]))
-            .await?,
+        &common::extract_one(&db.extraction_job("hostile", Some(&["id", "amount"]))).await?,
         "id",
     );
     assert_eq!(batch.num_rows(), common::HOSTILE_ROWS);
@@ -307,9 +303,11 @@ async fn projection_returns_requested_columns() -> Result<(), Box<dyn std::error
 async fn dates_and_timestamps_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::Array;
     let db = live!();
-    let ex = extractor(&db).await?;
     // No ORDER BY in extraction: sort by id before asserting per-row positions.
-    let batch = common::sorted_by(&ex.extract_full_table(&db.table(), None).await?, "id");
+    let batch = common::sorted_by(
+        &common::extract_one(&db.extraction_job("hostile", None)).await?,
+        "id",
+    );
 
     // date -> Date32 days since unix epoch (2024-02-29, leap day included).
     let idx = batch.schema().index_of("day").unwrap();

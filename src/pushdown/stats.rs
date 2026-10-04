@@ -36,17 +36,6 @@ pub struct ColumnStats {
 /// [`ColumnStats::most_common_vals`] use: integers as themselves, timestamps as seconds since
 /// the Unix epoch, dates as days since 1970-01-01. `None` for unordered literals (text, bool,
 /// float), whose comparisons keep the default estimates.
-///
-/// # Examples
-/// ```
-/// use chrono::NaiveDate;
-/// use el_ballista::pushdown::Literal;
-/// use el_ballista::pushdown::stats::ordinal;
-/// assert_eq!(ordinal(&Literal::Int(7)), Some(7.0));
-/// let d = NaiveDate::from_ymd_opt(1970, 1, 11).unwrap();
-/// assert_eq!(ordinal(&Literal::Date(d)), Some(10.0));
-/// assert_eq!(ordinal(&Literal::Text("x".into())), None);
-/// ```
 pub fn ordinal(literal: &Literal) -> Option<f64> {
     match literal {
         Literal::Int(v) => Some(*v as f64),
@@ -91,13 +80,6 @@ impl SourceStatistics {
     /// Empty statistics for contexts that cannot reach the source (e.g. a provider rebuilt
     /// from a serialized plan on a scheduler). Selectivity falls back to conservative
     /// defaults, so cost-based decisions degrade to keeping — never to pushing blindly.
-    ///
-    /// # Examples
-    /// ```
-    /// use el_ballista::pushdown::stats::SourceStatistics;
-    /// let stats = SourceStatistics::empty("orders");
-    /// assert!(stats.columns.is_empty());
-    /// ```
     pub fn empty(table_name: &str) -> Self {
         Self {
             table_name: table_name.to_string(),

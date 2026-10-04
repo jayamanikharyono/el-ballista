@@ -1,13 +1,14 @@
 //! Logical-plan extension codec for Ballista.
 //! distributed/table_codec.rs
-//! The `el-ballista distribute` client registers a `PostgresTableProvider` and runs
-//! `DataFrame::create_physical_plan` locally — the physical plan is what gets shipped. But the
-//! *logical* plan also travels (client → scheduler → planner), and Ballista's default logical
-//! codec rejects provider nodes it doesn't recognize. This codec serializes our provider as JSON
-//! so the scheduler can rebuild it (without opening a single connection) and plan the scan.
+//! The distributed client registers a `PostgresTableProvider` (with its partition bounds
+//! already computed) and submits the *logical* plan; the scheduler builds the physical plan
+//! from it. Ballista's default logical codec rejects provider nodes it doesn't recognize, so
+//! this codec serializes our provider as JSON and the scheduler rebuilds it — without ever
+//! connecting to the source, since the bounds travel in the model — to plan the scan.
 //! Non-Postgres nodes and providers fall back to `BallistaLogicalExtensionCodec`.
 
 use std::sync::Arc;
+use tracing::debug;
 
 use arrow::datatypes::SchemaRef;
 use ballista_core::serde::BallistaLogicalExtensionCodec;
@@ -86,11 +87,7 @@ impl LogicalExtensionCodec for PostgresLogicalCodec {
 
             buf.extend_from_slice(POSTGRES_SCAN_MAGIC);
             buf.extend_from_slice(&bytes);
-            log::debug!(
-                "encoded PostgresTableProvider for {} ({} bytes payload)",
-                table_ref,
-                bytes.len()
-            );
+            debug!(table = %table_ref, bytes = bytes.len(), "table provider encoded");
 
             Ok(())
         } else {
@@ -115,7 +112,7 @@ impl LogicalExtensionCodec for PostgresLogicalCodec {
                 })?;
 
             let provider = PostgresTableProvider::from_model(schema, model);
-            log::debug!("decoded PostgresTableProvider for {}", table_ref);
+            debug!(table = %table_ref, "table provider decoded");
 
             Ok(Arc::new(provider))
         } else {

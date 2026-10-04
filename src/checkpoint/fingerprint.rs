@@ -1,9 +1,9 @@
 //! Plan fingerprints: a stable identity for "what a job extracts".
 //!
 //! A checkpoint's completed splits are only meaningful for the plan that produced them. The
-//! pipeline describes its plan as named, canonical text components (table, schema,
-//! projection, resolved filters, strategy, partitions, partition column, execution mode) in a
-//! [`PlanIdentity`]; the fingerprint is a hash of those components.
+//! pipeline describes its plan as named, canonical text components (source database, table,
+//! schema, projection, resolved filters, strategy, partitions, partition column, execution
+//! mode) in a [`PlanIdentity`]; the fingerprint is a hash of those components.
 //!
 //! The hash is FNV-1a (64-bit) implemented here, not `std::hash::Hasher`/`DefaultHasher`,
 //! whose output is explicitly not stable across Rust releases. Components are hashed with
